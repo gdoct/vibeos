@@ -117,6 +117,26 @@ the host).
   ([kernel/src/drivers/pci.c](kernel/src/drivers/pci.c)) — type-1 via
   ports 0xCF8/0xCFC, `pci_find(vendor, dev_lo, dev_hi)`.
 
+### Filesystem
+- **MyFS v1** ([kernel/src/fs.c](kernel/src/fs.c),
+  [kernel/include/fs.h](kernel/include/fs.h)) — a tiny, non-journaled,
+  writable filesystem over any `block_device_t`. 4 KiB FS blocks (8 sectors);
+  superblock / inode bitmap / data bitmap / fixed inode table / data area.
+  128-byte inodes with 13 direct + one single-indirect pointer (files up to
+  ~4 MiB). ext2-style variable-length directory entries with `.`/`..`.
+  **mkfs runs on first boot** when it sees an unformatted volume. VFS-ish
+  kernel API: `fs_mount`/`fs_unmount`, `fs_open`/`fs_read`/`fs_write`/
+  `fs_close`, `fs_create`/`fs_mkdir`/`fs_unlink`/`fs_readdir`. The inode table
+  is the source of truth; the bitmaps are a derived cache, so every mutating
+  op writes in crash-safe order (data → inode → dirent → bitmaps+superblock)
+  and a **dirty-mount `fsck`** rebuilds the bitmaps, fixes link counts, drops
+  dangling directory entries, and frees orphans. Verified end-to-end on
+  virtio-blk: format, a 64 KiB indirect-block file round-trip, `readdir`,
+  `unlink`, persistence across a clean unmount/remount **and across a reboot**
+  (the `MYFS` magic + file bytes are visible in the host `vdisk.img`), plus a
+  forced-dirty `fsck` that rebuilds a deliberately-wiped data bitmap with the
+  data left intact.
+
 ### Memory & I/O plumbing
 - **Page tables** — see *Paging / virtual memory* under Kernel core.
 - **Physical page allocator** ([kernel/src/pmm.c](kernel/src/pmm.c)) —
@@ -202,6 +222,11 @@ today" above:
   today, so this is no longer blocking); the ACPI `_PRT` (we route all
   PCI GSIs to one shared vector instead of resolving each device's pin —
   correct for shared INTx, revisit if we need per-device routing).
+- **Filesystem (MyFS v1)** — the §2 follow-up below, finished end-to-end:
+  on-disk format, direct + single-indirect blocks, the full kernel file API,
+  crash-safe ordered writes, and a dirty-mount `fsck`. Folded into "What works
+  today" above. *Deferred:* no journaling, no rename, single global mounted
+  volume, no permissions/uid — all fine until userspace needs them.
 
 ## Follow-ups, ordered
 
@@ -223,21 +248,59 @@ N>1.
 
 **Unlocks.** Real concurrency, real performance discussions.
 
-### 2. Filesystem: read-only FAT, then something real
+### 2. Filesystem: simple read/write from day one
+
+**✅ Shipped (MyFS v1).** Built as described below — see the *Filesystem*
+section under "What works today". The design notes here are kept as the
+record of what was built and what was intentionally deferred. **Userspace
+(below) is now the next step.**
 
 **Why now.** Right now the kernel can read and write raw blocks on
-virtio-blk, but there's no way to load anything *named*. To load a
-userspace binary from disk you need a filesystem.
+virtio-blk, but there's no way to load anything *named* or persist
+structured state safely. A minimal writable filesystem gives us both
+program loading and real stateful behavior immediately.
 
 **What to build.**
-- FAT16/32 read-only over `block_device_t` (we already have one on the
-  ESP — same FS the bootloader walks)
-- File handle abstraction (`open` / `read` / `close`) with the
-  kernel-internal callers using it directly
-- Later: a writable filesystem. `ext2` is the standard learning
-  choice; a log-structured toy FS is more fun.
+- Start with a tiny non-journaled writable FS over `block_device_t`
+  (single volume, fixed block size, straightforward on-disk metadata)
+- VFS-ish file API for kernel callers from day one:
+  `open` / `read` / `write` / `create` / `mkdir` / `unlink` / `close`
+- Keep consistency rules simple (ordered metadata updates + fsck tool on
+  boot after unclean shutdown) instead of adding journaling now
+- Pick one clear target format and finish it end-to-end before adding
+  compatibility layers or a second FS
 
-**Unlocks.** Loading executables. Persisting state. Real configuration.
+**Layout details (v1 target).**
+- **Block size:** 4096 bytes everywhere (metadata + data)
+- **Block 0: superblock**
+  - Magic/version, total blocks, inode count, feature flags
+  - Block numbers for inode bitmap, data bitmap, inode table, data area
+  - Root inode number, clean/dirty unmount flag, last mount/write tick
+- **Inode bitmap:** 1 bit per inode (allocated/free)
+- **Data bitmap:** 1 bit per data block (allocated/free)
+- **Inode table:** fixed-size inode records (for example 128 bytes each)
+  - Type (`file`/`dir`), size, link count, direct block pointers
+  - One single-indirect pointer (optional in v1 if direct blocks are enough)
+  - Basic timestamps (`ctime`/`mtime`)
+- **Data area:** file contents and directory blocks
+- **Directory format:** variable-length entries in data blocks
+  - `inode`, `type`, `name_len`, `name[]`
+  - Always maintain `.` and `..` for directories
+
+**Write/update rules (no journal).**
+- Allocate in bitmap first in memory, but write blocks in crash-safe order:
+  data block -> inode (size/pointers) -> directory entry -> bitmap + superblock
+- On delete/unlink, reverse the visibility first:
+  directory entry removal -> inode link update/free -> data free in bitmap
+- Superblock `dirty` set on mount, cleared only on clean unmount
+- `fsck` on dirty mount repairs:
+  - bitmap vs inode-table mismatches
+  - directory entries pointing to invalid/free inodes
+  - inode link-count mismatches
+  - orphaned allocated blocks/inodes
+
+**Unlocks.** Loading executables, writable config/state, logs, and
+real application workflows that survive reboot.
 
 ### 3. Userspace
 
@@ -248,7 +311,7 @@ single-binary monolith.
 **What to build.**
 - Ring 3 entry: SYSCALL/SYSRET MSRs (`STAR`, `LSTAR`, `SFMASK`)
 - Per-process address space (CR3 switch on schedule)
-- ELF loader for userspace binaries (loaded from the FAT FS)
+- ELF loader for userspace binaries (loaded from the kernel FS)
 - Syscall table — start with the bare minimum: `write`, `read`,
   `exit`, `getpid`, `mmap`, `brk`
 - A `init` userspace program that does something visible

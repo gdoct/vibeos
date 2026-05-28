@@ -96,6 +96,7 @@ KERNEL_C_SRCS = \
   kernel/src/paging.c \
   kernel/src/kmalloc.c \
   kernel/src/device.c \
+  kernel/src/fs.c \
   kernel/src/idt.c \
   kernel/src/exception.c \
   kernel/src/pic.c \

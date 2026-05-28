@@ -10,6 +10,7 @@
 #include "kmalloc.h"
 #include "paging.h"
 #include "apic.h"
+#include "fs.h"
 #include "../../boot/include/bootinfo.h"
 
 extern "C" block_device_t *ramdisk_init(uint64_t num_blocks);
@@ -111,6 +112,114 @@ static void selftest_block(block_device_t *bd) {
 
     kprintf("[selftest] block %s: 1x%u-byte sector round-trip OK\n",
             bd->dev.name, bd->block_size);
+}
+
+/* End-to-end filesystem exercise: format, create a dir + files (one large
+   enough to need single-indirect blocks), read them back, list the dir,
+   unlink, then prove persistence across a clean remount and recovery across a
+   forced-dirty fsck. Runs on the boot stack with virtio polling (no scheduler
+   yet), like selftest_block above. */
+static void selftest_fs(block_device_t *dev) {
+    const char *msg = "Hello, MyFS!\n";
+    uint32_t mlen = (uint32_t)kstrlen(msg);
+    uint32_t spb  = FS_BLOCK_SIZE / dev->block_size;
+    int r, fd, got;
+
+    r = fs_mount(dev);
+    if (r != FS_OK) panic("fs: mount failed (%d)", r);
+
+    /* On a reboot the volume already holds /dir from a previous run — that is
+       itself proof of cross-reboot persistence, so EEXIST is fine here. */
+    r = fs_mkdir("/dir");
+    if (r != FS_OK && r != FS_EEXIST) panic("fs: mkdir /dir failed (%d)", r);
+
+    /* small file round-trip (TRUNC so a re-run starts clean) */
+    fd = fs_open("/dir/hello.txt", FS_O_CREATE | FS_O_TRUNC);
+    if (fd < 0) panic("fs: open hello.txt failed (%d)", fd);
+    if (fs_write(fd, msg, mlen) != (int)mlen) panic("fs: short write");
+    fs_close(fd);
+
+    char small[32];
+    fd = fs_open("/dir/hello.txt", 0);
+    if (fd < 0) panic("fs: reopen hello.txt failed (%d)", fd);
+    got = fs_read(fd, small, sizeof small);
+    fs_close(fd);
+    if (got != (int)mlen || kmemcmp(small, msg, mlen) != 0)
+        panic("fs: hello.txt round-trip mismatch (got %d)", got);
+
+    /* large file: 64 KiB = 16 blocks > 13 direct, so single-indirect kicks in */
+    const uint32_t BIG = 64 * 1024;
+    uint8_t *wbuf = (uint8_t *)kmalloc(BIG);
+    uint8_t *rbuf = (uint8_t *)kmalloc(BIG);
+    if (!wbuf || !rbuf) panic("fs: selftest out of memory");
+    for (uint32_t i = 0; i < BIG; i++) wbuf[i] = (uint8_t)(i * 31u + 7u);
+
+    fd = fs_open("/dir/big.bin", FS_O_CREATE | FS_O_TRUNC);
+    if (fd < 0) panic("fs: open big.bin failed (%d)", fd);
+    if (fs_write(fd, wbuf, BIG) != (int)BIG) panic("fs: big.bin short write");
+    fs_close(fd);
+
+    fd = fs_open("/dir/big.bin", 0);
+    kmemset(rbuf, 0, BIG);
+    got = fs_read(fd, rbuf, BIG);
+    fs_close(fd);
+    if (got != (int)BIG || kmemcmp(wbuf, rbuf, BIG) != 0)
+        panic("fs: big.bin round-trip mismatch (got %d)", got);
+    kprintf("[selftest] fs: 64 KiB indirect-block file round-trip OK\n");
+
+    /* directory listing */
+    fs_dirent_t ents[8];
+    int ne = fs_readdir("/dir", ents, 8);
+    kprintf("[selftest] fs: /dir lists %d entries:", ne);
+    for (int i = 0; i < ne; i++)
+        kprintf(" %s%s", ents[i].name, ents[i].type == FT_DIR ? "/" : "");
+    kprintf("\n");
+
+    /* unlink round-trip */
+    r = fs_create("/dir/tmp");
+    if (r != FS_OK && r != FS_EEXIST)    panic("fs: create tmp failed (%d)", r);
+    if (fs_unlink("/dir/tmp") != FS_OK)  panic("fs: unlink tmp failed");
+    if (fs_open("/dir/tmp", 0) != FS_ENOENT) panic("fs: tmp survived unlink");
+
+    /* clean unmount + remount: data persists, no fsck */
+    if (fs_unmount() != FS_OK) panic("fs: unmount failed");
+    if (fs_mount(dev) != FS_OK) panic("fs: remount failed");
+    fd = fs_open("/dir/hello.txt", 0);
+    if (fd < 0) panic("fs: hello.txt gone after clean remount (%d)", fd);
+    kmemset(small, 0, sizeof small);
+    got = fs_read(fd, small, sizeof small);
+    fs_close(fd);
+    if (got != (int)mlen || kmemcmp(small, msg, mlen) != 0)
+        panic("fs: persistence check failed");
+    kprintf("[selftest] fs: clean remount persisted /dir/hello.txt\n");
+
+    /* forced-dirty fsck: set the dirty flag and scribble the data bitmap to
+       all-free on disk, then remount. fsck must rebuild it from the inodes
+       (the source of truth) and leave the data intact. */
+    block_read(dev, 0, spb, rbuf);
+    ((superblock_t *)rbuf)->dirty = 1;
+    block_write(dev, 0, spb, rbuf);          /* mark unclean */
+    kmemset(rbuf, 0, FS_BLOCK_SIZE);
+    block_write(dev, 2 * spb, spb, rbuf);    /* wipe data bitmap (block 2) */
+
+    if (fs_mount(dev) != FS_OK) panic("fs: dirty remount failed");
+    fd = fs_open("/dir/big.bin", 0);
+    if (fd < 0) panic("fs: big.bin gone after fsck (%d)", fd);
+    kmemset(rbuf, 0, BIG);
+    got = fs_read(fd, rbuf, BIG);
+    fs_close(fd);
+    if (got != (int)BIG || kmemcmp(wbuf, rbuf, BIG) != 0)
+        panic("fs: big.bin corrupted by fsck (got %d)", got);
+    /* allocation still works (rebuilt bitmap has no phantom free blocks) */
+    fd = fs_open("/dir/after_fsck.txt", FS_O_CREATE);
+    if (fd < 0 || fs_write(fd, msg, mlen) != (int)mlen)
+        panic("fs: write after fsck failed");
+    fs_close(fd);
+    kprintf("[selftest] fs: fsck rebuilt the wiped bitmap, data intact\n");
+
+    fs_unmount();
+    kfree(wbuf);
+    kfree(rbuf);
 }
 
 static void selftest_paging(void) {
@@ -236,6 +345,11 @@ extern "C" void kmain(BootInfo *bi) {
     block_device_t *vblk = virtio_blk_init();
     if (vblk) selftest_block(vblk);
     g_demo_vblk = vblk;
+
+    /* Filesystem end-to-end test on real storage when present (so writes are
+       visible in the host vdisk.img), else on the ramdisk. Runs here, before
+       irq_enable, so virtio uses its polling path like selftest_block. */
+    selftest_fs(vblk ? vblk : rd);
 
     /* Now take interrupts. From here virtio completions arrive via IRQ
        and the timer drives preemption + sleeper wakeups. */
