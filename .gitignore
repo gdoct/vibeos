@@ -1,0 +1,45 @@
+# git ignore for c/c++ projects
+# Compiled Object files
+*.o
+*.so
+*.exe
+*.dll
+*.out
+*.a
+*.dylib
+# Precompiled Headers
+*.gch
+# Compiled Dynamic libraries
+*.dll
+*.so
+*.dylib
+# For Visual Studio
+*.vcxproj.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.cache
+*.ilk
+*.pdb
+*.idb
+*.ipch
+*.aps
+*.pch
+*.res
+*.obj
+*.log
+*.tlog
+*.lastbuildstate
+*.vspscc
+*.vssscc
+*.scc
+# For Code::Blocks      
+*.depend
+*.layout
+*.cbp
+*.workspace
+
+build/
+bin/
+dist/

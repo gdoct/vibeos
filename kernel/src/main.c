@@ -8,6 +8,7 @@
 #include "timer.h"
 #include "task.h"
 #include "kmalloc.h"
+#include "paging.h"
 #include "../../boot/include/bootinfo.h"
 
 extern "C" block_device_t *ramdisk_init(uint64_t num_blocks);
@@ -111,6 +112,46 @@ static void selftest_block(block_device_t *bd) {
             bd->dev.name, bd->block_size);
 }
 
+static void selftest_paging(void) {
+    /* Direct map: the same physical bytes must be visible through both the
+       identity address and PHYS_OFFSET + phys. Read the kernel's first
+       words both ways and compare. */
+    volatile uint32_t *ident  = (volatile uint32_t *)0x100000;
+    volatile uint32_t *direct = (volatile uint32_t *)phys_to_virt(0x100000);
+    if (*ident != *direct)
+        panic("paging: direct map mismatch %x != %x", *ident, *direct);
+
+    /* vmap round-trip: map a scratch page at a scratch VA, write through
+       it, observe the write through the identity alias, then unmap. */
+    uint64_t pa = pmm_alloc_page();
+    uint64_t va = KSTACK_REGION - 0x40000000ULL;   /* away from stacks */
+    vmap(va, pa, 1, PTE_P | PTE_W);
+    uint64_t got = 0;
+    if (!paging_query(va, &got) || got != pa)
+        panic("paging: query after vmap gave %lx, want %lx",
+              (unsigned long)got, (unsigned long)pa);
+    *(volatile uint32_t *)va = 0xC0FFEE42;
+    if (*(volatile uint32_t *)(uintptr_t)pa != 0xC0FFEE42)
+        panic("paging: write via vmap not visible at phys");
+    vunmap(va, 1);
+    if (paging_query(va, &got))
+        panic("paging: still mapped after vunmap");
+    pmm_free_page(pa);
+
+    /* Guard page: a fresh kernel stack must be mapped, with the page just
+       below its base unmapped. */
+    uint64_t base, dummy;
+    uint64_t top = kstack_alloc(4, &base);
+    (void)top;
+    if (!paging_query(base, &dummy))
+        panic("paging: stack base not mapped");
+    if (paging_query(base - PAGE_SIZE, &dummy))
+        panic("paging: stack guard page is mapped (no protection!)");
+    vunmap(base, 4);   /* leak the phys pages + VA range; fine for a test */
+
+    kprintf("[selftest] paging: direct map + vmap round-trip + stack guard OK\n");
+}
+
 static void selftest_heap(void) {
     /* Page freelist: a freed single page must be the next one handed out. */
     uint64_t a = pmm_alloc_page();
@@ -162,6 +203,8 @@ extern "C" void kmain(BootInfo *bi) {
             (unsigned long)bi->fb.base);
 
     pmm_init(bi);
+    paging_init(bi);
+    selftest_paging();
     selftest_heap();
 
     fb_device_t *fb = fb_init(&bi->fb);

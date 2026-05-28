@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "pmm.h"
 #include "irq.h"
+#include "paging.h"
 #include "task.h"
 
 /*
@@ -62,8 +63,11 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
     }
     if (slot < 0) panic("task_create: pool full");
 
-    uint64_t base = pmm_alloc_pages(KSTACK_PAGES);
-    if (!base) panic("task_create: stack alloc failed");
+    /* Stack lives in the kernel vmalloc window with an unmapped guard
+       page below it, so an overflow faults cleanly instead of scribbling
+       on a neighbour. stack_base/top are virtual addresses. */
+    uint64_t base;
+    uint64_t top = kstack_alloc(KSTACK_PAGES, &base);
 
     task_t *t = &g_tasks[slot];
     t->id         = slot;
@@ -71,7 +75,7 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
     t->entry      = entry;
     t->arg        = arg;
     t->stack_base = base;
-    t->stack_top  = base + (uint64_t)KSTACK_PAGES * PAGE_SIZE;
+    t->stack_top  = top;
 
     /* Hand-craft the stack so context_switch's restore-and-ret lands at
        task_trampoline with zeroed callee-saved registers.

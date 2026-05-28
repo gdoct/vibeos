@@ -93,6 +93,7 @@ KERNEL_C_SRCS = \
   kernel/src/kio.c \
   kernel/src/panic.c \
   kernel/src/pmm.c \
+  kernel/src/paging.c \
   kernel/src/kmalloc.c \
   kernel/src/device.c \
   kernel/src/idt.c \

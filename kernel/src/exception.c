@@ -34,6 +34,16 @@ void exception_handler(regs_t *r) {
 
     kprintf("\n!! EXCEPTION %lu (%s) err=%lx\n",
             r->vector, exc_name(r->vector), r->error_code);
+
+    if (r->vector == 14) {
+        /* #PF error code bits: P present, W/R write, U/S user, RSVD, I/D. */
+        uint64_t e = r->error_code;
+        kprintf("   page fault @ %016lx: %s, %s, %s%s\n", cr2,
+                (e & 1) ? "protection-violation" : "not-present",
+                (e & 2) ? "write" : "read",
+                (e & 4) ? "user" : "kernel",
+                (e & 16) ? ", instr-fetch" : "");
+    }
     kprintf("   rip=%016lx cs=%lx rflags=%016lx\n", r->rip, r->cs, r->rflags);
     kprintf("   rsp=%016lx ss=%lx cr2=%016lx\n",    r->rsp, r->ss, cr2);
     kprintf("   rax=%016lx rbx=%016lx rcx=%016lx\n", r->rax, r->rbx, r->rcx);

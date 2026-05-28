@@ -24,8 +24,9 @@ the host).
 
 ### Kernel core
 - **Linked at 1 MiB physical** ([kernel/linker.ld](kernel/linker.ld)),
-  small code model. The bootloader's identity-mapped page tables remain
-  in place; no kernel page-table work yet.
+  small code model. We build our own 4-level page tables at boot (see
+  Paging below) but keep the kernel identity-mapped, so no relink is
+  needed.
 - **GDT** ([kernel/src/gdt.S](kernel/src/gdt.S)) — three descriptors
   (null, kernel CS=0x08, kernel DS=0x10). Loaded by `gdt_init`, which
   also reloads CS via a far return.
@@ -60,6 +61,20 @@ the host).
   IRQ-state save/restore (`irq_save`/`irq_restore` in
   [kernel/include/irq.h](kernel/include/irq.h)) makes the wake paths
   safe from both task and IRQ context.
+- **Paging / virtual memory** ([kernel/src/paging.c](kernel/src/paging.c))
+  — our own 4-level page tables replace the firmware's at boot. `PML4[0]`
+  identity-maps low physical memory with 2 MiB pages (kernel keeps
+  running unrelinked); `PML4[256]` is a Linux-style **direct map** at
+  `PHYS_OFFSET` (0xFFFF800000000000) that shares the same PD tables, so
+  any phys address is reachable via `phys_to_virt`. The map auto-extends
+  past 4 GiB to cover the framebuffer/MMIO. A 4 KiB `vmap` / `vunmap` /
+  `paging_query` walker (intermediate tables allocated on demand) backs
+  **guarded kernel stacks**: each task stack lives in a high-half
+  vmalloc window (`KSTACK_REGION`) with an unmapped guard page below, so
+  a stack overflow takes a clean `#PF` instead of corrupting a neighbour.
+  The exception handler decodes `#PF` error bits + CR2. Verified by a
+  direct-map round-trip, a vmap/query/unmap round-trip, and a guard-page
+  fault landing exactly on the guard address.
 
 ### Device subsystem
 - **Device registry** ([kernel/include/device.h](kernel/include/device.h))
@@ -90,6 +105,7 @@ the host).
   ports 0xCF8/0xCFC, `pci_find(vendor, dev_lo, dev_hi)`.
 
 ### Memory & I/O plumbing
+- **Page tables** — see *Paging / virtual memory* under Kernel core.
 - **Physical page allocator** ([kernel/src/pmm.c](kernel/src/pmm.c)) —
   bump allocator over the largest ConventionalMemory region above the
   kernel image, plus a **single-page freelist**: `pmm_free_page` returns
@@ -130,7 +146,7 @@ the host).
 ┌──────────────────────────────────────────────────────────────┐
 │ kmain (kernel/src/main.c)                                    │
 │   gdt_init → idt_init  →  exceptions live                    │
-│   pmm_init(BootInfo) → kmalloc heap self-test                │
+│   pmm_init(BootInfo) → paging_init (CR3) → self-tests        │
 │   fb_init                                                    │
 │   irq_init (PIC) → timer_init(100Hz)   [IF still 0]          │
 │   ramdisk_init, virtio_blk_init (hooks INTx) → self-tests    │
@@ -150,8 +166,8 @@ the host).
 
 ## Recently shipped
 
-The first three follow-ups below are done — they're folded into "What
-works today" above:
+The first four follow-ups are done — they're folded into "What works
+today" above:
 
 - **Wait queues + blocking I/O** — `TASK_BLOCKED`, an idle task,
   `wait_queue_*`, and a `ksleep_ms` that blocks on a timer sleeper list.
@@ -161,34 +177,18 @@ works today" above:
   line, 8..15, now also opens the master IRQ2 cascade.)
 - **Real PMM + kmalloc** — single-page freelist (`pmm_free_page`) and a
   power-of-two slab `kmalloc`/`kfree`.
+- **Paging + virtual memory** — own 4-level tables (identity + a
+  `PHYS_OFFSET` direct map), 4 KiB `vmap`/`vunmap`, and guarded kernel
+  stacks. *Deferred:* the kernel is still identity-mapped rather than
+  relinked into the higher half — fine for now, revisit when userspace
+  needs the low half (see Userspace below).
 
 ## Follow-ups, ordered
 
 This is roughly the order to do them in — each one removes the most
 limiting constraint at the time it's chosen.
 
-### 1. Paging + virtual memory
-
-**Why now.** We're still on the firmware's identity map. Three things
-this blocks:
-- **Stack guard pages.** Today a stack overflow silently corrupts
-  whatever page sits below. With paging we can leave the page below
-  each kernel stack unmapped and get a clean `#PF`.
-- **Higher-half kernel.** Conventionally kernels live in the upper
-  canonical address range so userspace can have the lower half. We
-  can't put userspace anywhere useful without this.
-- **Memory-mapped device regions** for modern virtio, AHCI, and
-  basically anything past 2010.
-
-**What to build.**
-- 4-level page table setup, identity-map physical memory in the
-  higher half (`PHYS_OFFSET` like Linux)
-- `vmap` / `vunmap` for MMIO and per-task kernel stacks
-- Switch into our own page tables before tearing down UEFI's
-
-**Unlocks.** Everything from this point assumes paging.
-
-### 2. APIC + IOAPIC (replace 8259)
+### 1. APIC + IOAPIC (replace 8259)
 
 **Why now.** SMP needs LAPICs. MSI/MSI-X needs LAPICs. Modern virtio
 needs MSI to be useful. The 8259 is fine for one CPU + PIT but caps us
@@ -204,7 +204,7 @@ at that.
 **Unlocks.** SMP, MSI-driven device interrupts, sub-millisecond timer
 resolution.
 
-### 3. SMP
+### 2. SMP
 
 **Why now.** One CPU is fine, but most of the interesting design
 questions (per-CPU run queues, locking, IPIs, RCU) only show up at
@@ -219,7 +219,7 @@ N>1.
 
 **Unlocks.** Real concurrency, real performance discussions.
 
-### 4. Filesystem: read-only FAT, then something real
+### 3. Filesystem: read-only FAT, then something real
 
 **Why now.** Right now the kernel can read and write raw blocks on
 virtio-blk, but there's no way to load anything *named*. To load a
@@ -235,7 +235,7 @@ userspace binary from disk you need a filesystem.
 
 **Unlocks.** Loading executables. Persisting state. Real configuration.
 
-### 5. Userspace
+### 4. Userspace
 
 **Why now.** Everything until here has been kernel-only. Userspace
 makes the kernel an actual *operating system* rather than a
@@ -252,7 +252,7 @@ single-binary monolith.
 **Unlocks.** Multiple isolated processes, signals, fork/exec —
 basically everything that makes UNIX UNIX.
 
-### 6. Linux ABI compatibility
+### 5. Linux ABI compatibility
 
 The note in [kernel/README.md](kernel/README.md) says the kernel
 "should aim to be Linux compatible — run Linux applications and support
@@ -274,8 +274,15 @@ These will come up again. Capturing them so future work doesn't relitigate.
   the original boot Makefile. We use `extern "C"` liberally on anything
   asm or other-TU code touches. Don't grow this into Real C++ —
   no RTTI, no exceptions, no STL.
-- **Identity-mapped paging from firmware** is good enough until we
-  write our own. Don't try to set up paging just because.
+- **Own page tables, but kernel still identity-mapped.** We build our
+  own PML4 (identity + `PHYS_OFFSET` direct map) but deliberately did
+  *not* relink the kernel into the higher half — that's a bigger change
+  (load vs. virtual addresses, a high-VA entry trampoline) with no payoff
+  until userspace wants the low half. Keeping identity means existing
+  physical-pointer code (PMM, virtio descriptors, framebuffer) keeps
+  working untouched. New code that wants a phys address should reach it
+  via `phys_to_virt` rather than assuming identity, so the eventual
+  higher-half move is cheap.
 - **Legacy virtio over modern.** ~300 lines vs. ~800. Will swap when we
   add MSI/IOAPIC because the modern interface is required for MSI.
 - **8259 over APIC** for the same reason — small enough to write in an
