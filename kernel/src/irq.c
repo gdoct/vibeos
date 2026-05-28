@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "irq.h"
+#include "apic.h"
 
 extern "C" void pic_remap(uint8_t off1, uint8_t off2);
 extern "C" void pic_eoi(uint8_t irq);
@@ -7,6 +8,9 @@ extern "C" void pic_mask(uint8_t irq);
 extern "C" void pic_unmask(uint8_t irq);
 
 static irq_handler_t g_handlers[NUM_IRQS];
+static int           g_apic_mode = 0;
+
+void irq_set_apic_mode(int on) { g_apic_mode = on; }
 
 void irq_init(void) {
     pic_remap(IRQ_BASE, IRQ_BASE + 8);
@@ -28,9 +32,12 @@ void irq_unmask(uint8_t irq) { if (irq < NUM_IRQS) pic_unmask(irq); }
  *
  * EOI is sent BEFORE the handler runs. The scheduler's timer handler
  * may context-switch away and never return here — in that case the
- * deferred-EOI variant would leave the PIC line latched and block all
- * further timer interrupts. With IF=0 in the CPU there's no harm in
- * EOIing early.
+ * deferred-EOI variant would leave the interrupt latched and block all
+ * further interrupts. With IF=0 in the CPU there's no harm in EOIing
+ * early. For level-triggered I/O APIC lines this can cause one redundant
+ * re-fire (the line is still asserted when we EOI), but the device's ISR
+ * read in the handler deasserts it and the redundant interrupt is a
+ * harmless no-op once the handler checks "was this mine?".
  */
 extern "C" void irq_dispatch(regs_t *r) {
     uint64_t v = r->vector;
@@ -39,6 +46,7 @@ extern "C" void irq_dispatch(regs_t *r) {
         return;
     }
     uint8_t irq = (uint8_t)(v - IRQ_BASE);
-    pic_eoi(irq);
+    if (g_apic_mode) lapic_eoi();
+    else             pic_eoi(irq);
     if (g_handlers[irq]) g_handlers[irq](irq, r);
 }

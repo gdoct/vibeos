@@ -32,6 +32,10 @@ static void idt_set_gate(int vec, uint64_t handler) {
     g_idt[vec].reserved   = 0;
 }
 
+extern "C" void idt_set_vector(int vec, void *handler) {
+    idt_set_gate(vec, (uint64_t)(uintptr_t)handler);
+}
+
 void idt_init(void) {
     kmemset(g_idt, 0, sizeof(g_idt));
     for (int i = 0; i < 32; i++) idt_set_gate(i,          isr_table[i]);

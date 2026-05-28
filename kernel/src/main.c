@@ -9,6 +9,7 @@
 #include "task.h"
 #include "kmalloc.h"
 #include "paging.h"
+#include "apic.h"
 #include "../../boot/include/bootinfo.h"
 
 extern "C" block_device_t *ramdisk_init(uint64_t num_blocks);
@@ -210,11 +211,17 @@ extern "C" void kmain(BootInfo *bi) {
     fb_device_t *fb = fb_init(&bi->fb);
     paint_splash(fb);
 
-    /* PIC remap + 100 Hz tick source. Done before device init so a driver
-       can register and unmask its IRQ line and have it survive the remap.
-       Interrupts stay globally masked (IF=0) until irq_enable() below. */
+    /* Interrupt controller bring-up. irq_init remaps + masks the 8259 so
+       it's in a known-quiet state; apic_init then (if the MADT is usable)
+       takes over as the active controller, leaving the 8259 fully masked.
+       Done before device init so a driver can wire its IRQ here and have
+       it routed. Interrupts stay globally masked (IF=0) until irq_enable
+       below. */
     irq_init();
     timer_init(100);
+    if (!apic_init(bi, 100)) {
+        timer_start_pit();          /* fallback: PIT drives IRQ 0 via 8259 */
+    }
 
     /* 256 KiB RAM disk = 512 sectors of 512 bytes. Useful as a baseline
        check that the block_device_t interface works even when no real

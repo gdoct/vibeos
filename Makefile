@@ -100,6 +100,7 @@ KERNEL_C_SRCS = \
   kernel/src/exception.c \
   kernel/src/pic.c \
   kernel/src/irq.c \
+  kernel/src/apic.c \
   kernel/src/task.c \
   kernel/src/drivers/fb.c \
   kernel/src/drivers/font.c \

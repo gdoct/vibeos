@@ -46,7 +46,20 @@ static void on_tick(uint8_t irq, regs_t *regs) {
 
 void timer_init(uint32_t hz) {
     if (hz == 0) hz = 100;
-    uint32_t div = PIT_FREQ / hz;
+    g_hz = hz;
+    g_ticks = 0;
+
+    /* The tick lands on IRQ 0 regardless of source: the LAPIC timer
+       (APIC mode, vector 0x20) or the PIT via the 8259 (timer_start_pit).
+       on_tick is source-agnostic. */
+    irq_register(0, on_tick);
+    kprintf("[timer] tick handler registered for %u Hz\n", hz);
+}
+
+/* Fallback tick source when there's no APIC: program PIT channel 0 to
+   raise IRQ 0 at g_hz and unmask it on the 8259. */
+void timer_start_pit(void) {
+    uint32_t div = PIT_FREQ / g_hz;
     if (div > 0xFFFF) div = 0xFFFF;
     if (div == 0)     div = 1;
 
@@ -55,13 +68,8 @@ void timer_init(uint32_t hz) {
     outb(PIT_DATA0, (uint8_t)(div & 0xFF));
     outb(PIT_DATA0, (uint8_t)((div >> 8) & 0xFF));
 
-    g_hz = hz;
-    g_ticks = 0;
-
-    irq_register(0, on_tick);
     irq_unmask(0);
-
-    kprintf("[timer] PIT %u Hz (div=%u)\n", hz, div);
+    kprintf("[timer] PIT %u Hz (div=%u) driving IRQ0\n", g_hz, div);
 }
 
 uint64_t timer_ticks(void) { return g_ticks; }

@@ -5,6 +5,7 @@
 #include "block.h"
 #include "virtio.h"
 #include "irq.h"
+#include "apic.h"
 #include "task.h"
 
 /*
@@ -38,6 +39,7 @@ typedef struct virtio_blk {
     volatile uint16_t last_used_idx;  /* what we've already observed */
 
     uint8_t    irq_line;              /* PIC IRQ from PCI config 0x3C */
+    uint8_t    irq_ok;                /* completion IRQ wired (block vs poll) */
     wait_queue_t wq;                  /* submitter blocks here for completion */
     volatile uint64_t completions;    /* total requests the IRQ has reaped */
 
@@ -177,7 +179,7 @@ static int submit(virtio_blk_t *v, uint32_t type, uint64_t lba,
        another task gets the CPU while the disk works. Before the
        scheduler exists (early-boot self-tests), there's nothing to switch
        to, so fall back to polling and reaping inline. */
-    if (sched_active() && v->irq_line < NUM_IRQS) {
+    if (sched_active() && v->irq_ok) {
         uint64_t f = irq_save();
         while (v->last_used_idx != want)
             wait_queue_sleep(&v->wq);
@@ -236,17 +238,26 @@ extern "C" block_device_t *virtio_blk_init(void) {
 
     virtq_setup(&g_vblk);
 
-    /* INTx setup: the BIOS/firmware programmed the PIC IRQ this device is
-       wired to into PCI config 0x3C. Hook it and unmask the PIC line.
-       (The line stays dormant until kmain does irq_enable.) */
+    /* INTx completion interrupt. Under the I/O APIC, apic_init already
+       routed all PCI INTx GSIs to APIC_PCI_VECTOR (== IRQ 11 once
+       dispatched), so we just register our handler there. On the legacy
+       8259 we use the PIC IRQ the firmware wrote into PCI config 0x3C and
+       unmask that line. Either way the line stays dormant until kmain
+       does irq_enable. */
     g_vblk.irq_line = pci_read8(d.bus, d.dev, d.fn, PCI_INTERRUPT_LINE);
     g_vblk.wq.head = g_vblk.wq.tail = nullptr;
     g_vblk.completions = 0;
-    if (g_vblk.irq_line < NUM_IRQS) {
+    if (apic_enabled()) {
+        irq_register(APIC_PCI_VECTOR - 0x20, vblk_irq);
+        g_vblk.irq_ok = 1;
+        kprintf("[virtio-blk] INTx via I/O APIC -> vec %x\n", APIC_PCI_VECTOR);
+    } else if (g_vblk.irq_line < NUM_IRQS) {
         irq_register(g_vblk.irq_line, vblk_irq);
         irq_unmask(g_vblk.irq_line);
-        kprintf("[virtio-blk] INTx on IRQ %u\n", g_vblk.irq_line);
+        g_vblk.irq_ok = 1;
+        kprintf("[virtio-blk] INTx on PIC IRQ %u\n", g_vblk.irq_line);
     } else {
+        g_vblk.irq_ok = 0;
         kprintf("[virtio-blk] no usable IRQ line (%u); staying polled\n",
                 g_vblk.irq_line);
     }

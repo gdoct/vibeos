@@ -23,6 +23,10 @@ void irq_register(uint8_t irq, irq_handler_t h);
 void irq_mask(uint8_t irq);
 void irq_unmask(uint8_t irq);
 
+/* Switch irq_dispatch's end-of-interrupt from the 8259 to the local APIC.
+   Called by apic_init once the APIC is the active controller. */
+void irq_set_apic_mode(int on);
+
 /* Set IF=1. Don't call until irq_init() has remapped the PIC. */
 static inline void irq_enable(void)  { __asm__ volatile("sti"); }
 static inline void irq_disable(void) { __asm__ volatile("cli"); }

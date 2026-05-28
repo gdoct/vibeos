@@ -177,6 +177,14 @@ irq_common:
     iretq
     .size   irq_common, . - irq_common
 
+    /* Spurious LAPIC interrupt: no EOI, just return. */
+    .section .text
+    .globl  isr_spurious
+    .type   isr_spurious, @function
+isr_spurious:
+    iretq
+    .size   isr_spurious, . - isr_spurious
+
     /* Table of stub entry points, used by idt_init() in C. */
     .section .rodata
     .balign 8

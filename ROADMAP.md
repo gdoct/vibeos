@@ -39,18 +39,30 @@ the host).
     ([kernel/src/exception.c](kernel/src/exception.c))
   - `irq_dispatch` → look up handler, **EOI first**, then call
     ([kernel/src/irq.c](kernel/src/irq.c))
-- **8259 PIC** ([kernel/src/pic.c](kernel/src/pic.c)) — remapped to
-  vectors 0x20..0x2F, all lines masked at init. `pic_unmask` /
+- **APIC (LAPIC + I/O APIC)** ([kernel/src/apic.c](kernel/src/apic.c))
+  — the active interrupt controller. `apic_init` parses the ACPI MADT
+  (via the BootInfo RSDP → RSDT/XSDT) for the LAPIC and I/O APIC, enables
+  the LAPIC (base MSR + spurious vector 0xFF), masks every I/O APIC
+  redirection entry, and routes the PCI INTx GSIs (16..23) to one shared
+  vector (`0x2B`). The system tick is the **LAPIC timer**, calibrated
+  against PIT channel 2 and run periodic at 100 Hz on vector `0x20`.
+  `irq_dispatch` EOIs through the LAPIC in this mode. The 8259 is left
+  fully masked; if the MADT is unusable we fall back to it + the PIT.
+- **8259 PIC** ([kernel/src/pic.c](kernel/src/pic.c)) — legacy fallback
+  only. Remapped to 0x20..0x2F, all lines masked at init. `pic_unmask` /
   `pic_mask` / `pic_eoi`.
 - **PIT** ([kernel/src/drivers/timer.c](kernel/src/drivers/timer.c)) —
-  channel 0, mode 3, 100 Hz. `g_ticks` counter; `ksleep_ms` blocks the
-  task on a sleeper list (busy-`hlt` only before the scheduler exists).
+  channel 2 is the LAPIC-timer calibration reference; channel 0 only
+  drives the tick in the no-APIC fallback (`timer_start_pit`). `g_ticks`
+  counter; `ksleep_ms` blocks the task on a sleeper list (busy-`hlt` only
+  before the scheduler exists).
 - **Round-robin preemptive scheduler**
   ([kernel/src/task.c](kernel/src/task.c),
   [kernel/src/context_switch.S](kernel/src/context_switch.S)) — fixed
   pool of 8 tasks, 16 KiB per-task kernel stack from PMM, cooperative
   `task_yield` *and* timer-driven preemption (via `sched_tick` from the
-  PIT IRQ). A `TASK_BLOCKED` state plus an always-runnable **idle task**
+  system-tick IRQ — the LAPIC timer). A `TASK_BLOCKED` state plus an
+  always-runnable **idle task**
   (`sti; hlt`) mean a CPU with no ready work draws no power instead of
   spinning. Verified by workers that sleep and an I/O worker that blocks.
 - **Wait queues + blocking sleep** ([kernel/src/task.c](kernel/src/task.c))
@@ -92,11 +104,12 @@ the host).
   — 256 KiB backed by PMM pages. Exercises the interface end-to-end.
 - **Virtio-blk** ([kernel/src/drivers/virtio_blk.c](kernel/src/drivers/virtio_blk.c))
   — legacy PCI IO BAR, single virtqueue, three descriptors per request
-  (header / data / status). **IRQ-driven completion**: the INTx line is
-  read from PCI config `0x3C`, the handler reads the clear-on-read ISR
-  register and wakes the submitter via a per-device wait queue, so a
-  reading task blocks (letting others run) instead of polling
-  `used_idx`. Falls back to polling during early boot before the
+  (header / data / status). **IRQ-driven completion**: the completion
+  interrupt arrives via the I/O APIC (the shared PCI INTx vector; on the
+  PIC fallback, the line from PCI config `0x3C`). The handler reads the
+  clear-on-read ISR register and wakes the submitter via a per-device
+  wait queue, so a reading task blocks (letting others run) instead of
+  polling `used_idx`. Falls back to polling during early boot before the
   scheduler exists. Verified: bytes the kernel writes show up in the
   host `vdisk.img` byte-for-byte, and an I/O worker completes 8 reads
   via IRQ while other tasks run.
@@ -148,7 +161,7 @@ the host).
 │   gdt_init → idt_init  →  exceptions live                    │
 │   pmm_init(BootInfo) → paging_init (CR3) → self-tests        │
 │   fb_init                                                    │
-│   irq_init (PIC) → timer_init(100Hz)   [IF still 0]          │
+│   irq_init → timer_init → apic_init (LAPIC+IOAPIC) [IF 0]    │
 │   ramdisk_init, virtio_blk_init (hooks INTx) → self-tests    │
 │   sti  →  device_dump                                        │
 │   scheduler_demo: sched_init + idle + workers + io task      │
@@ -182,29 +195,20 @@ today" above:
   stacks. *Deferred:* the kernel is still identity-mapped rather than
   relinked into the higher half — fine for now, revisit when userspace
   needs the low half (see Userspace below).
+- **APIC (LAPIC + I/O APIC)** — replaced the 8259 as the active
+  controller: MADT parse, LAPIC enable, I/O APIC routing of PCI INTx to a
+  shared vector, LAPIC-timer system tick calibrated against the PIT.
+  *Deferred:* MSI/MSI-X + modern virtio (the I/O APIC INTx path works
+  today, so this is no longer blocking); the ACPI `_PRT` (we route all
+  PCI GSIs to one shared vector instead of resolving each device's pin —
+  correct for shared INTx, revisit if we need per-device routing).
 
 ## Follow-ups, ordered
 
 This is roughly the order to do them in — each one removes the most
 limiting constraint at the time it's chosen.
 
-### 1. APIC + IOAPIC (replace 8259)
-
-**Why now.** SMP needs LAPICs. MSI/MSI-X needs LAPICs. Modern virtio
-needs MSI to be useful. The 8259 is fine for one CPU + PIT but caps us
-at that.
-
-**What to build.**
-- Parse ACPI MADT to find LAPIC base + IOAPIC base + IRQ overrides
-- Map LAPIC MMIO (needs paging)
-- Disable 8259, enable LAPIC, set up spurious vector
-- Reprogram IOAPIC redirection entries for the IRQs we care about
-- Switch the timer source to LAPIC-timer or HPET (PIT becomes legacy)
-
-**Unlocks.** SMP, MSI-driven device interrupts, sub-millisecond timer
-resolution.
-
-### 2. SMP
+### 1. SMP
 
 **Why now.** One CPU is fine, but most of the interesting design
 questions (per-CPU run queues, locking, IPIs, RCU) only show up at
@@ -219,7 +223,7 @@ N>1.
 
 **Unlocks.** Real concurrency, real performance discussions.
 
-### 3. Filesystem: read-only FAT, then something real
+### 2. Filesystem: read-only FAT, then something real
 
 **Why now.** Right now the kernel can read and write raw blocks on
 virtio-blk, but there's no way to load anything *named*. To load a
@@ -235,7 +239,7 @@ userspace binary from disk you need a filesystem.
 
 **Unlocks.** Loading executables. Persisting state. Real configuration.
 
-### 4. Userspace
+### 3. Userspace
 
 **Why now.** Everything until here has been kernel-only. Userspace
 makes the kernel an actual *operating system* rather than a
@@ -252,7 +256,7 @@ single-binary monolith.
 **Unlocks.** Multiple isolated processes, signals, fork/exec —
 basically everything that makes UNIX UNIX.
 
-### 5. Linux ABI compatibility
+### 4. Linux ABI compatibility
 
 The note in [kernel/README.md](kernel/README.md) says the kernel
 "should aim to be Linux compatible — run Linux applications and support
@@ -283,16 +287,23 @@ These will come up again. Capturing them so future work doesn't relitigate.
   working untouched. New code that wants a phys address should reach it
   via `phys_to_virt` rather than assuming identity, so the eventual
   higher-half move is cheap.
-- **Legacy virtio over modern.** ~300 lines vs. ~800. Will swap when we
-  add MSI/IOAPIC because the modern interface is required for MSI.
-- **8259 over APIC** for the same reason — small enough to write in an
-  afternoon, swap when SMP arrives.
+- **Legacy virtio over modern.** ~300 lines vs. ~800. Its INTx
+  completion now arrives through the I/O APIC, so the original reason to
+  swap (needing MSI) is no longer pressing; revisit only if we want
+  MSI-X / multiqueue.
+- **APIC, not the 8259.** The LAPIC + I/O APIC are now the active
+  controller (the 8259 is a masked fallback). We route *all* PCI INTx
+  GSIs to one shared vector rather than parse the ACPI `_PRT` — correct
+  for shared, level-triggered INTx and far cheaper than an AML
+  interpreter. The LAPIC timer (not the PIT) is the system tick.
 - **Fixed-size task pool, fixed-size kernel stacks**. Cheap and obvious
   failure mode (panic). Grow when there's a real reason.
 - **C++ `const` globals need `extern "C"`** to be visible across TUs.
   Bit us once in the framebuffer font; will bite again.
 - **EOI before handler, always.** A handler that context-switches away
-  must not strand the PIC line. The comment in
+  must not strand the interrupt line (PIC or LAPIC). For level-triggered
+  I/O APIC lines this can cause one redundant re-fire, which the device's
+  ISR-claim check absorbs harmlessly. The comment in
   [kernel/src/irq.c](kernel/src/irq.c) explains it.
 
 ## How to run
