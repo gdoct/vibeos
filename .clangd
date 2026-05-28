@@ -1,0 +1,15 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -x
+    - c++
+    - -Ikernel/include
+    - -Iboot/include
+    - -ffreestanding
+    - -fno-exceptions
+    - -fno-rtti
+    - -mno-red-zone
+    - -mno-sse
+    - -mno-mmx
+    - -Wall
+    - -Wextra
