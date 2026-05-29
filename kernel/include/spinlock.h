@@ -9,58 +9,41 @@ extern "C" {
 #endif
 
 /*
- * Critical-section seam (ROADMAP §3).
+ * IRQ-safe test-and-set spinlock (ROADMAP §1).
  *
- * On a uniprocessor there is no true concurrency: clearing IF (irq_save)
- * already gives mutual exclusion against IRQ handlers and, since nothing
- * else runs, against every other thread. So the UP body of a spinlock is
- * just irq_save / irq_restore — no actual spinning.
+ * Acquire disables interrupts on this CPU *then* spins on an atomic word, so
+ * (a) an IRQ handler on the holding CPU can't deadlock trying to re-take the
+ * lock, and (b) other CPUs are excluded by the atomic. Release stores the word
+ * (store-release) and restores the caller's interrupt state.
  *
- * The point of having the *type* now is to mark every site that will need
- * a real lock once SMP (§1) lands. At that point spin_lock grows a
- * test-and-set / ticket loop around this same IRQ-disable (an IRQ-safe
- * spinlock: take the lock with interrupts off so an IRQ on the holding CPU
- * can't deadlock against it), and these call sites do not change.
+ * On a uniprocessor there's no contention — IF is already off, so the exchange
+ * always succeeds on the first try and this degenerates to irq_save/restore.
  *
- * Convention: every shared mutable structure (scheduler run queue, PMM
- * freelist, kmalloc slabs, FS tables, and the new userspace vmspace / fd
- * table / process table) owns a spinlock_t and takes it here rather than
- * calling irq_save directly. New code uses this from day one; existing
- * bare irq_save/irq_restore sites migrate to it opportunistically.
+ * Convention: every shared mutable structure owns a spinlock_t and takes it
+ * here rather than calling irq_save directly.
  */
 typedef struct spinlock {
-    uint64_t flags;   /* UP: saved RFLAGS from irq_save while held */
-#ifndef NDEBUG
-    int      held;    /* cheap re-entrancy / unlock-without-lock check */
-#endif
+    volatile uint32_t locked;   /* 0 = free, 1 = held */
+    uint64_t          flags;    /* saved RFLAGS of the current holder */
 } spinlock_t;
 
-#define SPINLOCK_INIT  { 0 }
+#define SPINLOCK_INIT  { 0, 0 }
 
 static inline void spin_lock_init(spinlock_t *l) {
-    l->flags = 0;
-#ifndef NDEBUG
-    l->held = 0;
-#endif
+    l->locked = 0;
+    l->flags  = 0;
 }
 
 static inline void spin_lock(spinlock_t *l) {
-    uint64_t f = irq_save();
-    /* SMP §1: a `lock; bts` / ticket-wait loop goes here, spinning with
-       interrupts already off so the holder can't be preempted into a
-       deadlock. UP has nothing to spin on. */
-    l->flags = f;
-#ifndef NDEBUG
-    l->held = 1;
-#endif
+    uint64_t f = irq_save();    /* IF off first: IRQ-safe on this CPU */
+    while (__atomic_exchange_n(&l->locked, 1u, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
+    l->flags = f;               /* only the holder writes flags */
 }
 
 static inline void spin_unlock(spinlock_t *l) {
     uint64_t f = l->flags;
-#ifndef NDEBUG
-    l->held = 0;
-#endif
-    /* SMP §1: release the lock word (store-release) before restoring IF. */
+    __atomic_store_n(&l->locked, 0u, __ATOMIC_RELEASE);
     irq_restore(f);
 }
 

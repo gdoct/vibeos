@@ -1,7 +1,10 @@
 #include "kernel.h"
 #include "pmm.h"
 #include "irq.h"
+#include "spinlock.h"
 #include "paging.h"   /* phys_to_virt: pages are reached via the direct map */
+
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 /* EFI memory type we treat as free. The full UEFI spec lists a few more
    that become free after ExitBootServices, but ConventionalMemory alone
@@ -59,7 +62,7 @@ void pmm_init(const BootInfo *bi) {
 uint64_t pmm_alloc_pages(size_t pages) {
     if (pages == 0) return 0;
 
-    uint64_t f = irq_save();
+    spin_lock(&pmm_lock);
 
     /* Single-page requests prefer the freelist so returned pages get
        reused. Multi-page requests need contiguity, which the freelist
@@ -68,16 +71,16 @@ uint64_t pmm_alloc_pages(size_t pages) {
         uint64_t addr = pmm_freelist;
         pmm_freelist = *(uint64_t *)phys_to_virt(addr);   /* next-free link */
         pmm_freed--;
-        irq_restore(f);
+        spin_unlock(&pmm_lock);
         kmemset(phys_to_virt(addr), 0, PAGE_SIZE);
         return addr;
     }
 
     uint64_t bytes = (uint64_t)pages * PAGE_SIZE;
-    if (pmm_cursor + bytes > pmm_end) { irq_restore(f); return 0; }
+    if (pmm_cursor + bytes > pmm_end) { spin_unlock(&pmm_lock); return 0; }
     uint64_t addr = pmm_cursor;
     pmm_cursor += bytes;
-    irq_restore(f);
+    spin_unlock(&pmm_lock);
     kmemset(phys_to_virt(addr), 0, (size_t)bytes);
     return addr;
 }
@@ -88,11 +91,11 @@ void pmm_free_page(uint64_t phys) {
     if (phys == 0) return;
     if (phys & PAGE_MASK) panic("pmm_free_page: %lx not page-aligned",
                                 (unsigned long)phys);
-    uint64_t f = irq_save();
+    spin_lock(&pmm_lock);
     *(uint64_t *)phys_to_virt(phys) = pmm_freelist;   /* store next-free link */
     pmm_freelist = phys;
     pmm_freed++;
-    irq_restore(f);
+    spin_unlock(&pmm_lock);
 }
 
 uint64_t pmm_free_bytes(void)  {

@@ -1,8 +1,11 @@
 #include "kernel.h"
 #include "pmm.h"
 #include "irq.h"
+#include "spinlock.h"
 #include "paging.h"   /* PMM hands out physical addrs; reach them via direct map */
 #include "kmalloc.h"
+
+static spinlock_t kmalloc_lock = SPINLOCK_INIT;
 
 /*
  * A small heap on top of the physical page allocator.
@@ -69,13 +72,13 @@ static int refill(int c) {
 void *kmalloc(size_t size) {
     if (size == 0) return nullptr;
 
-    uint64_t f = irq_save();
+    spin_lock(&kmalloc_lock);
     size_t need = size + HDR_SIZE;
     void *ret = nullptr;
 
     int c = size_to_class(need);
     if (c >= 0) {
-        if (!k_slabs[c] && refill(c) < 0) { irq_restore(f); return nullptr; }
+        if (!k_slabs[c] && refill(c) < 0) { spin_unlock(&kmalloc_lock); return nullptr; }
         free_node_t *n = k_slabs[c];
         k_slabs[c] = n->next;
 
@@ -96,7 +99,7 @@ void *kmalloc(size_t size) {
     }
 
     if (ret) k_in_use += size;
-    irq_restore(f);
+    spin_unlock(&kmalloc_lock);
     return ret;
 }
 
@@ -107,7 +110,7 @@ void kfree(void *ptr) {
     if (h->magic != ALLOC_MAGIC)
         panic("kfree: bad magic %x at %p (double free?)", h->magic, ptr);
 
-    uint64_t f = irq_save();
+    spin_lock(&kmalloc_lock);
     h->magic = 0;   /* poison so a double free trips the check above */
 
     k_in_use -= h->req_size;
@@ -123,7 +126,7 @@ void kfree(void *ptr) {
         n->next = k_slabs[c];
         k_slabs[c] = n;
     }
-    irq_restore(f);
+    spin_unlock(&kmalloc_lock);
 }
 
 size_t kmalloc_in_use(void) { return k_in_use; }
