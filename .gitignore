@@ -43,3 +43,4 @@
 build/
 bin/
 dist/
+obj/
