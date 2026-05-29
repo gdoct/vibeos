@@ -145,10 +145,8 @@ static int submit(virtio_blk_t *v, uint32_t type, uint64_t lba,
     v->status       = 0xFF;     /* sentinel; device overwrites */
 
     /* Descriptor addresses are what the device DMAs against, so they must be
-       physical. Kernel pointers are now direct-map / high-half VAs (v->hdr
-       lives in .bss, the kernel-high window), never identity — translate via
-       the page tables. Each buffer here fits in one page, so it is
-       physically contiguous. */
+       physical. Kernel pointers are direct-map / high-half VAs, never
+       identity — translate via the page tables (kva_to_phys). */
 
     /* desc[0]: header (read-only for device) */
     v->desc[0].addr  = kva_to_phys(&v->hdr);
@@ -156,18 +154,33 @@ static int submit(virtio_blk_t *v, uint32_t type, uint64_t lba,
     v->desc[0].flags = VIRTQ_DESC_F_NEXT;
     v->desc[0].next  = 1;
 
-    /* desc[1]: data buffer */
-    v->desc[1].addr  = kva_to_phys(buf);
-    v->desc[1].len   = data_bytes;
-    v->desc[1].flags = VIRTQ_DESC_F_NEXT
-                     | (dev_writes_data ? VIRTQ_DESC_F_WRITE : 0);
-    v->desc[1].next  = 2;
+    /* Data buffer, scatter-gathered per physical page. The caller's buffer may
+       be a kernel stack / vmalloc region whose pages are NOT physically
+       contiguous, so a single (addr,len) would DMA across a page boundary into
+       the wrong frame. Emit one descriptor per page-bounded chunk, translating
+       each independently. */
+    uint16_t d = 1;
+    uint8_t *p = (uint8_t *)buf;
+    uint32_t remaining = data_bytes;
+    uint16_t data_flag = VIRTQ_DESC_F_NEXT | (dev_writes_data ? VIRTQ_DESC_F_WRITE : 0);
+    while (remaining > 0) {
+        uint32_t page_off = (uint32_t)((uintptr_t)p & PAGE_MASK);
+        uint32_t chunk = (uint32_t)PAGE_SIZE - page_off;
+        if (chunk > remaining) chunk = remaining;
+        v->desc[d].addr  = kva_to_phys(p);
+        v->desc[d].len   = chunk;
+        v->desc[d].flags = data_flag;
+        v->desc[d].next  = (uint16_t)(d + 1);
+        p += chunk; remaining -= chunk; d++;
+        if (d >= v->qsize - 1)
+            panic("virtio-blk: transfer too large (%u bytes)", data_bytes);
+    }
 
-    /* desc[2]: status byte (device-write) */
-    v->desc[2].addr  = kva_to_phys(&v->status);
-    v->desc[2].len   = 1;
-    v->desc[2].flags = VIRTQ_DESC_F_WRITE;
-    v->desc[2].next  = 0;
+    /* status byte (device-write), terminating the chain */
+    v->desc[d].addr  = kva_to_phys(&v->status);
+    v->desc[d].len   = 1;
+    v->desc[d].flags = VIRTQ_DESC_F_WRITE;
+    v->desc[d].next  = 0;
 
     /* Add to available ring. x86 TSO + compiler barrier is enough. */
     uint16_t idx = *v->avail_idx;
