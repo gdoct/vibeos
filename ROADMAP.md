@@ -318,9 +318,11 @@ Files: [kernel/src/usermode.S](kernel/src/usermode.S),
 [kernel/src/tss.c](kernel/src/tss.c),
 [kernel/src/elf64.c](kernel/src/elf64.c), [user/](user/), and the
 higher-half relink in [kernel/src/start.S](kernel/src/start.S) +
-[kernel/linker.ld](kernel/linker.ld). **Milestone B (below) is next:**
-per-process address spaces, `fork`/`execve`, the host VibeFS populate tool,
-and console input. The detailed spec is kept below as the build record.
+[kernel/linker.ld](kernel/linker.ld). **Milestone B is also shipped**
+(per-process address spaces, `fork`/`execve`/`wait4`, programs loaded from
+disk, and an interactive `/bin/sh` over the serial console) — see its
+section below. The whole of §3 is done; **SMP (§1) is the next step.** The
+detailed specs are kept below as the build record.
 
 **Why now.** Everything until here has been kernel-only. Userspace
 makes the kernel an actual *operating system* rather than a
@@ -463,7 +465,15 @@ highest-leverage insurance against a viral SMP refactor.
   without taking down the kernel; a timer tick preempts a spinning user
   loop (proves TSS `rsp0` + the `iretq` resume path).
 
-#### Milestone B — real processes & isolation
+#### Milestone B — real processes & isolation ✅ shipped
+
+**Milestone B is complete:** per-process address spaces, `fork`/`execve`/
+`wait4`, programs loaded from disk, and an interactive shell. Verified on
+QEMU `-smp 1`: `/bin/init` execs `/bin/sh`; at the `vibe$` prompt, `help`,
+running `/bin/hello` by name and by path, command-not-found, and `exit`
+all work, with programs loaded from the VibeFS volume. Built+bootstrapped
+by [build.sh](build.sh) (clean image each run via the diskutil host tool).
+Phase-by-phase status below.
 
 **✅ Phase 4 shipped (per-process address spaces + fork/execve/wait4).**
 Each process owns a `vmspace_t` (its own PML4); the kernel upper half
@@ -494,14 +504,30 @@ pointers are dereferenced directly). **Phase 5(B) is next.**
 - `fork` (COW or eager), `execve` (tear down user region, reload ELF),
   `wait4`. This is where multiple isolated processes become real.
 
-**Phase 5(B) — host FS populate tool + console input.**
-- Flesh out [interop/tools/diskutil](interop/tools/diskutil/) into a
-  host tool that writes files into `vdisk.img` in VibeFS format (reusing
-  the on-disk structs in [kernel/include/fs.h](kernel/include/fs.h)).
-  Add a `make image` step that installs `/bin/init` (and later
-  `busybox`, `tcc`). Retires the embedded-blob hack.
-- PS/2 keyboard (or serial RX) + a TTY so `read(0)` works — the
-  prerequisite for any interactive program.
+**✅ Phase 5(B) shipped (load-from-disk + console + shell).**
+- The kernel mounts the root VibeFS volume at boot and loads `/bin/init`
+  from it ([user_load_path](kernel/src/elf64.c)); `execve` reads programs
+  from disk too. Embedded blobs are retired and the destructive fs
+  self-test is gone.
+- The host tool [interop/tools/diskutil](interop/tools/diskutil/)
+  (`disktool-cli`) creates + populates the VibeFS image
+  (`--create-volume`/`--mkdir`/`--import`); [build.sh](build.sh) wires the
+  clean-build + bootstrap flow and `make run` mounts the result. (Its
+  `FsMagic` was corrected to `0x53464256` to match the kernel post-rename.)
+- **Console:** serial RX (chosen over PS/2 — testable headless) drained
+  from the timer tick into a canonical line-discipline TTY
+  ([kernel/src/tty.c](kernel/src/tty.c)); `read(0)` blocks and returns one
+  line. [user/sh.c](user/sh.c) is a small shell (fork+execve+wait4, `/bin`
+  path resolution, `help`/`exit`).
+- *Bonus fix found here:* virtio-blk now scatter-gathers DMA per physical
+  page — a multi-page block read into a non-contiguous kstack buffer had
+  been corrupting bytes past a page boundary.
+
+*Deferred:* on an **unclean** shutdown the next boot's `fsck` drops
+`/bin/init` on a diskutil-made volume (kernel-fsck ↔ tool layout nuance);
+the "clean image each rebuild" workflow avoids it. `execve` still ignores
+user `argv` (kernel sets `argv[0]=path`). No ACPI poweroff (a clean `exit`
+halts; QEMU stays up).
 
 **Decisions recorded.**
 - **SYSCALL/SYSRET, not `int 0x80`** — matches §4's Linux x86-64 path.
