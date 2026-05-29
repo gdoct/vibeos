@@ -1,0 +1,167 @@
+﻿@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Disk Explorer";
+}
+
+<section class="hero">
+    <h1>MyFS Disk Explorer</h1>
+    <p>Open a disk image, browse directories, preview file contents, and download files from MyFS v1.0 volumes.</p>
+</section>
+
+<section class="panel">
+    <form method="get" class="form-grid">
+        <label asp-for="ImagePath">Disk image path</label>
+        <input asp-for="ImagePath" type="text" placeholder="/home/guido/myos/vdisk.img" />
+
+        <label asp-for="DirectoryPath">Directory path</label>
+        <input asp-for="DirectoryPath" type="text" placeholder="/" />
+
+        <div class="form-actions">
+            <button type="submit" class="btn-primary">Open Directory</button>
+        </div>
+    </form>
+</section>
+
+@if (!string.IsNullOrWhiteSpace(Model.ErrorMessage))
+{
+    <section class="panel error-box">
+        <strong>Could not read image:</strong>
+        <div>@Model.ErrorMessage</div>
+    </section>
+}
+
+@if (!string.IsNullOrWhiteSpace(Model.StatusMessage))
+{
+    <section class="panel status-box">
+        @Model.StatusMessage
+    </section>
+}
+
+@if (!string.IsNullOrWhiteSpace(Model.ErrorStatusMessage))
+{
+    <section class="panel error-box">
+        @Model.ErrorStatusMessage
+    </section>
+}
+
+@if (!string.IsNullOrWhiteSpace(Model.ImagePath))
+{
+    <section class="panel action-grid">
+        <form method="post" asp-page-handler="CreateDirectory" class="mini-form">
+            <input type="hidden" name="imagePath" value="@Model.ImagePath" />
+            <input type="hidden" name="directoryPath" value="@Model.DirectoryPath" />
+            <label>Create directory</label>
+            <input type="text" name="newDirectoryName" placeholder="new-folder" />
+            <button type="submit" class="btn-primary">Create</button>
+        </form>
+
+        <form method="post" enctype="multipart/form-data" asp-page-handler="Upload" class="mini-form">
+            <input type="hidden" name="imagePath" value="@Model.ImagePath" />
+            <input type="hidden" name="directoryPath" value="@Model.DirectoryPath" />
+            <label>Upload file</label>
+            <input type="file" name="uploadFile" />
+            <button type="submit" class="btn-primary">Upload</button>
+        </form>
+
+        <form method="post" asp-page-handler="Copy" class="mini-form">
+            <input type="hidden" name="imagePath" value="@Model.ImagePath" />
+            <input type="hidden" name="directoryPath" value="@Model.DirectoryPath" />
+            <label>Copy file</label>
+            <input type="text" name="copySourcePath" placeholder="/hello.txt" />
+            <input type="text" name="copyDestinationName" placeholder="hello-copy.txt" />
+            <button type="submit" class="btn-primary">Copy</button>
+        </form>
+    </section>
+
+    <section class="panel">
+        <div class="meta-row">
+            <span><strong>Image:</strong> @Model.ImagePath</span>
+            <span><strong>Directory:</strong> @Model.DirectoryPath</span>
+        </div>
+
+        @if (Model.Entries.Count == 0)
+        {
+            <p class="muted">No entries found in this directory.</p>
+        }
+        else
+        {
+            <div class="table-wrap">
+                <table class="explorer-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Type</th>
+                            <th>Size</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var entry in Model.Entries)
+                    {
+                        <tr>
+                            <td>@entry.Name</td>
+                            <td>@entry.Type</td>
+                            <td>@entry.Size</td>
+                            <td>
+                                @if (entry.Type == DiskUtil.Core.Filesystems.MyFs.v1_0.MyFsNodeType.Directory)
+                                {
+                                    <a class="action-link"
+                                       asp-page="/Index"
+                                       asp-route-ImagePath="@Model.ImagePath"
+                                       asp-route-DirectoryPath="@entry.FullPath">Browse</a>
+                                }
+                                else
+                                {
+                                    <a class="action-link"
+                                       asp-page="/Index"
+                                       asp-route-ImagePath="@Model.ImagePath"
+                                       asp-route-DirectoryPath="@Model.DirectoryPath"
+                                       asp-route-PreviewFilePath="@entry.FullPath">Preview</a>
+                                    <a class="action-link"
+                                       asp-page-handler="Download"
+                                       asp-route-imagePath="@Model.ImagePath"
+                                       asp-route-filePath="@entry.FullPath">Download</a>
+                                    <form method="post" asp-page-handler="Delete" class="inline-form">
+                                        <input type="hidden" name="imagePath" value="@Model.ImagePath" />
+                                        <input type="hidden" name="directoryPath" value="@Model.DirectoryPath" />
+                                        <input type="hidden" name="targetPath" value="@entry.FullPath" />
+                                        <button type="submit" class="action-button">Delete</button>
+                                    </form>
+                                }
+                                else
+                                {
+                                    <form method="post" asp-page-handler="Delete" class="inline-form">
+                                        <input type="hidden" name="imagePath" value="@Model.ImagePath" />
+                                        <input type="hidden" name="directoryPath" value="@Model.DirectoryPath" />
+                                        <input type="hidden" name="targetPath" value="@entry.FullPath" />
+                                        <button type="submit" class="action-button">Delete</button>
+                                    </form>
+                                }
+                            </td>
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+        }
+    </section>
+}
+
+@if (!string.IsNullOrWhiteSpace(Model.PreviewFilePath))
+{
+    <section class="panel preview-grid">
+        <div>
+            <h2>Preview: @Model.PreviewFilePath</h2>
+            @if (Model.PreviewTruncated)
+            {
+                <p class="muted">Showing the first 2048 bytes.</p>
+            }
+            <pre class="preview-text">@Model.PreviewText</pre>
+        </div>
+        <div>
+            <h2>Hex</h2>
+            <pre class="preview-hex">@Model.PreviewHex</pre>
+        </div>
+    </section>
+}

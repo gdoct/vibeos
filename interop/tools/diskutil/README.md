@@ -1,24 +1,85 @@
 # Disk utility
 
-This utility allows access to the virtual disk images created by the operating system. It can be used to read and write data to the virtual disk images, as well as to manage the disk images themselves.
-the program works as an interactive shell, allowing users to enter commands to perform various operations on the disk images. The utility supports a range of commands for managing disk images, including creating new disk images, mounting and unmounting disk images, and reading and writing data to disk images.
+Cross-platform C# utility for interacting with virtual disk images used by the OS project.
 
-the supported commands are as follows:
-- `ls`: List the contents of the current directory on the disk image.
-- `cd [directory]`: Change the current directory on the disk image.
-- `cat [file]`: Display the contents of a file on the disk image.
-- `write [file] [data]`: Write data to a file on the disk image.
-- `mkdir [directory]`: Create a new directory on the disk image.
-- `copy [source] [destination]`: Copy a file or directory from one location to another on the disk image.
-- `rm [file/directory]`: Remove a file or directory from the disk image.
-- `exit`: Exit the disk utility.
+## Current status
+The solution is scaffolded and includes a working MyFS explorer with write operations.
 
-## Usage
-To use the disk utility, run the following command:
+Projects:
+- `DiskUtil.Core` (`src/DiskUtil.Core`): Core library for filesystem and disk image logic.
+- `DiskUtil.Web` (`src/DiskUtil.Web`): ASP.NET Core Razor Pages web UI.
+- `DiskUtil.Core.Tests` (`tests/DiskUtil.Core.Tests`): xUnit tests for core logic.
 
-```diskutil [path-to-disk-image] [options]```
+Project dependencies:
+- `DiskUtil.Web` -> `DiskUtil.Core`
+- `DiskUtil.Core.Tests` -> `DiskUtil.Core`
+
+Solution file:
+- `DiskUtil.sln`
+
+## Build and run
+
+Build everything:
+
+```bash
+dotnet build DiskUtil.sln
 ```
 
+Run the web UI:
 
-# Filesystem logic
-Copy the filesystem source files from the kernel to the `diskutil` directory into a folder with a version number. This will allow the disk utility to access the necessary filesystem logic for reading and writing data to the disk images. When we later update the filesystem logic we can copy that to a new folder so we can stay backwards compatible with older disk images that may still be using the older filesystem logic.
+```bash
+dotnet run --project src/DiskUtil.Web
+```
+
+Run the web UI with a specific default image path:
+
+```bash
+dotnet run --project src/DiskUtil.Web -- --image /home/guido/myos/vdisk.img
+```
+
+You can also set the default in config or environment:
+- `src/DiskUtil.Web/appsettings.json` -> `DiskUtil:DefaultImagePath`
+- environment variable -> `DiskUtil__DefaultImagePath`
+
+Run tests:
+
+```bash
+dotnet test DiskUtil.sln
+```
+
+## Implemented structure
+Filesystem logic in `DiskUtil.Core` should be versioned to preserve compatibility as formats evolve.
+
+Suggested namespace/folder layout:
+
+```text
+DiskUtil.Core/
+    Filesystems/
+        MyFS/
+            v1_0/
+```
+
+## Implemented features
+- MyFS v1.0 reader in `DiskUtil.Core`:
+    - Superblock and inode parsing
+    - Directory traversal by absolute path
+    - File reads with direct + single/double/triple-indirect block support
+    - File and directory mutations: format image, create directory, write/overwrite file, copy file, delete file/empty directory
+- Explorer UI in `DiskUtil.Web`:
+    - Open disk image by path
+    - Browse directory contents
+    - Preview file text/hex (first 2 KiB)
+    - Download files (up to 64 MiB in this build)
+    - Create directory
+    - Upload file
+    - Copy file
+    - Delete file or empty directory
+- Tests in `DiskUtil.Core.Tests`:
+    - In-memory format + read tests
+    - Round-trip write and reopen verification
+    - Create/copy/delete behavior tests
+    - Invalid magic rejection test
+
+## Current limitations
+- Web delete only supports files and empty directories.
+- The web app assumes the image starts with a MyFS superblock at block 0.
