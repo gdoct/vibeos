@@ -239,12 +239,37 @@ limiting constraint at the time it's chosen.
 questions (per-CPU run queues, locking, IPIs, RCU) only show up at
 N>1.
 
-**What to build.**
-- Bring up APs via INIT-SIPI-SIPI from BSP
-- Per-CPU `task_t *current` (`gs:0` trick)
-- Per-CPU runqueues + work stealing or a single locked global queue
-- Spinlocks; spinlock irqsave variants for IRQ-shared data
-- IPI scaffolding (LAPIC ICR)
+**✅ Stage A shipped (locking + AP bringup).**
+- IRQ-safe test-and-set `spinlock_t` ([kernel/include/spinlock.h](kernel/include/spinlock.h));
+  PMM and kmalloc converted from bare `irq_save` to it; `kprintf`
+  serialized so multi-CPU output doesn't garble.
+- MADT CPU enumeration + LAPIC ICR IPIs ([kernel/src/apic.c](kernel/src/apic.c)).
+- A real-mode → long-mode AP trampoline ([kernel/src/ap_boot.S](kernel/src/ap_boot.S))
+  copied to a low page; INIT-SIPI-SIPI bringup in
+  [kernel/src/smp.c](kernel/src/smp.c). Each AP switches to the master
+  kernel tables, loads the shared GDT/IDT, enables its LAPIC, and parks.
+- Verified on QEMU `-smp 4`: all 4 CPUs come online; the shell still runs
+  on the BSP.
+
+**🔜 Stage B — make the scheduler SMP (run tasks on all CPUs).** The
+current scheduler is single-`g_current`, direct task→task switch, no lock.
+Plan (xv6-style, proven correct):
+- Per-CPU scheduler context + `current`/`idle`, reached via
+  `apic_local_id()` (NOT `gs` — `enter_user` sets `gs=USER_DS`, so a
+  `gs`-based `this_cpu()` is unsafe in the kernel without `swapgs`).
+- A global `sched_lock` held *across* each context switch and released by
+  the resumed side (the "baton": acquire-on-enter, release-in-next). Every
+  path participates — `task_trampoline`/`fork_child_return` release on
+  first run; `yield`/`sleep`/`exit`/timer-preempt acquire then switch.
+- Switch model becomes task↔per-CPU-scheduler (reuse `context_switch.S`),
+  not task↔task, so an outgoing task's context is fully saved before
+  another CPU can pick it.
+- Per-CPU LAPIC timer for preemption on every core.
+- **Scope choice:** run kernel tasks on all CPUs but **pin user tasks to
+  the BSP** first, so the syscall/IRQ-from-ring3 per-CPU-stack path doesn't
+  need `swapgs` yet (`TSS.rsp0`/kernel-rsp stay BSP-only). Lifting that —
+  user tasks on any CPU — is the follow-on that adds `swapgs` to the
+  syscall entry and a conditional `swapgs` to the ISR stubs.
 
 **Unlocks.** Real concurrency, real performance discussions.
 
