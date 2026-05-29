@@ -306,18 +306,143 @@ real application workflows that survive reboot.
 
 **Why now.** Everything until here has been kernel-only. Userspace
 makes the kernel an actual *operating system* rather than a
-single-binary monolith.
+single-binary monolith. It's also the gate in front of everything
+interesting — a static `busybox`, a self-hosting `tcc`, any "do
+something" workload — all of which are §4 Linux-ABI binaries that ride
+on the machinery built here.
 
-**What to build.**
-- Ring 3 entry: SYSCALL/SYSRET MSRs (`STAR`, `LSTAR`, `SFMASK`)
-- Per-process address space (CR3 switch on schedule)
-- ELF loader for userspace binaries (loaded from the kernel FS)
-- Syscall table — start with the bare minimum: `write`, `read`,
-  `exit`, `getpid`, `mmap`, `brk`
-- A `init` userspace program that does something visible
+**The decision that shapes the rest: relink the kernel to the higher
+half, up front.** Real Linux static binaries are linked low
+(`busybox`/`tcc` at `0x400000`), so the entire low canonical half must
+belong to userspace. Today the kernel *executes* from the identity map
+in `PML4[0]` (it's linked at 1 MiB physical — see
+[kernel/linker.ld](kernel/linker.ld)) and the page-table walker
+(`table()` in [kernel/src/paging.c](kernel/src/paging.c)) dereferences
+physical addresses *as* identity VAs. Both have to move off the low half
+before a process can own it. We do this relink as **Phase 0** rather
+than deferring it (the deferral noted under "Design choices" and at the
+end of the §2 Paging work is hereby retired) — doing it later would mean
+re-plumbing user address spaces a second time.
 
-**Unlocks.** Multiple isolated processes, signals, fork/exec —
-basically everything that makes UNIX UNIX.
+The work then splits into two milestones: **A** proves ring 3 + syscalls
++ ELF loading end-to-end with a single process in shared tables; **B**
+adds real per-process isolation and the host-side tooling. Finish A
+end-to-end before starting B.
+
+#### Phase 0 — higher-half relink (free the low half)
+
+- Pick `KERNEL_VBASE = 0xFFFFFFFF80000000` (canonical top −2 GiB),
+  build with `-mcmodel=kernel -fno-pic`, and relink the kernel there.
+  In [kernel/linker.ld](kernel/linker.ld), keep a small **`.boot`
+  section linked low** (VMA == LMA == `0x100000`) holding `_start`; lay
+  everything else at high VMA with `AT()` placing its LMA contiguously
+  in physical RAM. Because `_start` stays low, `e_entry` stays low and
+  **the bootloader needs no change** — it still loads each `PT_LOAD` at
+  `p_paddr` and jumps to the (low) entry under UEFI identity paging.
+- `_start` (low, position-independent) builds **bootstrap page tables**:
+  a temporary low identity map (so its own RIP stays valid across the
+  CR3 load), the kernel image at `KERNEL_VBASE`, and the `PHYS_OFFSET`
+  direct map. Load CR3, far-jump to a high-half `_start_high`, set up the
+  high kernel stack, `call kmain`.
+- Switch `table()` (and any other identity-assuming accessor) from
+  identity to `phys_to_virt`, so the walker reaches page tables through
+  the direct map instead of the low half.
+- `paging_init` runs high, rebuilds the full tables via `phys_to_virt`,
+  then **drops the temporary low identity** (`PML4[0]` cleared). The low
+  half is now entirely free for userspace. Audit remaining identity
+  users (PMM consumers, virtio descriptor setup — device-facing physical
+  addresses are fine; CPU-side dereferences must use `phys_to_virt`).
+- **Verify:** kernel boots and passes all existing self-tests running
+  from `0xFFFFFFFF8...`, with `PML4[0]` unmapped (a deref of a low
+  address now faults cleanly).
+
+#### Milestone A — one user process, visible end-to-end
+
+**Phase 1 — CPU plumbing for ring 3.**
+- [kernel/src/gdt.S](kernel/src/gdt.S): add user-data, user-code (DPL 3,
+  long) and a **TSS** descriptor. Layout is fixed by `SYSRET` ordering:
+  `null / kcode 0x08 / kdata 0x10 / udata 0x18 / ucode 0x20 / TSS 0x28`.
+  `ltr $0x28`.
+- TSS `rsp0` = the running task's `stack_top`, written on every context
+  switch into a task that can trap from ring 3. This is the *only*
+  scheduler change preemption-of-userspace needs: `isr.S` + `iretq`
+  already restore user `CS/SS/RSP` from the trap frame
+  ([kernel/include/regs.h](kernel/include/regs.h)), so a timer IRQ or
+  `#PF` taken in ring 3 lands on that task's existing guarded kernel
+  stack and resumes correctly.
+- SYSCALL/SYSRET: set `EFER.SCE`, `STAR` (syscall→`0x08`, sysret
+  base→`0x10`), `LSTAR`=`syscall_entry`, `SFMASK`=mask `IF` (enter with
+  interrupts off → no reentrancy while still on the user stack).
+  `syscall` does **not** switch stacks, so `syscall_entry` loads the
+  kernel stack itself: UP shortcut is a global "current kernel rsp"
+  written on each schedule; leave a `swapgs` + `KERNEL_GS_BASE` TODO for
+  SMP (§1). *(Chosen over `int 0x80`: it matches the §4 Linux x86-64
+  path, so we pay the entry-stub cost once.)*
+
+**Phase 2 — user ELF loader + initial stack.**
+- New `kernel/src/elf64.c` (lift logic from
+  [boot/src/elf.c](boot/src/elf.c)): parse static `ET_EXEC`, allocate
+  user pages per `PT_LOAD` at `p_vaddr` with `PTE_U` and flags from
+  `p_flags`, copy from the file, zero `.bss`.
+- Build the System V x86-64 initial stack: `argc, argv[], NULL, envp[],
+  NULL, auxv[AT_NULL]`, string area. Minimal auxv now; §4 adds
+  `AT_PHDR/AT_ENTRY/AT_PAGESZ/AT_RANDOM`.
+- `enter_user(rip, rsp)`: load user `DS/ES`, push the `iretq` frame
+  (user `SS`, `RSP`, `RFLAGS` with `IF=1`, user `CS`, entry), `iretq`.
+
+**Phase 3 — syscall dispatch + minimal table.**
+- Dispatcher: `rax`=nr, args in `rdi,rsi,rdx,r10,r8,r9`, return in `rax`.
+- Bare minimum: `write` (fd 1/2 → `serial_write`/console), `exit` /
+  `exit_group` (→ `task_exit`), `getpid`, `brk` (bump a user heap).
+  `read` stubbed to EOF until console input exists.
+- Per-process fd table; `0/1/2` → console, others wrap `fs_open` /
+  `fs_read` / `fs_write` for the eventual compiler workflow.
+
+**Phase 5(A) — the init program, on-disk via an embedded blob.**
+- A `user/` tree: `crt0.S` (call `main`, then `exit`), a tiny static
+  libc (syscall wrappers via the `syscall` insn), a user linker script.
+  Build `user/init.elf` static.
+- mkfs makes an *empty* volume and there's no host populate tool yet, so
+  for Milestone A **embed `init.elf` as a kernel blob** (`.incbin` /
+  `objcopy`) and load it from memory — no new host tooling. `kmain`
+  (extending/replacing `scheduler_demo` at the launch point in
+  [kernel/src/main.c](kernel/src/main.c)) loads the blob and drops to
+  ring 3.
+- **Verify:** init runs in ring 3, `write`s a banner to serial, `exit`s
+  cleanly; a bad user pointer faults into the existing `#PF` handler
+  without taking down the kernel; a timer tick preempts a spinning user
+  loop (proves TSS `rsp0` + the `iretq` resume path).
+
+#### Milestone B — real processes & isolation
+
+**Phase 4 — per-process address spaces.**
+- A `vmspace_t` owns a PML4; the kernel high-half entries (direct map,
+  kstacks, kernel image) are **shared by copying the top-level PML4
+  entries by value** while each process gets its own low-half subtree.
+  CR3 switch in `switch_to` ([kernel/src/task.c](kernel/src/task.c));
+  skip it between two kernel threads that share the kernel space.
+- `fork` (COW or eager), `execve` (tear down user region, reload ELF),
+  `wait4`. This is where multiple isolated processes become real.
+
+**Phase 5(B) — host FS populate tool + console input.**
+- Flesh out [interop/tools/diskutil](interop/tools/diskutil/) into a
+  host tool that writes files into `vdisk.img` in MyFS format (reusing
+  the on-disk structs in [kernel/include/fs.h](kernel/include/fs.h)).
+  Add a `make image` step that installs `/bin/init` (and later
+  `busybox`, `tcc`). Retires the embedded-blob hack.
+- PS/2 keyboard (or serial RX) + a TTY so `read(0)` works — the
+  prerequisite for any interactive program.
+
+**Decisions recorded.**
+- **SYSCALL/SYSRET, not `int 0x80`** — matches §4's Linux x86-64 path.
+- **Higher-half relink up front (Phase 0)** — frees the low half so §4
+  binaries linked at `0x400000` need no further address-space rework.
+- **Embed `init.elf` as a blob for Milestone A**, build the host MyFS
+  populate tool in Milestone B.
+
+**Unlocks.** Multiple isolated processes, signals, fork/exec — basically
+everything that makes UNIX UNIX — and the §4 ABI work that lets real
+binaries run.
 
 ### 4. Linux ABI compatibility
 
@@ -349,7 +474,10 @@ These will come up again. Capturing them so future work doesn't relitigate.
   physical-pointer code (PMM, virtio descriptors, framebuffer) keeps
   working untouched. New code that wants a phys address should reach it
   via `phys_to_virt` rather than assuming identity, so the eventual
-  higher-half move is cheap.
+  higher-half move is cheap. **Superseded:** §3 Phase 0 does that move up
+  front (userspace needs the low half), so this note is now history — the
+  `phys_to_virt` discipline it asked for is exactly what makes Phase 0
+  cheap.
 - **Legacy virtio over modern.** ~300 lines vs. ~800. Its INTx
   completion now arrives through the I/O APIC, so the original reason to
   swap (needing MSI) is no longer pressing; revisit only if we want
