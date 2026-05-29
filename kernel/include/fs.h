@@ -21,7 +21,7 @@ extern "C" {
 
 #define FS_BLOCK_SIZE   4096u
 #define FS_MAGIC        0x4D594653u    /* 'MYFS' little-endian */
-#define FS_VERSION      1u
+#define FS_VERSION      2u             /* v2: double/triple indirect + 64-bit size */
 
 #define FS_NAME_MAX     60             /* bytes; not counting a NUL */
 
@@ -30,10 +30,22 @@ extern "C" {
 #define FT_REG          1              /* regular file */
 #define FT_DIR          2              /* directory */
 
-/* Block-pointer geometry of an inode. */
-#define FS_NDIRECT      13
-#define FS_NINDIRECT    (FS_BLOCK_SIZE / sizeof(uint32_t))   /* 1024 */
-#define FS_MAXFILEBLKS  (FS_NDIRECT + FS_NINDIRECT)
+/* Block-pointer geometry of an inode.
+ *
+ *   13 direct          + 1 single-indirect (1024)
+ *    + 1 double-indirect (1024^2) + 1 triple-indirect (1024^3)
+ *
+ * gives a maximum file of ~4 TiB (1024^3 * 4 KiB). The 64-bit `size` field and
+ * 64-bit file offsets are what let us actually reach past 4 GiB. */
+#define FS_NDIRECT          13
+#define FS_NPTR_PER_BLOCK   (FS_BLOCK_SIZE / sizeof(uint32_t))   /* 1024 ptrs/block */
+#define FS_NINDIRECT        FS_NPTR_PER_BLOCK                    /* single-indirect reach */
+#define FS_NDOUBLE          ((uint64_t)FS_NPTR_PER_BLOCK * FS_NPTR_PER_BLOCK)
+#define FS_NTRIPLE          ((uint64_t)FS_NPTR_PER_BLOCK * FS_NPTR_PER_BLOCK * FS_NPTR_PER_BLOCK)
+#define FS_MAXFILEBLKS      ((uint64_t)FS_NDIRECT + FS_NINDIRECT + FS_NDOUBLE + FS_NTRIPLE)
+
+/* Bits addressable by one 4 KiB bitmap block. */
+#define FS_BITS_PER_BMBLK   (FS_BLOCK_SIZE * 8u)                 /* 32768 */
 
 /* open() flags. */
 #define FS_O_CREATE     0x1
@@ -63,28 +75,32 @@ typedef struct {
     uint32_t total_blocks;         /* FS blocks in the volume */
     uint32_t inode_count;          /* total inode slots (incl. 0 and root) */
     uint32_t inode_bitmap_blk;     /* = 1 */
-    uint32_t data_bitmap_blk;      /* = 2 */
-    uint32_t inode_table_blk;      /* = 3 */
+    uint32_t inode_bitmap_blocks;  /* >= 1 */
+    uint32_t data_bitmap_blk;      /* first data-bitmap block */
+    uint32_t data_bitmap_blocks;   /* >= 1; ceil(data_blocks / 32768) */
+    uint32_t inode_table_blk;      /* first inode-table block */
     uint32_t inode_table_blocks;   /* IT */
-    uint32_t data_start_blk;       /* 3 + IT */
+    uint32_t data_start_blk;       /* first data block */
     uint32_t data_blocks;          /* total_blocks - data_start_blk */
     uint32_t root_inode;           /* = 1 */
     uint32_t dirty;                /* 1 while mounted / after a crash */
     uint32_t mount_tick;           /* timer tick of last mount */
     uint32_t write_tick;           /* timer tick of last metadata flush */
-    uint8_t  pad[FS_BLOCK_SIZE - 15 * sizeof(uint32_t)];
+    uint8_t  pad[FS_BLOCK_SIZE - 17 * sizeof(uint32_t)];
 } __attribute__((packed)) superblock_t;
 static_assert(sizeof(superblock_t) == FS_BLOCK_SIZE, "superblock must be one block");
 
 typedef struct {
     uint16_t type;                 /* FT_NONE / FT_REG / FT_DIR */
     uint16_t links;                /* directory references */
-    uint32_t size;                 /* bytes */
+    uint64_t size;                 /* bytes (64-bit: files may exceed 4 GiB) */
     uint32_t ctime;                /* tick at creation */
     uint32_t mtime;                /* tick at last write */
     uint32_t direct[FS_NDIRECT];   /* data block numbers, 0 == hole/none */
-    uint32_t indirect;             /* block of FS_NINDIRECT u32 ptrs, 0 == none */
-    uint8_t  pad[56];              /* 16 hdr + 52 direct + 4 indirect = 72; +56 = 128 */
+    uint32_t indirect;             /* single-indirect: block of 1024 u32 ptrs */
+    uint32_t indirect2;            /* double-indirect: block of ptrs to L1 blocks */
+    uint32_t indirect3;            /* triple-indirect: block of ptrs to L2 blocks */
+    uint8_t  pad[44];              /* 20 hdr + 52 direct + 12 indirect = 84; +44 = 128 */
 } __attribute__((packed)) inode_t;
 static_assert(sizeof(inode_t) == 128, "inode must be 128 bytes");
 
@@ -118,6 +134,7 @@ int fs_unmount(void);
 int fs_open  (const char *path, int flags);
 int fs_read  (int fd, void *buf, uint32_t n);
 int fs_write (int fd, const void *buf, uint32_t n);
+int fs_seek  (int fd, uint64_t off);   /* set absolute file offset (may exceed 4 GiB) */
 int fs_close (int fd);
 
 int fs_create(const char *path);

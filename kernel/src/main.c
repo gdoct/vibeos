@@ -114,11 +114,15 @@ static void selftest_block(block_device_t *bd) {
             bd->dev.name, bd->block_size);
 }
 
-/* End-to-end filesystem exercise: format, create a dir + files (one large
-   enough to need single-indirect blocks), read them back, list the dir,
-   unlink, then prove persistence across a clean remount and recovery across a
-   forced-dirty fsck. Runs on the boot stack with virtio polling (no scheduler
-   yet), like selftest_block above. */
+/* Deterministic byte pattern keyed by absolute file offset, for large-file
+   round-trip checks. */
+static uint8_t fs_pat(uint64_t off) { return (uint8_t)(off * 2654435761u + 0xABu); }
+
+/* End-to-end filesystem exercise: format, create a dir + files (sized to reach
+   single-, double-, and triple-indirect blocks, including a >4 GiB sparse
+   file), read them back, list the dir, unlink, then prove persistence across a
+   clean remount and recovery across a forced-dirty fsck. Runs on the boot stack
+   with virtio polling (no scheduler yet), like selftest_block above. */
 static void selftest_fs(block_device_t *dev) {
     const char *msg = "Hello, MyFS!\n";
     uint32_t mlen = (uint32_t)kstrlen(msg);
@@ -167,6 +171,57 @@ static void selftest_fs(block_device_t *dev) {
         panic("fs: big.bin round-trip mismatch (got %d)", got);
     kprintf("[selftest] fs: 64 KiB indirect-block file round-trip OK\n");
 
+    /* 5 MiB file: 1280 blocks > 1037 (13 direct + 1024 single-indirect), so
+       this crosses into double-indirect. Written/verified in 64 KiB chunks to
+       avoid a multi-MiB compare buffer. */
+    const uint64_t HUGE = 5ull * 1024 * 1024;
+    fd = fs_open("/dir/huge.bin", FS_O_CREATE | FS_O_TRUNC);
+    if (fd < 0) panic("fs: open huge.bin failed (%d)", fd);
+    for (uint64_t pos = 0; pos < HUGE; pos += BIG) {
+        uint32_t chunk = (uint32_t)(HUGE - pos < BIG ? HUGE - pos : BIG);
+        for (uint32_t i = 0; i < chunk; i++) wbuf[i] = fs_pat(pos + i);
+        if (fs_write(fd, wbuf, chunk) != (int)chunk)
+            panic("fs: huge.bin short write @%lu", (unsigned long)pos);
+    }
+    fs_close(fd);
+    fd = fs_open("/dir/huge.bin", 0);
+    for (uint64_t pos = 0; pos < HUGE; pos += BIG) {
+        uint32_t chunk = (uint32_t)(HUGE - pos < BIG ? HUGE - pos : BIG);
+        kmemset(rbuf, 0, chunk);
+        if (fs_read(fd, rbuf, chunk) != (int)chunk)
+            panic("fs: huge.bin short read @%lu", (unsigned long)pos);
+        for (uint32_t i = 0; i < chunk; i++)
+            if (rbuf[i] != fs_pat(pos + i))
+                panic("fs: huge.bin mismatch @%lu", (unsigned long)(pos + i));
+    }
+    fs_close(fd);
+    kprintf("[selftest] fs: 5 MiB double-indirect file round-trip OK\n");
+
+    /* Past 4 GiB: seek to a 5 GiB offset (file block ~1.31M, in triple-indirect
+       territory) and write a marker. Proves 64-bit offsets/size + the
+       triple-indirect path. The file is sparse, so only a handful of blocks are
+       physically allocated on the 8 GiB volume. */
+    const uint64_t FAR = 5ull * 1024 * 1024 * 1024;     /* 5 GiB */
+    const char *mark   = "past-4GiB!";
+    uint32_t klen      = (uint32_t)kstrlen(mark);
+    fd = fs_open("/dir/sparse.bin", FS_O_CREATE | FS_O_TRUNC);
+    if (fd < 0) panic("fs: open sparse.bin failed (%d)", fd);
+    if (fs_seek(fd, FAR) != FS_OK) panic("fs: seek to 5 GiB failed");
+    if (fs_write(fd, mark, klen) != (int)klen) panic("fs: sparse.bin write failed");
+    fs_close(fd);
+
+    fd = fs_open("/dir/sparse.bin", 0);
+    kmemset(rbuf, 0xFF, 16);
+    if (fs_read(fd, rbuf, 16) != 16) panic("fs: sparse hole short read");
+    for (int i = 0; i < 16; i++) if (rbuf[i] != 0) panic("fs: sparse hole not zero");
+    if (fs_seek(fd, FAR) != FS_OK) panic("fs: re-seek to 5 GiB failed");
+    kmemset(rbuf, 0, 32);
+    got = fs_read(fd, rbuf, klen);
+    fs_close(fd);
+    if (got != (int)klen || kmemcmp(rbuf, mark, klen) != 0)
+        panic("fs: 5 GiB marker round-trip mismatch (got %d)", got);
+    kprintf("[selftest] fs: 5 GiB-offset triple-indirect write/read OK (file > 4 GiB)\n");
+
     /* directory listing */
     fs_dirent_t ents[8];
     int ne = fs_readdir("/dir", ents, 8);
@@ -197,10 +252,11 @@ static void selftest_fs(block_device_t *dev) {
        all-free on disk, then remount. fsck must rebuild it from the inodes
        (the source of truth) and leave the data intact. */
     block_read(dev, 0, spb, rbuf);
+    uint32_t db_blk = ((superblock_t *)rbuf)->data_bitmap_blk;
     ((superblock_t *)rbuf)->dirty = 1;
-    block_write(dev, 0, spb, rbuf);          /* mark unclean */
+    block_write(dev, 0, spb, rbuf);              /* mark unclean */
     kmemset(rbuf, 0, FS_BLOCK_SIZE);
-    block_write(dev, 2 * spb, spb, rbuf);    /* wipe data bitmap (block 2) */
+    block_write(dev, (uint64_t)db_blk * spb, spb, rbuf);   /* wipe first data-bitmap block */
 
     if (fs_mount(dev) != FS_OK) panic("fs: dirty remount failed");
     fd = fs_open("/dir/big.bin", 0);
@@ -208,14 +264,40 @@ static void selftest_fs(block_device_t *dev) {
     kmemset(rbuf, 0, BIG);
     got = fs_read(fd, rbuf, BIG);
     fs_close(fd);
-    if (got != (int)BIG || kmemcmp(wbuf, rbuf, BIG) != 0)
-        panic("fs: big.bin corrupted by fsck (got %d)", got);
+    /* Recompute big.bin's pattern: wbuf was reused by the 5 MiB test above. */
+    if (got != (int)BIG) panic("fs: big.bin short read after fsck (got %d)", got);
+    for (uint32_t i = 0; i < BIG; i++)
+        if (rbuf[i] != (uint8_t)(i * 31u + 7u))
+            panic("fs: big.bin corrupted by fsck @%u", i);
+
+    /* The double- and triple-indirect files must survive the bitmap rebuild too
+       (fsck walks all three indirect levels to re-mark their blocks). */
+    fd = fs_open("/dir/huge.bin", 0);
+    if (fd < 0) panic("fs: huge.bin gone after fsck (%d)", fd);
+    for (uint64_t pos = 0; pos < HUGE; pos += BIG) {
+        uint32_t chunk = (uint32_t)(HUGE - pos < BIG ? HUGE - pos : BIG);
+        kmemset(rbuf, 0, chunk);
+        if (fs_read(fd, rbuf, chunk) != (int)chunk) panic("fs: huge.bin short read post-fsck");
+        for (uint32_t i = 0; i < chunk; i++)
+            if (rbuf[i] != fs_pat(pos + i)) panic("fs: huge.bin corrupted by fsck @%lu",
+                                                  (unsigned long)(pos + i));
+    }
+    fs_close(fd);
+    fd = fs_open("/dir/sparse.bin", 0);
+    if (fd < 0) panic("fs: sparse.bin gone after fsck (%d)", fd);
+    if (fs_seek(fd, FAR) != FS_OK) panic("fs: post-fsck seek to 5 GiB failed");
+    kmemset(rbuf, 0, 32);
+    got = fs_read(fd, rbuf, klen);
+    fs_close(fd);
+    if (got != (int)klen || kmemcmp(rbuf, mark, klen) != 0)
+        panic("fs: sparse.bin corrupted by fsck (got %d)", got);
+
     /* allocation still works (rebuilt bitmap has no phantom free blocks) */
     fd = fs_open("/dir/after_fsck.txt", FS_O_CREATE);
     if (fd < 0 || fs_write(fd, msg, mlen) != (int)mlen)
         panic("fs: write after fsck failed");
     fs_close(fd);
-    kprintf("[selftest] fs: fsck rebuilt the wiped bitmap, data intact\n");
+    kprintf("[selftest] fs: fsck rebuilt the wiped bitmap, multi-level data intact\n");
 
     fs_unmount();
     kfree(wbuf);

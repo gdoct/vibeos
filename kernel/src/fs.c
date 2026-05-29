@@ -26,8 +26,12 @@ static struct {
     block_device_t *dev;
     uint32_t        spb;        /* underlying sectors per 4 KiB FS block */
     superblock_t    sb;         /* cached superblock (block 0) */
-    uint8_t         inode_bm[FS_BLOCK_SIZE];   /* cached inode bitmap (block 1) */
-    uint8_t         data_bm[FS_BLOCK_SIZE];    /* cached data  bitmap (block 2) */
+    uint8_t         inode_bm[FS_BLOCK_SIZE];   /* cached inode bitmap (1 block; <=32768 inodes) */
+    uint8_t        *data_bm;    /* cached data bitmap, data_bitmap_blocks * 4 KiB */
+    uint8_t        *data_bm_dirty;             /* per data-bitmap-block "needs write" flag */
+    uint32_t        data_bm_blocks;            /* == sb.data_bitmap_blocks */
+    int             inode_bm_dirty;            /* inode bitmap changed since last flush */
+    uint32_t        next_data;  /* allocation cursor: data-block index to try next */
     int             mounted;
 } g;
 
@@ -36,7 +40,7 @@ static struct {
 static uint8_t g_zeros[FS_BLOCK_SIZE];
 
 #define FS_MAX_OPEN 16
-static struct { int used; uint32_t ino; uint32_t off; } g_fds[FS_MAX_OPEN];
+static struct { int used; uint32_t ino; uint64_t off; } g_fds[FS_MAX_OPEN];
 
 /* ---- forward declarations (definitions are grouped by concern below) ---- */
 static void     inode_read (uint32_t ino, inode_t *out);
@@ -66,19 +70,30 @@ static int  bm_test(const uint8_t *bm, uint32_t i) { return (bm[i >> 3] >> (i & 
 static void bm_set (uint8_t *bm, uint32_t i) { bm[i >> 3] |=  (uint8_t)(1u << (i & 7)); }
 static void bm_clr (uint8_t *bm, uint32_t i) { bm[i >> 3] &= (uint8_t)~(1u << (i & 7)); }
 
-/* Mark an absolute block number used in the data bitmap (used by fsck). */
+/* Note the data-bitmap block holding data-block index `d` as needing a write. */
+static void data_bm_touch(uint32_t d) { g.data_bm_dirty[d / FS_BITS_PER_BMBLK] = 1; }
+
+/* Mark an absolute block number used in the data bitmap (used by fsck, which
+   writes the whole bitmap itself and so does not track per-block dirtiness). */
 static void mark_data(uint32_t blk) {
     if (blk < g.sb.data_start_blk || blk >= g.sb.total_blocks) return;
     bm_set(g.data_bm, blk - g.sb.data_start_blk);
 }
 
 /* Allocate a data block: returns an absolute block number, or 0 if full.
-   The block is zeroed on disk before being handed out so callers never see
-   stale contents (and fresh directory/indirect blocks read back as empty). */
+   Scans from a rotating cursor (g.next_data) so filling a large file is O(n)
+   overall rather than O(n^2). The block is zeroed on disk before being handed
+   out so callers never see stale contents (and fresh directory/indirect blocks
+   read back as empty). */
 static uint32_t data_alloc(void) {
-    for (uint32_t d = 0; d < g.sb.data_blocks; d++) {
+    uint32_t n = g.sb.data_blocks;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t d = g.next_data + k;
+        if (d >= n) d -= n;                 /* wrap */
         if (!bm_test(g.data_bm, d)) {
             bm_set(g.data_bm, d);
+            data_bm_touch(d);
+            g.next_data = (d + 1 < n) ? d + 1 : 0;
             uint32_t blk = g.sb.data_start_blk + d;
             bzero(blk);
             return blk;
@@ -89,15 +104,55 @@ static uint32_t data_alloc(void) {
 
 static void data_free(uint32_t blk) {
     if (blk < g.sb.data_start_blk || blk >= g.sb.total_blocks) return;
-    bm_clr(g.data_bm, blk - g.sb.data_start_blk);
+    uint32_t d = blk - g.sb.data_start_blk;
+    bm_clr(g.data_bm, d);
+    data_bm_touch(d);
+    if (d < g.next_data) g.next_data = d;   /* prefer reusing freed space */
+}
+
+/* (Re)allocate the in-RAM data bitmap + its dirty-flag array from the cached
+   superblock. Safe to call again on remount (frees the previous arrays). */
+static void data_bm_setup(void) {
+    uint32_t dbb = g.sb.data_bitmap_blocks;
+    if (g.data_bm)       { kfree(g.data_bm);       g.data_bm       = nullptr; }
+    if (g.data_bm_dirty) { kfree(g.data_bm_dirty); g.data_bm_dirty = nullptr; }
+    g.data_bm       = (uint8_t *)kmalloc((size_t)dbb * FS_BLOCK_SIZE);
+    g.data_bm_dirty = (uint8_t *)kmalloc(dbb);
+    if (!g.data_bm || !g.data_bm_dirty)
+        panic("fs: out of memory for data bitmap (%u blocks)", dbb);
+    kmemset(g.data_bm,       0, (size_t)dbb * FS_BLOCK_SIZE);
+    kmemset(g.data_bm_dirty, 0, dbb);
+    g.data_bm_blocks = dbb;
+    g.next_data      = 0;
 }
 
 /* Persist the derived metadata. Always called LAST in a mutating op, after the
-   data/inode/directory writes it describes, to preserve the crash ordering. */
+   data/inode/directory writes it describes, to preserve the crash ordering.
+   Writes only the bitmap blocks actually touched since the last flush (the
+   superblock's dirty flag already lives on disk from mount, so it is not
+   rewritten per-op; fsck rebuilds the bitmaps after a crash regardless). */
 static void flush_meta(void) {
+    if (g.inode_bm_dirty) {
+        bwrite(g.sb.inode_bitmap_blk, g.inode_bm);
+        g.inode_bm_dirty = 0;
+    }
+    for (uint32_t i = 0; i < g.data_bm_blocks; i++) {
+        if (g.data_bm_dirty[i]) {
+            bwrite(g.sb.data_bitmap_blk + i, g.data_bm + (size_t)i * FS_BLOCK_SIZE);
+            g.data_bm_dirty[i] = 0;
+        }
+    }
+}
+
+/* Force a full rewrite of all metadata bitmaps + the superblock. Used by mkfs
+   and unmount where the on-disk copy must be made authoritative. */
+static void flush_meta_all(void) {
     g.sb.write_tick = (uint32_t)timer_ticks();
     bwrite(g.sb.inode_bitmap_blk, g.inode_bm);
-    bwrite(g.sb.data_bitmap_blk,  g.data_bm);
+    for (uint32_t i = 0; i < g.data_bm_blocks; i++)
+        bwrite(g.sb.data_bitmap_blk + i, g.data_bm + (size_t)i * FS_BLOCK_SIZE);
+    g.inode_bm_dirty = 0;
+    kmemset(g.data_bm_dirty, 0, g.data_bm_blocks);
     bwrite(0, &g.sb);
 }
 
@@ -124,6 +179,7 @@ static uint32_t inode_alloc(uint16_t type) {
     for (uint32_t i = 1; i < g.sb.inode_count; i++) {
         if (!bm_test(g.inode_bm, i)) {
             bm_set(g.inode_bm, i);
+            g.inode_bm_dirty = 1;
             inode_t in;
             kmemset(&in, 0, sizeof in);
             in.type  = type;
@@ -137,19 +193,31 @@ static uint32_t inode_alloc(uint16_t type) {
 
 /* Free every block an inode references (data + the indirect block itself),
    zeroing the in-memory pointers. Does not touch the inode bitmap. */
+/* Recursively free an indirect tree of height `level` (1=single .. 3=triple)
+   rooted at disk block `blk`, including `blk` itself. Buffers come from the
+   heap (not the stack) so 3 levels of recursion stay well clear of the 16 KiB
+   per-task kernel stack. */
+static void free_indirect(uint32_t blk, int level) {
+    uint8_t *buf = (uint8_t *)kmalloc(FS_BLOCK_SIZE);
+    if (!buf) panic("fs: out of memory freeing indirect block");
+    bread(blk, buf);
+    uint32_t *ptrs = (uint32_t *)buf;
+    for (uint32_t i = 0; i < FS_NPTR_PER_BLOCK; i++) {
+        if (!ptrs[i]) continue;
+        if (level > 1) free_indirect(ptrs[i], level - 1);
+        else           data_free(ptrs[i]);
+    }
+    kfree(buf);
+    data_free(blk);
+}
+
 static void blocks_free(inode_t *in) {
     for (uint32_t i = 0; i < FS_NDIRECT; i++) {
         if (in->direct[i]) { data_free(in->direct[i]); in->direct[i] = 0; }
     }
-    if (in->indirect) {
-        uint8_t buf[FS_BLOCK_SIZE];
-        bread(in->indirect, buf);
-        uint32_t *ptrs = (uint32_t *)buf;
-        for (uint32_t i = 0; i < FS_NINDIRECT; i++)
-            if (ptrs[i]) data_free(ptrs[i]);
-        data_free(in->indirect);
-        in->indirect = 0;
-    }
+    if (in->indirect)  { free_indirect(in->indirect,  1); in->indirect  = 0; }
+    if (in->indirect2) { free_indirect(in->indirect2, 2); in->indirect2 = 0; }
+    if (in->indirect3) { free_indirect(in->indirect3, 3); in->indirect3 = 0; }
 }
 
 /* Truncate to zero length, keeping the inode allocated as a file. */
@@ -166,12 +234,50 @@ static void inode_free(uint32_t ino, inode_t *in) {
     kmemset(in, 0, sizeof *in);          /* type = FT_NONE */
     inode_write(ino, in);
     bm_clr(g.inode_bm, ino);
+    g.inode_bm_dirty = 1;
+}
+
+/* Walk an indirect tree of height `level` (1=single .. 3=triple) rooted at the
+   pointer *root (which lives in the inode), descending to the data block at
+   tree-relative index `idx`. Iterative with a single reused buffer, so stack
+   use is O(1) regardless of depth. When `alloc`, missing intermediate and leaf
+   blocks are allocated; intermediate-block writes are persisted here, while a
+   newly-allocated *root is left for the caller to persist with the inode.
+   Returns the data block, or 0 (absent and !alloc, or out of space). */
+static uint32_t bmap_indirect(uint32_t *root, int level, uint32_t idx, int alloc) {
+    uint8_t buf[FS_BLOCK_SIZE];     /* holds the block that contains `slot` */
+    uint32_t *slot = root;          /* address of the pointer to the next node */
+    uint32_t parent = 0;            /* disk block holding *slot (0 == inode) */
+    int hops = level;               /* indirect blocks still below *slot */
+
+    for (;;) {
+        if (!*slot) {
+            if (!alloc) return 0;
+            uint32_t nb = data_alloc();         /* data_alloc zeroes the block */
+            if (!nb) return 0;
+            *slot = nb;
+            if (parent) bwrite(parent, buf);    /* persist the parent's new ptr */
+            /* parent == 0: *slot is an inode field; caller persists the inode. */
+        }
+        uint32_t blk = *slot;
+        if (hops == 0) return blk;              /* reached the data block */
+
+        bread(blk, buf);                         /* descend one level */
+        uint32_t *ptrs = (uint32_t *)buf;
+        uint32_t per = 1;                        /* leaves covered by each child */
+        for (int i = 1; i < hops; i++) per *= FS_NPTR_PER_BLOCK;
+        uint32_t ci = idx / per;
+        idx %= per;
+        parent = blk;
+        slot   = &ptrs[ci];
+        hops--;
+    }
 }
 
 /* Map file-block index `fbn` to an absolute disk block. If `alloc`, allocate
    any missing data/indirect blocks and update *in in memory (the caller is
    responsible for persisting the inode). Returns 0 when absent (and !alloc),
-   beyond the single-indirect range, or out of space. */
+   beyond the triple-indirect range, or out of space. */
 static uint32_t bmap(inode_t *in, uint32_t fbn, int alloc) {
     if (fbn < FS_NDIRECT) {
         uint32_t b = in->direct[fbn];
@@ -182,28 +288,35 @@ static uint32_t bmap(inode_t *in, uint32_t fbn, int alloc) {
         }
         return b;
     }
-
     fbn -= FS_NDIRECT;
-    if (fbn >= FS_NINDIRECT) return 0;          /* past single-indirect reach */
 
-    if (!in->indirect) {
-        if (!alloc) return 0;
-        uint32_t ib = data_alloc();             /* data_alloc already zeroed it */
-        if (!ib) return 0;
-        in->indirect = ib;
+    /* The root pointers live in a packed on-disk struct, so operate on an
+       aligned local and copy back (the caller persists the inode). */
+    uint32_t root, b;
+    if (fbn < FS_NINDIRECT) {
+        root = in->indirect;
+        b = bmap_indirect(&root, 1, fbn, alloc);
+        in->indirect = root;
+        return b;
+    }
+    fbn -= FS_NINDIRECT;
+
+    if ((uint64_t)fbn < FS_NDOUBLE) {
+        root = in->indirect2;
+        b = bmap_indirect(&root, 2, fbn, alloc);
+        in->indirect2 = root;
+        return b;
+    }
+    fbn -= (uint32_t)FS_NDOUBLE;
+
+    if ((uint64_t)fbn < FS_NTRIPLE) {
+        root = in->indirect3;
+        b = bmap_indirect(&root, 3, fbn, alloc);
+        in->indirect3 = root;
+        return b;
     }
 
-    uint8_t buf[FS_BLOCK_SIZE];
-    bread(in->indirect, buf);
-    uint32_t *ptrs = (uint32_t *)buf;
-    uint32_t b = ptrs[fbn];
-    if (!b && alloc) {
-        b = data_alloc();
-        if (!b) return 0;
-        ptrs[fbn] = b;
-        bwrite(in->indirect, buf);
-    }
-    return b;
+    return 0;                                    /* past triple-indirect reach */
 }
 
 /* --------------------------------------------------------------- directories */
@@ -430,27 +543,45 @@ static void mkfs(void) {
     inode_count = (inode_count + 31u) & ~31u;               /* multiple of 32 */
 
     uint32_t IT = inode_count / FS_INODES_PER_BLOCK;
-    uint32_t data_start = 3 + IT;
-    if (data_start >= total) panic("fs: no room for data area");
+
+    /* Layout: sb | inode bitmap (1 blk) | data bitmap (DB blks) | inode table
+       (IT blks) | data area. The data bitmap must cover the data blocks, whose
+       count depends on DB in turn; solving the recurrence, DB = ceil(after /
+       bits_per_block) where `after` is everything past the inode table covers
+       both the bitmap and the data, which guarantees coverage. */
+    uint32_t inode_bm_blocks = 1;               /* <=32768 inodes -> 1 block */
+    if (1u + inode_bm_blocks + IT >= total) panic("fs: no room for data area");
+    uint32_t after = total - 1u - inode_bm_blocks - IT;   /* data bitmap + data */
+    uint32_t DB = (after + FS_BITS_PER_BMBLK - 1) / FS_BITS_PER_BMBLK;
+    if (DB == 0) DB = 1;
+    if (DB >= after) panic("fs: no room for data area");
+
+    uint32_t data_bitmap_blk = 1u + inode_bm_blocks;      /* right after inode bm */
+    uint32_t inode_table_blk = data_bitmap_blk + DB;
+    uint32_t data_start      = inode_table_blk + IT;
 
     kmemset(&g.sb, 0, sizeof g.sb);
-    g.sb.magic              = FS_MAGIC;
-    g.sb.version            = FS_VERSION;
-    g.sb.block_size         = FS_BLOCK_SIZE;
-    g.sb.total_blocks       = total;
-    g.sb.inode_count        = inode_count;
-    g.sb.inode_bitmap_blk   = 1;
-    g.sb.data_bitmap_blk    = 2;
-    g.sb.inode_table_blk    = 3;
-    g.sb.inode_table_blocks = IT;
-    g.sb.data_start_blk     = data_start;
-    g.sb.data_blocks        = total - data_start;
-    g.sb.root_inode         = 1;
-    g.sb.dirty              = 0;
+    g.sb.magic               = FS_MAGIC;
+    g.sb.version             = FS_VERSION;
+    g.sb.block_size          = FS_BLOCK_SIZE;
+    g.sb.total_blocks        = total;
+    g.sb.inode_count         = inode_count;
+    g.sb.inode_bitmap_blk    = 1;
+    g.sb.inode_bitmap_blocks = inode_bm_blocks;
+    g.sb.data_bitmap_blk     = data_bitmap_blk;
+    g.sb.data_bitmap_blocks  = DB;
+    g.sb.inode_table_blk     = inode_table_blk;
+    g.sb.inode_table_blocks  = IT;
+    g.sb.data_start_blk      = data_start;
+    g.sb.data_blocks         = total - data_start;
+    g.sb.root_inode          = 1;
+    g.sb.dirty               = 0;
+
+    /* Now that the layout (and DB) is known, size the in-RAM data bitmap. */
+    data_bm_setup();
 
     /* Empty bitmaps; inode 0 (reserved) and inode 1 (root) are in use. */
     kmemset(g.inode_bm, 0, sizeof g.inode_bm);
-    kmemset(g.data_bm,  0, sizeof g.data_bm);
     bm_set(g.inode_bm, 0);
     bm_set(g.inode_bm, 1);
     for (uint32_t i = 0; i < IT; i++) bzero(g.sb.inode_table_blk + i);
@@ -479,10 +610,27 @@ static void mkfs(void) {
     bwrite(b, buf);
     inode_write(1, &root);
 
-    flush_meta();
+    flush_meta_all();          /* write both bitmaps + the superblock in full */
 }
 
 /* ----------------------------------------------------------------------- fsck */
+
+/* Mark every block of an indirect tree of height `level` (including the tree's
+   own pointer blocks) used in the data bitmap. Mirror of free_indirect; uses a
+   heap buffer so triple-indirect recursion stays off the kernel stack. */
+static void mark_indirect(uint32_t blk, int level) {
+    mark_data(blk);
+    uint8_t *buf = (uint8_t *)kmalloc(FS_BLOCK_SIZE);
+    if (!buf) panic("fsck: out of memory marking indirect block");
+    bread(blk, buf);
+    uint32_t *p = (uint32_t *)buf;
+    for (uint32_t i = 0; i < FS_NPTR_PER_BLOCK; i++) {
+        if (!p[i]) continue;
+        if (level > 1) mark_indirect(p[i], level - 1);
+        else           mark_data(p[i]);
+    }
+    kfree(buf);
+}
 
 /*
  * Repair an unclean volume. The inode table is authoritative, so we:
@@ -566,14 +714,15 @@ static void fsck(void) {
 
     /* Pass 3: rebuild both bitmaps from the inodes that survived, diffing
        against what was on disk so a corrupted/torn bitmap is reported. */
+    uint32_t db_bytes = g.data_bm_blocks * FS_BLOCK_SIZE;
     uint8_t *old_ib = (uint8_t *)kmalloc(FS_BLOCK_SIZE);
-    uint8_t *old_db = (uint8_t *)kmalloc(FS_BLOCK_SIZE);
+    uint8_t *old_db = (uint8_t *)kmalloc(db_bytes);
     if (!old_ib || !old_db) panic("fsck: out of memory");
     kmemcpy(old_ib, g.inode_bm, FS_BLOCK_SIZE);
-    kmemcpy(old_db, g.data_bm,  FS_BLOCK_SIZE);
+    kmemcpy(old_db, g.data_bm,  db_bytes);
 
     kmemset(g.inode_bm, 0, sizeof g.inode_bm);
-    kmemset(g.data_bm,  0, sizeof g.data_bm);
+    kmemset(g.data_bm,  0, db_bytes);
     bm_set(g.inode_bm, 0);
     for (uint32_t ino = 1; ino < n; ino++) {
         inode_t in;
@@ -582,35 +731,36 @@ static void fsck(void) {
         bm_set(g.inode_bm, ino);
         for (uint32_t i = 0; i < FS_NDIRECT; i++)
             if (in.direct[i]) mark_data(in.direct[i]);
-        if (in.indirect) {
-            mark_data(in.indirect);
-            uint8_t buf[FS_BLOCK_SIZE];
-            bread(in.indirect, buf);
-            uint32_t *p = (uint32_t *)buf;
-            for (uint32_t i = 0; i < FS_NINDIRECT; i++)
-                if (p[i]) mark_data(p[i]);
-        }
+        if (in.indirect)  mark_indirect(in.indirect,  1);
+        if (in.indirect2) mark_indirect(in.indirect2, 2);
+        if (in.indirect3) mark_indirect(in.indirect3, 3);
     }
 
     int ib_fixed = 0, db_fixed = 0;
-    for (uint32_t i = 0; i < FS_BLOCK_SIZE; i++) {
+    for (uint32_t i = 0; i < FS_BLOCK_SIZE; i++)
         ib_fixed += popcount8((uint8_t)(old_ib[i] ^ g.inode_bm[i]));
+    for (uint32_t i = 0; i < db_bytes; i++)
         db_fixed += popcount8((uint8_t)(old_db[i] ^ g.data_bm[i]));
-    }
     if (ib_fixed) { kprintf("[fsck] inode bitmap: corrected %d bit(s)\n", ib_fixed); repairs += ib_fixed; }
     if (db_fixed) { kprintf("[fsck] data bitmap: corrected %d bit(s)\n", db_fixed); repairs += db_fixed; }
     kfree(old_ib);
     kfree(old_db);
 
-    bwrite(g.sb.inode_bitmap_blk, g.inode_bm);
-    bwrite(g.sb.data_bitmap_blk,  g.data_bm);
-    g.sb.write_tick = (uint32_t)timer_ticks();
-    bwrite(0, &g.sb);
+    flush_meta_all();          /* rewrite both bitmaps (all blocks) + superblock */
     kfree(linkcnt);
     kprintf("[fsck] complete: %d repair(s)\n", repairs);
 }
 
 /* ------------------------------------------------------------- mount/unmount */
+
+/* Load both cached bitmaps from disk into RAM (all data-bitmap blocks). */
+static void bitmaps_load(void) {
+    bread(g.sb.inode_bitmap_blk, g.inode_bm);
+    for (uint32_t i = 0; i < g.data_bm_blocks; i++)
+        bread(g.sb.data_bitmap_blk + i, g.data_bm + (size_t)i * FS_BLOCK_SIZE);
+    g.inode_bm_dirty = 0;
+    kmemset(g.data_bm_dirty, 0, g.data_bm_blocks);
+}
 
 int fs_mount(block_device_t *dev) {
     if (!dev) return FS_EINVAL;
@@ -630,14 +780,13 @@ int fs_mount(block_device_t *dev) {
         bread(0, &g.sb);
     }
 
-    bread(g.sb.inode_bitmap_blk, g.inode_bm);
-    bread(g.sb.data_bitmap_blk,  g.data_bm);
+    data_bm_setup();        /* size the in-RAM data bitmap from the superblock */
+    bitmaps_load();
 
     if (g.sb.dirty) {
         kprintf("[fs] %s: unclean unmount -> running fsck\n", dev->dev.name);
         fsck();
-        bread(g.sb.inode_bitmap_blk, g.inode_bm);
-        bread(g.sb.data_bitmap_blk,  g.data_bm);
+        bitmaps_load();
     }
 
     g.sb.dirty      = 1;
@@ -645,16 +794,17 @@ int fs_mount(block_device_t *dev) {
     bwrite(0, &g.sb);
     g.mounted = 1;
 
-    kprintf("[fs] mounted %s: %u blocks, %u inodes, data@%u (%u blocks)\n",
+    kprintf("[fs] mounted %s: %u blocks, %u inodes, data@%u (%u blocks), "
+            "data-bitmap %u blk(s), max file %lu MiB\n",
             dev->dev.name, g.sb.total_blocks, g.sb.inode_count,
-            g.sb.data_start_blk, g.sb.data_blocks);
+            g.sb.data_start_blk, g.sb.data_blocks, g.sb.data_bitmap_blocks,
+            (unsigned long)(((uint64_t)g.sb.data_blocks * FS_BLOCK_SIZE) >> 20));
     return FS_OK;
 }
 
 int fs_unmount(void) {
     if (!g.mounted) return FS_EINVAL;
-    bwrite(g.sb.inode_bitmap_blk, g.inode_bm);
-    bwrite(g.sb.data_bitmap_blk,  g.data_bm);
+    flush_meta_all();           /* both bitmaps in full + superblock */
     g.sb.dirty      = 0;
     g.sb.write_tick = (uint32_t)timer_ticks();
     bwrite(0, &g.sb);
@@ -818,15 +968,15 @@ int fs_read(int fd, void *buf, uint32_t n) {
     inode_t in;
     inode_read(g_fds[fd].ino, &in);
 
-    uint32_t off = g_fds[fd].off;
+    uint64_t off = g_fds[fd].off;
     if (off >= in.size) return 0;
-    if (n > in.size - off) n = in.size - off;
+    if ((uint64_t)n > in.size - off) n = (uint32_t)(in.size - off);
 
     uint8_t blk[FS_BLOCK_SIZE];
     uint32_t done = 0;
     while (done < n) {
-        uint32_t fbn   = off / FS_BLOCK_SIZE;
-        uint32_t bo    = off % FS_BLOCK_SIZE;
+        uint32_t fbn   = (uint32_t)(off / FS_BLOCK_SIZE);
+        uint32_t bo    = (uint32_t)(off % FS_BLOCK_SIZE);
         uint32_t chunk = FS_BLOCK_SIZE - bo;
         if (chunk > n - done) chunk = n - done;
         uint32_t b = bmap(&in, fbn, 0);
@@ -844,15 +994,15 @@ int fs_write(int fd, const void *buf, uint32_t n) {
     inode_t in;
     inode_read(g_fds[fd].ino, &in);
 
-    uint32_t off = g_fds[fd].off;
-    if ((uint64_t)off + n > (uint64_t)FS_MAXFILEBLKS * FS_BLOCK_SIZE)
+    uint64_t off = g_fds[fd].off;
+    if (off + n > FS_MAXFILEBLKS * (uint64_t)FS_BLOCK_SIZE)
         return FS_EFBIG;
 
     uint8_t blk[FS_BLOCK_SIZE];
     uint32_t done = 0;
     while (done < n) {
-        uint32_t fbn   = off / FS_BLOCK_SIZE;
-        uint32_t bo    = off % FS_BLOCK_SIZE;
+        uint32_t fbn   = (uint32_t)(off / FS_BLOCK_SIZE);
+        uint32_t bo    = (uint32_t)(off % FS_BLOCK_SIZE);
         uint32_t chunk = FS_BLOCK_SIZE - bo;
         if (chunk > n - done) chunk = n - done;
         uint32_t b = bmap(&in, fbn, 1);
@@ -868,8 +1018,17 @@ int fs_write(int fd, const void *buf, uint32_t n) {
     in.mtime = (uint32_t)timer_ticks();
     inode_write(g_fds[fd].ino, &in);                /* inode (size+ptrs) next */
     g_fds[fd].off = off;
-    flush_meta();                                   /* bitmaps + sb last */
+    flush_meta();                                   /* touched bitmap blocks last */
     return (int)done;
+}
+
+/* Set the absolute file offset. Seeking past EOF is allowed; a later write
+   creates a sparse file (intervening blocks read back as zeros). */
+int fs_seek(int fd, uint64_t off) {
+    if (fd < 0 || fd >= FS_MAX_OPEN || !g_fds[fd].used) return FS_EBADF;
+    if (off > FS_MAXFILEBLKS * (uint64_t)FS_BLOCK_SIZE) return FS_EFBIG;
+    g_fds[fd].off = off;
+    return FS_OK;
 }
 
 /* -------------------------------------------------------------------- readdir */

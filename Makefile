@@ -171,8 +171,12 @@ $(IMG): $(EFI) $(KERNEL_ELF)
 
 VDISK = boot/build/vdisk.img
 
+# Sparse 8 GiB virtio disk: large enough to host files past the old 4 MiB /
+# 128 MiB ceilings (and, structurally, multi-GiB files). Sparse, so it costs
+# almost nothing on the host until blocks are actually written.
+VDISK_BYTES = 8589934592      # 8 GiB
 $(VDISK): | boot/build
-	dd if=/dev/zero of=$@ bs=1M count=4 status=none
+	truncate -s $(VDISK_BYTES) $@
 
 run: $(IMG) $(VDISK)
 	$(QEMU) -machine q35 -m 256 \
