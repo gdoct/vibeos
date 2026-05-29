@@ -37,15 +37,23 @@ static void init_launch(void *arg) {
     enter_user(entry, rsp);
 }
 
-void scheduler_demo(void) {
-    sched_init();
-    /* Launch /bin/init as the first userspace process, then block until it
-       exits. init demonstrates the process model (fork + execve /bin/hello +
-       wait4). The boot task only wakes to notice init is gone. */
-    task_t *init = task_create("init", init_launch, nullptr);
-    while (init->state != TASK_DEAD && init->state != TASK_ZOMBIE)
-        ksleep_ms(20);
-    kprintf("[kernel] init exited\n");
+/* A kernel demo task: prints which CPU it's running on a few times, then
+   exits. With several of these plus SMP, the scheduler spreads them across
+   CPUs (and they migrate as they sleep/wake) — a visible sign of stage B. */
+static void smp_worker(void *arg) {
+    int id = (int)(intptr_t)arg;
+    for (int i = 0; i < 6; i++) {
+        kprintf("[worker %d] iter %d on CPU %d\n", id, i, smp_cpu_index());
+        ksleep_ms(250);
+    }
+}
+
+/* Create the initial task set: /bin/init (the user shell, pinned to the BSP)
+   plus a few kernel workers that exercise multi-CPU scheduling. */
+static void create_initial_tasks(void) {
+    task_create("init", init_launch, nullptr);
+    for (int i = 0; i < 4; i++)
+        task_create("worker", smp_worker, (void *)(intptr_t)i);
 }
 
 static void check_bootinfo(const BootInfo *bi) {
@@ -243,30 +251,21 @@ extern "C" void kmain(BootInfo *bi) {
        and the timer drives preemption + sleeper wakeups. */
     irq_enable();
 
-    /* Bring up the other CPUs (uses the timer for SIPI pacing, so it runs
-       after irq_enable). They come online and park until the scheduler is
-       SMP-aware. */
+    /* SMP scheduler bring-up. Initialize it, create the initial tasks, then
+       bring up the other CPUs (each joins the scheduler from ap_entry). The
+       initial tasks exist first so the APs have work the moment they're up. */
+    sched_init();
+    create_initial_tasks();
     smp_init();
 
     device_dump();
 
-    /* Hand kmain off to the scheduler as task 0, then create two
-       workers and yield until they're done. Each worker prints, then
-       busy-waits on the tick counter for ~500 ms — with timer-driven
-       preemption the two workers interleave even though they never
-       yield voluntarily inside the wait. */
-    extern void scheduler_demo(void);
-    scheduler_demo();
-
-    /* Status line on screen so the user sees a visible "we're alive" signal. */
-    char buf[80];
-    /* simple sprintf-ish using kprintf is overkill; format inline */
-    const char *ok = "READY. SERIAL: SEE QEMU STDIO";
+    /* Visible "we're alive" banner before this CPU dissolves into the
+       scheduler loop. */
     fb->draw_text(fb, FB_FONT_W, fb->height - FB_FONT_H * 2,
-                  ok, fb_rgb(fb, 0x80, 0xFF, 0x80),
+                  "READY. SERIAL: SEE QEMU STDIO", fb_rgb(fb, 0x80, 0xFF, 0x80),
                   fb_rgb(fb, 0x00, 0x00, 0x00));
-    (void)buf;
 
-    kprintf("[kernel] init complete, halting\n");
-    halt_forever();
+    kprintf("[kernel] BSP entering scheduler\n");
+    scheduler();   /* never returns */
 }

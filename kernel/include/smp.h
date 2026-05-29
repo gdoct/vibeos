@@ -26,6 +26,14 @@ void smp_init(void);
 
 int  smp_cpu_count(void);   /* CPUs online, including the BSP */
 
+/* Index (0 = BSP) of the calling CPU. Safe before the APIC/SMP are up: returns
+   0 (only the BSP runs then). Used by the scheduler's per-CPU state and by the
+   interrupt-nesting (push/pop) accounting. */
+int  smp_cpu_index(void);
+
+/* Per-CPU LAPIC timer start for an AP (reuses the BSP's calibrated rate). */
+void ap_entry(void);
+
 #ifdef __cplusplus
 }
 #endif

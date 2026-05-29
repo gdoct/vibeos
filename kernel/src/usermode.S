@@ -55,6 +55,7 @@ syscall_entry:
     .globl  fork_child_return
     .type   fork_child_return, @function
 fork_child_return:
+    call    sched_unlock            /* release the scheduler baton (lock held on entry) */
     movq    0(%rsp), %rax           /* frame.rax (= 0 for the child) */
     addq    $8, %rsp
     popq    %rdi

@@ -4,121 +4,130 @@
 #include "paging.h"
 #include "task.h"
 #include "usermode.h"
+#include "timer.h"
+#include "smp.h"
 
 /*
- * Cooperative + timer-preemptive round-robin scheduler.
+ * SMP scheduler (ROADMAP §1, stage B), xv6-style.
  *
- * Tasks live in a fixed-size pool. Slot 0 is the boot context (kmain);
- * slots 1..MAX_TASKS-1 hold tasks created via task_create. Each task
- * owns its own kernel stack and a saved RSP.
+ * Each CPU runs its own scheduler() loop on its boot/AP stack. Tasks never
+ * switch directly to each other; they switch to/from the per-CPU scheduler
+ * context. A single sched_lock protects all task state (the `state` field,
+ * the wait queues, the sleeper list, and each CPU's `current`) and is held
+ * *across* every context switch — handed off like a baton: the side that
+ * resumes after a switch is responsible for releasing it (task_trampoline /
+ * fork_child_return on first run; the scheduler / yielding task otherwise).
  *
- * Context switching is delegated to context_switch.S, which only saves
- * the SysV ABI's callee-saved registers. The caller-saved ones are
- * either spilled by the C compiler around the call (cooperative path)
- * or already on the kernel stack because we entered through an IRQ
- * stub (preemptive path) — so by the time the asm runs there is
- * nothing more for it to preserve.
+ * Interrupt state is tracked per-CPU (push_off/pop_off, à la xv6 push/popcli)
+ * rather than stored in the lock, because the lock crosses context switches —
+ * so the IF baton must follow the CPU, not the lock word.
+ *
+ * Scope: kernel tasks run on any CPU; user tasks are pinned to the BSP, so the
+ * ring-3 syscall/IRQ path keeps using one global kernel-stack latch (no swapgs
+ * yet). Lifting that is the follow-on.
  */
 
 #define KSTACK_PAGES   4   /* 16 KiB kernel stack per task */
 
 extern "C" void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern "C" __attribute__((noreturn)) void task_trampoline(void);
+extern "C" void fork_child_return(void);
 
-static task_t g_tasks[MAX_TASKS];
-static int    g_current     = 0;
-static int    g_idle        = -1;   /* always-runnable fallback task */
-static int    g_initialized = 0;
-static uint64_t g_active_cr3 = 0;   /* last CR3 we loaded (avoid redundant flushes) */
+static task_t   g_tasks[MAX_TASKS];   /* slot 0 unused (no boot task in this model) */
+static int      g_started = 0;
 
-task_t *task_current(void) { return &g_tasks[g_current]; }
-int     sched_active(void) { return g_initialized; }
+/* Per-CPU scheduler state. */
+static uint64_t g_sched_rsp[SMP_MAX_CPUS];   /* the scheduler loop's saved rsp */
+static task_t  *g_cpu_cur[SMP_MAX_CPUS];     /* running task (NULL while in scheduler) */
 
-/* The idle task runs only when nothing else is READY. It enables
-   interrupts and halts, so a CPU with no work draws no power and waits
-   for the next IRQ (a timer tick or device completion) to make something
-   runnable again. */
-static void idle_entry(void *arg) {
-    (void)arg;
-    for (;;) __asm__ volatile("sti; hlt");
+/* Tasks asleep in ksleep, linked through wq_next; under sched_lock. */
+static task_t  *g_sleepers = nullptr;
+
+/* ---- the one lock guarding task state, held across switches ---- */
+static volatile uint32_t sched_locked = 0;
+static int g_ncli[SMP_MAX_CPUS];     /* push_off nesting depth, per CPU */
+static int g_intena[SMP_MAX_CPUS];   /* was IF set before the first push_off */
+
+static void push_off(void) {
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    int c = smp_cpu_index();
+    if (g_ncli[c] == 0) g_intena[c] = (int)((f >> 9) & 1);
+    g_ncli[c]++;
 }
+static void pop_off(void) {
+    int c = smp_cpu_index();
+    if (--g_ncli[c] == 0 && g_intena[c]) __asm__ volatile("sti");
+}
+static void sched_lock(void) {
+    push_off();
+    while (__atomic_exchange_n(&sched_locked, 1u, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+}
+/* Exported so fork_child_return (usermode.S) can release the baton on a child's
+   first run, and so timer.c can wrap the tick under the same lock. */
+extern "C" void sched_unlock(void) {
+    __atomic_store_n(&sched_locked, 0u, __ATOMIC_RELEASE);
+    pop_off();
+}
+
+task_t *task_current(void) { return g_cpu_cur[smp_cpu_index()]; }
+int     sched_active(void) { return g_started; }
 
 void sched_init(void) {
     kmemset(g_tasks, 0, sizeof(g_tasks));
-    g_tasks[0].state = TASK_RUNNING;
-    g_tasks[0].id    = 0;
-    g_tasks[0].name  = "boot";
-    g_current        = 0;
-    g_initialized    = 1;
-    kprintf("[sched] init: boot context = slot 0\n");
-
-    task_t *idle = task_create("idle", idle_entry, nullptr);
-    g_idle = idle->id;
+    g_started = 1;
+    kprintf("[sched] SMP scheduler initialized\n");
 }
 
-/* Claim a free task slot and give it a fresh guarded kernel stack. The slot is
-   fully zeroed first, so a reused DEAD slot carries no stale fields (vm, brk,
-   wq links). Caller fills entry/saved_rsp and sets state READY. */
+/* ---- task creation ---- */
+
 static task_t *alloc_task_slot(const char *name) {
     int slot = -1;
-    for (int i = 1; i < MAX_TASKS; i++) {
-        if (g_tasks[i].state == TASK_NONE || g_tasks[i].state == TASK_DEAD) {
-            slot = i; break;
-        }
-    }
+    for (int i = 1; i < MAX_TASKS; i++)
+        if (g_tasks[i].state == TASK_NONE || g_tasks[i].state == TASK_DEAD) { slot = i; break; }
     if (slot < 0) panic("task: pool full");
 
-    /* Stack lives in the kernel vmalloc window with an unmapped guard page
-       below it, so an overflow faults cleanly. stack_base/top are virtual. */
     uint64_t base;
     uint64_t top = kstack_alloc(KSTACK_PAGES, &base);
 
     task_t *t = &g_tasks[slot];
     kmemset(t, 0, sizeof(*t));
-    t->id         = slot;
-    t->name       = name;
-    t->stack_base = base;
-    t->stack_top  = top;
+    t->id = slot; t->name = name;
+    t->stack_base = base; t->stack_top = top;
     return t;
 }
 
 task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
+    sched_lock();
     task_t *t = alloc_task_slot(name);
     t->entry = entry;
     t->arg   = arg;
 
-    /* Hand-craft the stack so context_switch's restore-and-ret lands at
-       task_trampoline with zeroed callee-saved registers (see the original
-       note): from low addr (saved_rsp) up: r15..rbx = 0, then the return
-       address = task_trampoline. */
+    /* Synthetic stack: context_switch restores 6 zeroed callee-saved regs and
+       `ret`s into task_trampoline. */
     uint64_t *sp = (uint64_t *)t->stack_top;
     *--sp = (uint64_t)task_trampoline;
     for (int j = 0; j < 6; j++) *--sp = 0;
     t->saved_rsp = (uint64_t)sp;
 
     t->state = TASK_READY;
-    kprintf("[sched] task %d \"%s\" entry=%p stack=%lx..%lx\n",
-            t->id, name, (void *)(uintptr_t)entry,
-            (unsigned long)t->stack_base, (unsigned long)t->stack_top);
+    int id = t->id;
+    sched_unlock();
+    kprintf("[sched] task %d \"%s\" entry=%p\n", id, name, (void *)(uintptr_t)entry);
     return t;
 }
 
-/* Attach `vm` to the current task and make it the active address space now
-   (keeping the CR3 tracker in sync). Used to move a task into a user address
-   space before entering ring 3. */
 void task_set_vmspace(struct vmspace *vm) {
     task_t *t = task_current();
     t->vm = vm;
     uint64_t cr3 = vm ? vm->pml4_phys : paging_kernel_pml4();
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
-    g_active_cr3 = cr3;
 }
-
-extern "C" void fork_child_return(void);
 
 task_t *task_fork(const char *name, struct vmspace *vm,
                   const struct syscall_frame *frame) {
     task_t *parent = task_current();
+    sched_lock();
     task_t *t = alloc_task_slot(name);
     t->vm        = vm;
     t->parent    = parent;
@@ -126,11 +135,8 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     t->brk_cur   = parent->brk_cur;
     t->brk_max   = parent->brk_max;
 
-    /* Craft the child kernel stack so context_switch restores 6 zeroed callee-
-       saved regs and `ret`s into fork_child_return, which then finds a copy of
-       the parent's syscall frame (with rax forced to 0) and sysrets to ring 3.
-       Push order (high->low) mirrors syscall_frame_t, then the return address,
-       then the callee-saved block (r15 ends up lowest = where saved_rsp points). */
+    /* Craft the child stack: context_switch -> fork_child_return, which finds a
+       copy of the parent's syscall frame (rax forced to 0) and sysrets. */
     uint64_t *sp = (uint64_t *)t->stack_top;
     *--sp = frame->user_rsp;
     *--sp = frame->r11;
@@ -142,114 +148,133 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     *--sp = frame->rsi;
     *--sp = frame->rdi;
     *--sp = 0;                                /* child sees fork() == 0 */
-    *--sp = (uint64_t)fork_child_return;      /* context_switch ret target */
-    for (int j = 0; j < 6; j++) *--sp = 0;    /* callee-saved */
+    *--sp = (uint64_t)fork_child_return;
+    for (int j = 0; j < 6; j++) *--sp = 0;
     t->saved_rsp = (uint64_t)sp;
 
     t->state = TASK_READY;
-    kprintf("[sched] fork: %d \"%s\" -> child %d\n", parent->id, parent->name, t->id);
+    int id = t->id, pid = parent->id;
+    sched_unlock();
+    kprintf("[sched] fork: %d \"%s\" -> child %d\n", pid, parent->name, id);
     return t;
 }
 
-/* Round-robin scan for a READY task after `from`, never returning the
-   idle task — idle is only ever a deliberate fallback. -1 if none. */
-static int pick_next_ready(int from) {
-    int i = from;
-    for (int n = 0; n < MAX_TASKS; n++) {
-        i = (i + 1) % MAX_TASKS;
-        if (i == g_idle) continue;
-        if (g_tasks[i].state == TASK_READY) return i;
+/* ---- the scheduler ---- */
+
+static void apply_task_mm(task_t *t) {
+    uint64_t cr3 = t->vm ? t->vm->pml4_phys : paging_kernel_pml4();
+    __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+    if (t->vm) {                 /* user task (BSP-pinned): set the kernel stack */
+        tss_set_rsp0(t->stack_top);
+        g_kernel_rsp = t->stack_top;
     }
-    return -1;
 }
 
-static void switch_to(int from, int to) {
-    if (to == from) return;
-    task_t *prev = &g_tasks[from];
-    task_t *next = &g_tasks[to];
-    /* A task we're leaving goes back on the run queue only if it was
-       actually running — a task that blocked or exited has already set
-       its own state and must keep it. */
-    if (prev->state == TASK_RUNNING) prev->state = TASK_READY;
-    next->state = TASK_RUNNING;
-    g_current   = to;
-    /* Track the running task's kernel stack for ring-3 entry: the TSS rsp0
-       (used when an IRQ/exception hits in ring 3) and the syscall stub's
-       stack both follow it. Harmless for kernel-only tasks. The boot/idle
-       slots have no allocated stack (stack_top == 0); skip those. */
-    if (next->stack_top) {
-        tss_set_rsp0(next->stack_top);
-        g_kernel_rsp = next->stack_top;
+/* Pick a READY task. User tasks (vm != NULL) only run on the BSP for now. */
+static task_t *pick_ready(int cpu) {
+    for (int i = 1; i < MAX_TASKS; i++) {
+        task_t *t = &g_tasks[i];
+        if (t->state != TASK_READY) continue;
+        if (t->vm && cpu != 0) continue;
+        return t;
     }
-    /* Switch address space: a user process runs in its own PML4, kernel
-       threads in the master tables. Skip the (TLB-flushing) CR3 reload when
-       it would not change. The kernel half is identical across all PML4s, so
-       the running kernel code/stack stay mapped across the switch. */
-    uint64_t want_cr3 = next->vm ? next->vm->pml4_phys : paging_kernel_pml4();
-    if (want_cr3 != g_active_cr3) {
-        __asm__ volatile("mov %0, %%cr3" :: "r"(want_cr3) : "memory");
-        g_active_cr3 = want_cr3;
-    }
-    context_switch(&prev->saved_rsp, next->saved_rsp);
+    return nullptr;
 }
 
-/*
- * Pick the next READY task round-robin and switch to it. If none is
- * READY but the current task can keep running, stay. Otherwise fall back
- * to the idle task — which always exists once sched_init has run, so we
- * never lose the thread of execution.
- *
- * Must be called with interrupts disabled.
- */
-static void schedule_to_next(void) {
-    int from = g_current;
-    int next = pick_next_ready(from);
-    if (next < 0) {
-        if (g_tasks[from].state == TASK_RUNNING) return;
-        next = g_idle;
-    }
-    switch_to(from, next);
+/* Switch from the current task back to this CPU's scheduler. Caller holds the
+   lock; it is still held when the task is later resumed here. */
+static void sched(void) {
+    int c = smp_cpu_index();
+    context_switch(&g_cpu_cur[c]->saved_rsp, g_sched_rsp[c]);
 }
+
+__attribute__((noreturn))
+void scheduler(void) {
+    int c = smp_cpu_index();
+    g_cpu_cur[c] = nullptr;
+    for (;;) {
+        __asm__ volatile("sti");          /* let IRQs make tasks runnable */
+        sched_lock();
+        task_t *t = pick_ready(c);
+        if (t) {
+            t->state = TASK_RUNNING;
+            g_cpu_cur[c] = t;
+            apply_task_mm(t);
+            context_switch(&g_sched_rsp[c], t->saved_rsp);  /* run t (lock held) */
+            g_cpu_cur[c] = nullptr;       /* t returned via sched() */
+        }
+        sched_unlock();
+        if (!t) __asm__ volatile("hlt");  /* nothing runnable; wait for an IRQ */
+    }
+}
+
+extern "C" __attribute__((noreturn))
+void task_trampoline(void) {
+    sched_unlock();                  /* release the baton the scheduler handed us */
+    task_t *t = task_current();
+    t->entry(t->arg);
+    task_exit();
+    __builtin_unreachable();
+}
+
+/* ---- yield / exit / wait ---- */
 
 void task_yield(void) {
-    if (!g_initialized) return;
-    uint64_t f = irq_save();
-    schedule_to_next();
-    irq_restore(f);
+    if (!g_started) return;
+    sched_lock();
+    task_t *t = g_cpu_cur[smp_cpu_index()];
+    if (t) t->state = TASK_READY;
+    sched();
+    sched_unlock();
 }
 
 void task_exit(void) {
-    irq_disable();
-    int id = g_current;
-    g_tasks[id].state = TASK_DEAD;
-    kprintf("[sched] task %d \"%s\" exited\n", id, g_tasks[id].name);
-    schedule_to_next();
-    panic("task_exit: schedule_to_next returned");
+    task_t *t = task_current();
+    kprintf("[sched] task %d \"%s\" exited\n", t->id, t->name);
+    sched_lock();
+    t->state = TASK_DEAD;
+    sched();
+    panic("task_exit: returned");
+}
+
+/* wait-queue internals (assume sched_lock held). */
+static void make_ready_locked(task_t *t) {
+    if (t->state == TASK_BLOCKED) t->state = TASK_READY;
+}
+static void wq_sleep_locked(wait_queue_t *wq) {
+    task_t *t = g_cpu_cur[smp_cpu_index()];
+    t->wq_next = nullptr;
+    if (wq->tail) wq->tail->wq_next = t; else wq->head = t;
+    wq->tail = t;
+    t->state = TASK_BLOCKED;
+    sched();                          /* lock held; held again when resumed */
+}
+static void wq_wake_all_locked(wait_queue_t *wq) {
+    task_t *t = wq->head;
+    while (t) { task_t *n = t->wq_next; t->wq_next = nullptr; make_ready_locked(t); t = n; }
+    wq->head = wq->tail = nullptr;
 }
 
 void task_exit_user(int code) {
-    irq_disable();
     task_t *t = task_current();
+    kprintf("[sched] task %d \"%s\" exit(%d)\n", t->id, t->name, code);
+    sched_lock();
     t->exit_code = code;
     task_t *p = t->parent;
     if (p && p->state != TASK_NONE && p->state != TASK_DEAD) {
-        /* Become a zombie; the parent's wait4 collects the status and reaps. */
-        t->state = TASK_ZOMBIE;
-        wait_queue_wake_all(&p->child_wq);
+        t->state = TASK_ZOMBIE;       /* parent's wait4 reaps */
+        wq_wake_all_locked(&p->child_wq);
     } else {
-        /* No reaper: drop the slot. The address space is the active CR3 right
-           now, so it can't be torn down here — leak it (only init/orphans). */
         t->state = TASK_DEAD;
     }
-    kprintf("[sched] task %d \"%s\" exit(%d)\n", t->id, t->name, code);
-    schedule_to_next();
+    sched();
     panic("task_exit_user: returned");
 }
 
 int task_wait(int *status) {
-    task_t *p = task_current();
+    sched_lock();
+    task_t *p = g_cpu_cur[smp_cpu_index()];
     for (;;) {
-        uint64_t fl = irq_save();
         int have_child = 0;
         for (int i = 1; i < MAX_TASKS; i++) {
             task_t *c = &g_tasks[i];
@@ -257,88 +282,65 @@ int task_wait(int *status) {
             if (c->state == TASK_ZOMBIE) {
                 int pid = c->id, code = c->exit_code;
                 struct vmspace *vm = c->vm;
-                c->state  = TASK_DEAD;      /* detach + free the slot */
-                c->parent = nullptr;
-                c->vm     = nullptr;
-                irq_restore(fl);
-                if (vm) vmspace_destroy(vm);   /* zombie never runs again */
+                c->state = TASK_DEAD; c->parent = nullptr; c->vm = nullptr;
+                sched_unlock();
+                if (vm) vmspace_destroy(vm);   /* zombie won't run again */
                 if (status) *status = code;
                 return pid;
             }
             if (c->state != TASK_DEAD && c->state != TASK_NONE) have_child = 1;
         }
-        if (!have_child) { irq_restore(fl); return -10; }   /* -ECHILD */
-        wait_queue_sleep(&p->child_wq);     /* IF off; returns IF off when woken */
-        irq_restore(fl);
+        if (!have_child) { sched_unlock(); return -10; }   /* -ECHILD */
+        wq_sleep_locked(&p->child_wq);
     }
 }
 
-void sched_block_and_switch(void) {
-    /* Caller holds IF=0 and has linked us onto a wake source. */
-    g_tasks[g_current].state = TASK_BLOCKED;
-    schedule_to_next();
-}
+/* ---- wait queues (public; acquire the lock) ---- */
 
-void sched_make_ready(task_t *t) {
-    if (t->state == TASK_BLOCKED) t->state = TASK_READY;
-}
-
-/* --- wait queues --- */
-
-void wait_queue_sleep(wait_queue_t *wq) {
-    task_t *t = task_current();
-    t->wq_next = nullptr;
-    if (wq->tail) wq->tail->wq_next = t;
-    else          wq->head = t;
-    wq->tail = t;
-    sched_block_and_switch();
-}
-
+void wait_queue_sleep(wait_queue_t *wq)    { sched_lock(); wq_sleep_locked(wq); sched_unlock(); }
 void wait_queue_wake_one(wait_queue_t *wq) {
-    uint64_t f = irq_save();
+    sched_lock();
     task_t *t = wq->head;
-    if (t) {
-        wq->head = t->wq_next;
-        if (!wq->head) wq->tail = nullptr;
-        t->wq_next = nullptr;
-        sched_make_ready(t);
+    if (t) { wq->head = t->wq_next; if (!wq->head) wq->tail = nullptr; t->wq_next = nullptr; make_ready_locked(t); }
+    sched_unlock();
+}
+void wait_queue_wake_all(wait_queue_t *wq) { sched_lock(); wq_wake_all_locked(wq); sched_unlock(); }
+
+/* ---- timer-driven sleep + preemption (called from timer.c) ---- */
+
+void task_sleep_ticks(uint64_t wake_tick) {
+    if (!g_started) {                 /* pre-scheduler (early boot, BSP only) */
+        while (timer_ticks() < wake_tick) __asm__ volatile("hlt");
+        return;
     }
-    irq_restore(f);
+    sched_lock();
+    task_t *t = g_cpu_cur[smp_cpu_index()];
+    t->wake_tick = wake_tick;
+    t->wq_next = g_sleepers; g_sleepers = t;
+    t->state = TASK_BLOCKED;
+    sched();
+    sched_unlock();
 }
 
-void wait_queue_wake_all(wait_queue_t *wq) {
-    uint64_t f = irq_save();
-    task_t *t = wq->head;
-    while (t) {
-        task_t *nxt = t->wq_next;
-        t->wq_next = nullptr;
-        sched_make_ready(t);
-        t = nxt;
+/* Per-tick: wake due sleepers and preempt the running task. From the timer
+   IRQ (IF off). */
+void task_tick(void) {
+    if (!g_started) return;
+    sched_lock();
+    uint64_t now = timer_ticks();
+    task_t **pp = &g_sleepers;
+    while (*pp) {
+        task_t *t = *pp;
+        if (t->state == TASK_BLOCKED && t->wake_tick <= now) {
+            *pp = t->wq_next; t->wq_next = nullptr; t->state = TASK_READY;
+        } else {
+            pp = &t->wq_next;
+        }
     }
-    wq->head = wq->tail = nullptr;
-    irq_restore(f);
-}
-
-void sched_tick(void) {
-    /* Called from the timer IRQ with IF=0. We can call into the same
-       switching machinery cooperative yield uses — the new task's RFLAGS
-       will be restored by iretq when irq_common unwinds. */
-    if (!g_initialized) return;
-    schedule_to_next();
-}
-
-/*
- * The first thing a brand-new task runs. Set up by task_create as the
- * "return target" baked into the synthetic stack frame.
- */
-extern "C" __attribute__((noreturn))
-void task_trampoline(void) {
-    /* We arrived here via `ret` from context_switch, which was called
-       with IF=0 (either cooperative cli, or inside an IRQ). The task
-       expects to run with interrupts on. */
-    irq_enable();
-    task_t *t = task_current();
-    t->entry(t->arg);
-    task_exit();
-    __builtin_unreachable();
+    task_t *cur = g_cpu_cur[smp_cpu_index()];
+    if (cur && cur->state == TASK_RUNNING) {
+        cur->state = TASK_READY;
+        sched();                      /* preempt; resumes here when rescheduled */
+    }
+    sched_unlock();
 }

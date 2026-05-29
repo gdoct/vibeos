@@ -4,6 +4,7 @@
 #include "apic.h"
 #include "timer.h"
 #include "idt.h"
+#include "task.h"
 #include "smp.h"
 
 /*
@@ -26,6 +27,17 @@ static struct cpu g_cpus[SMP_MAX_CPUS];
 static volatile int g_online = 1;        /* BSP is online from the start */
 
 int smp_cpu_count(void) { return g_online; }
+
+/* Index of the calling CPU (0 = BSP). Before the LAPIC is up only the BSP
+   runs, so return 0; afterwards map the local APIC id to its slot. */
+int smp_cpu_index(void) {
+    if (!apic_enabled()) return 0;
+    uint32_t aid = apic_local_id();
+    for (int i = 0; i < SMP_MAX_CPUS; i++)
+        if (g_cpus[i].apic_id == aid && (i == 0 || g_cpus[i].index == (uint32_t)i))
+            return i;
+    return 0;   /* not yet registered (early): treat as BSP */
+}
 
 /* Coarse millisecond delay off the 100 Hz tick (interrupts must be enabled). */
 static void delay_ms(uint64_t ms) {
@@ -54,12 +66,14 @@ extern "C" void ap_entry(void) {
     idt_load();              /* shared IDT */
     apic_enable_local();     /* this CPU's LAPIC */
 
+    apic_start_local_timer();    /* this CPU's preemption tick */
+
     uint32_t aid = apic_local_id();
     int ci = cpu_index_for_apic(aid);
     kprintf("[smp] CPU %d (apic %u) online\n", ci, aid);
     if (ci >= 0) __atomic_store_n(&g_cpus[ci].online, 1, __ATOMIC_RELEASE);
 
-    for (;;) __asm__ volatile("sti; hlt");   /* park until SMP stage B */
+    scheduler();                 /* join the scheduler; never returns */
 }
 
 void smp_init(void) {

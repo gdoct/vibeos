@@ -4,6 +4,7 @@
 #include "timer.h"
 #include "task.h"
 #include "tty.h"
+#include "smp.h"
 
 /*
  * 8254 PIT, channel 0, mode 3 (square wave). Fires IRQ0 at the requested
@@ -18,32 +19,17 @@
 static volatile uint64_t g_ticks = 0;
 static uint32_t          g_hz    = 0;
 
-/* Tasks sleeping in ksleep_ms, linked through task_t::wq_next. Unsorted:
-   we scan the whole list each tick, which is fine for a handful of
-   sleepers. Touched only with interrupts disabled (here in the IRQ, and
-   under irq_save in ksleep_ms). */
-static task_t *g_sleepers = nullptr;
-
-static void wake_due_sleepers(void) {
-    task_t **pp = &g_sleepers;
-    while (*pp) {
-        task_t *t = *pp;
-        if (t->wake_tick <= g_ticks) {
-            *pp = t->wq_next;       /* unlink */
-            t->wq_next = nullptr;
-            sched_make_ready(t);
-        } else {
-            pp = &t->wq_next;
-        }
-    }
-}
-
+/* The tick fires on every CPU (each has its own LAPIC timer). Only the BSP
+   advances the global time base and drains the serial console (single owner of
+   g_ticks / the TTY ring); every CPU runs task_tick to wake due sleepers and
+   preempt whatever it's running. */
 static void on_tick(uint8_t irq, regs_t *regs) {
     (void)irq; (void)regs;
-    g_ticks++;
-    tty_poll();     /* drain the serial console into the TTY line discipline */
-    wake_due_sleepers();
-    sched_tick();   /* no-op until sched_init has run */
+    if (smp_cpu_index() == 0) {
+        g_ticks++;
+        tty_poll();
+    }
+    task_tick();    /* no-op until sched_init has run */
 }
 
 void timer_init(uint32_t hz) {
@@ -81,20 +67,5 @@ void ksleep_ms(uint64_t ms) {
     if (g_hz == 0) return;
     /* Round up so a 1 ms sleep at 100 Hz still waits at least one tick. */
     uint64_t wait = (ms * g_hz + 999) / 1000;
-
-    /* Before the scheduler exists there's no task to block, so fall back
-       to a halt-spin. This path is only hit during early boot. */
-    if (!sched_active()) {
-        uint64_t target = g_ticks + wait;
-        while (g_ticks < target) __asm__ volatile("hlt");
-        return;
-    }
-
-    uint64_t f = irq_save();
-    task_t *t = task_current();
-    t->wake_tick = g_ticks + wait;
-    t->wq_next = g_sleepers;        /* push onto sleeper list */
-    g_sleepers = t;
-    sched_block_and_switch();       /* woken by wake_due_sleepers at deadline */
-    irq_restore(f);
+    task_sleep_ticks(g_ticks + wait);   /* handles the pre-scheduler case too */
 }

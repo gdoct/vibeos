@@ -35,6 +35,7 @@ uint32_t apic_local_id(void);         /* APIC id of the calling CPU */
 void     apic_send_init(uint8_t dest_apic_id);
 void     apic_send_sipi(uint8_t dest_apic_id, uint8_t vector);
 void     apic_enable_local(void);     /* AP software-enables its own LAPIC */
+void     apic_start_local_timer(void);/* start this CPU's periodic LAPIC timer */
 
 /* Vector the LAPIC timer and routed PCI INTx land on (both dispatched
    through irq_common, so they reuse irq_register: irq 0 and irq 11). */

@@ -59,12 +59,17 @@ typedef struct task {
     wait_queue_t  child_wq;
 } task_t;
 
-/* Convert the currently-running kmain context into task slot 0. Must
-   be called before any task_create / task_yield. */
+/* Initialize the SMP scheduler. Call once on the BSP before creating tasks
+   and before any CPU enters scheduler(). */
 void    sched_init(void);
 
+/* Per-CPU scheduler loop (never returns). Each CPU (BSP last, after creating
+   the initial tasks; each AP from ap_entry) calls this to start scheduling. */
+__attribute__((noreturn))
+void    scheduler(void);
+
 task_t *task_create(const char *name, void (*entry)(void *), void *arg);
-task_t *task_current(void);
+task_t *task_current(void);   /* the task running on the calling CPU */
 void    task_yield(void);
 
 /* Create a child of the current task for fork(): a new task in address space
@@ -89,32 +94,18 @@ void    task_exit_user(int code);
    children exist but none has exited yet; returns -ECHILD if there are none. */
 int     task_wait(int *status);
 
-/* Called from the timer IRQ. No-op until sched_init has run. */
-void    sched_tick(void);
+/* Timer-driven: wake due sleepers and preempt the running task. Called from
+   the tick IRQ on every CPU. No-op until sched_init has run. */
+void    task_tick(void);
+
+/* Block the current task until timer tick `wake_tick` (backs ksleep_ms). */
+void    task_sleep_ticks(uint64_t wake_tick);
 
 /* True once sched_init has run and blocking primitives are usable. */
 int     sched_active(void);
 
-/* --- primitives the wait-queue and sleep machinery build on --- */
-
-/* Mark the current task BLOCKED and switch away. MUST be called with
-   interrupts disabled and the task already linked onto whatever queue
-   will wake it. Returns (with interrupts still disabled) once the task
-   has been made READY again and rescheduled. */
-void    sched_block_and_switch(void);
-
-/* If t is BLOCKED, move it back to READY. Safe to call from IRQ context;
-   does not switch. */
-void    sched_make_ready(task_t *t);
-
-/* --- wait queues --- */
-
-/* Block the current task on wq. Call with interrupts disabled; returns
-   with interrupts still disabled once woken. */
+/* --- wait queues (block on a condition; another path wakes you) --- */
 void    wait_queue_sleep(wait_queue_t *wq);
-
-/* Wake the task at the head of wq (FIFO) / all tasks on wq. Safe from
-   any interrupt state; neither switches. */
 void    wait_queue_wake_one(wait_queue_t *wq);
 void    wait_queue_wake_all(wait_queue_t *wq);
 

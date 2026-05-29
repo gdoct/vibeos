@@ -94,6 +94,7 @@ static uint8_t  g_bsp_id = 0;
 static int      g_enabled = 0;
 static uint8_t  g_cpu_ids[MAX_CPUS];   /* APIC ids of enabled CPUs (from MADT) */
 static int      g_ncpu = 0;
+static uint32_t g_timer_init = 0;      /* calibrated LAPIC-timer initial count */
 
 int apic_enabled(void) { return g_enabled; }
 
@@ -283,13 +284,13 @@ int apic_init(const BootInfo *bi, uint32_t tick_hz) {
     for (uint32_t gsi = 16; gsi <= 23 && gsi <= g_ioapic_gsi_base + max_redir; gsi++)
         ioapic_route(gsi, APIC_PCI_VECTOR, g_bsp_id, /*level=*/1, /*low_active=*/1, 0);
 
-    /* Calibrate, then start the LAPIC timer as the periodic system tick. */
+    /* Calibrate, then start the LAPIC timer as the periodic system tick.
+       Save the count so each AP can program its own timer at the same rate. */
     uint64_t per_sec = calibrate_timer();
     uint32_t init_count = (uint32_t)(per_sec / (tick_hz ? tick_hz : 100));
     if (init_count == 0) init_count = 1;
-    lapic_write(LAPIC_TIMER_DIV, TIMER_DIV_16);
-    lapic_write(LAPIC_LVT_TIMER, APIC_TIMER_VECTOR | LVT_PERIODIC);
-    lapic_write(LAPIC_TIMER_INIT, init_count);
+    g_timer_init = init_count;
+    apic_start_local_timer();
 
     g_enabled = 1;
     irq_set_apic_mode(1);
@@ -324,4 +325,12 @@ void apic_enable_local(void) {
     lapic_write(LAPIC_LVT_LINT0, LVT_MASKED);
     lapic_write(LAPIC_LVT_LINT1, LVT_MASKED);
     lapic_write(LAPIC_LVT_ERROR, LVT_MASKED);
+}
+
+/* Start this CPU's LAPIC timer at the calibrated rate (periodic, the system
+   tick vector). The BSP calls it from apic_init; each AP calls it once up. */
+void apic_start_local_timer(void) {
+    lapic_write(LAPIC_TIMER_DIV, TIMER_DIV_16);
+    lapic_write(LAPIC_LVT_TIMER, APIC_TIMER_VECTOR | LVT_PERIODIC);
+    lapic_write(LAPIC_TIMER_INIT, g_timer_init ? g_timer_init : 1);
 }
