@@ -65,6 +65,7 @@ void       vmspace_switch(vmspace_t *vm);            /* load CR3 (NULL = master)
 void       vmspace_map(vmspace_t *vm, uint64_t va, uint64_t pa,
                        size_t pages, uint64_t flags);
 int        vmspace_query(vmspace_t *vm, uint64_t va, uint64_t *pa_out);
+void       vmspace_unmap(vmspace_t *vm, uint64_t va, size_t pages);  /* PTEs only; caller frees pa */
 vmspace_t *vmspace_fork(vmspace_t *parent);          /* eager deep copy */
 void       vmspace_destroy(vmspace_t *vm);           /* not while active */
 

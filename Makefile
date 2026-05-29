@@ -136,6 +136,12 @@ USER_INIT  = user/build/init.elf
 USER_HELLO = user/build/hello.elf
 USER_SH    = user/build/sh.elf
 
+# A real static musl binary, cross-built on the host (ROADMAP §4). This is the
+# §4 proof: an unmodified Linux/musl ELF that runs under the Linux ABI. Built
+# only if musl-gcc is present (apt install musl-tools).
+MUSL_CC    := $(shell command -v musl-gcc 2>/dev/null)
+USER_MHELLO = user/build/mhello.elf
+
 .PHONY: all clean run image kernel user
 all: $(EFI) $(KERNEL_ELF) user
 
@@ -177,7 +183,16 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO)
+
+# Static musl build (host cross-compile). Skipped with a note if musl-gcc is
+# absent, so the rest of the build still works.
+$(USER_MHELLO): user/musl/hello.c | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found (apt install musl-tools); skipping $(USER_MHELLO)"
+else
+	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
+endif
 
 user/build:
 	mkdir -p user/build

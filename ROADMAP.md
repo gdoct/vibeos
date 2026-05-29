@@ -80,9 +80,18 @@ filesystem, and drops to an interactive shell over the serial console — with
 
 ### Userspace
 - **Ring 3** via SYSCALL/SYSRET; ELF loader reads static `ET_EXEC` from VibeFS
-  ([elf64.c](kernel/src/elf64.c)) and builds the System V initial stack.
+  ([elf64.c](kernel/src/elf64.c)), streaming each `PT_LOAD` straight off the fd
+  (no image-size cap) and building the System V initial stack with a real auxv
+  (`AT_PHDR/PHENT/PHNUM/PAGESZ/ENTRY/RANDOM/...`) and passed-through `argv`/`envp`.
 - **Syscalls (Linux x86-64 numbers):** `read`(0→TTY), `write`(1/2→serial),
-  `brk`, `getpid`, `fork`, `execve`, `exit`/`exit_group`, `wait4`.
+  `writev`, `brk`, `mmap`/`munmap`/`mprotect` (anonymous, per-process arena),
+  `arch_prctl` (TLS via `FS_BASE`), `set_tid_address`, `ioctl`(→ENOTTY),
+  `rt_sigaction`/`rt_sigprocmask`/`madvise` (stubs), `getpid`, `fork`, `execve`,
+  `exit`/`exit_group`, `wait4`.
+- **Linux ABI — runs real static musl binaries** (ROADMAP §4 rung 1). An
+  unmodified `x86_64-linux-musl` `hello world` cross-compiled on the host runs
+  on the disk: TLS, anonymous mmap, auxv and argv/envp all in place. `/bin/mhello`
+  is built by `make` (needs `musl-tools`).
 - **`/bin/init` → `/bin/sh`** ([user/](user/)) — an interactive shell:
   `vibe$` prompt, line editing, run programs by name or path (`/bin/hello`),
   `help`/`exit`, exit-status reporting.
@@ -162,18 +171,25 @@ TLS and a fleshed-out initial stack.
 Practical method: the dispatcher already logs unknown syscalls — run the
 binary, see what it traps on, implement that one, repeat.
 
-**Rung 1 — a static musl `hello world` runs.** The real gate; *every* real
-binary needs these before `main`:
-- **TLS:** `arch_prctl(ARCH_SET_FS)` → `wrmsr(FS_BASE)`, saved/restored per task
-  (musl won't start without thread-local storage).
-- **Anonymous `mmap`/`munmap`/`mprotect`** — musl's malloc is mmap-based; the
-  kernel has none today.
-- **auxv:** `AT_PAGESZ`, `AT_RANDOM` (stack canary), `AT_PHDR/PHENT/PHNUM/ENTRY`.
-- **Startup stubs:** `set_tid_address`, `rt_sigprocmask`/`rt_sigaction`
-  (return 0), `ioctl(TCGETS)` for `isatty`.
-- **Loader fixes:** raise the 256 KiB image cap (a static `ld` is several MB),
-  grow the 32 KiB user stack, and **pass `argv`/`envp` through `execve`** (it
-  currently fabricates `argv[0]=path`).
+**Rung 1 — a static musl `hello world` runs. ✅ SHIPPED.** An unmodified
+`x86_64-linux-musl` binary (`/bin/mhello`) starts, prints with `argc`/`argv`,
+and exits cleanly. In practice musl's startup trapped on exactly four new calls
+(`arch_prctl`, `set_tid_address`, `ioctl`, `writev`); the rest below were built
+out for the next rungs. What landed:
+- **TLS:** `arch_prctl(ARCH_SET_FS)` → `wrmsr(FS_BASE)`, stored per task and
+  restored on every schedule (`apply_task_mm`).
+- **Anonymous `mmap`/`munmap`/`mprotect`** over a per-process bump arena at
+  8 GiB (`task.mmap_next`), with `vmspace_unmap` freeing pages.
+- **auxv:** `AT_PHDR/PHENT/PHNUM/PAGESZ/ENTRY/RANDOM/UID/EUID/GID/EGID/SECURE/
+  CLKTCK`, built by the loader from the in-memory phdrs.
+- **Startup stubs:** `set_tid_address`→tid; `rt_sigprocmask`/`rt_sigaction`/
+  `madvise`→0; `ioctl`→`-ENOTTY` (musl falls back to full buffering).
+- **Loader:** segments are now streamed off the fd (no image cap); 256 KiB user
+  stack; `argv`/`envp` plumbed through `execve` onto the initial stack.
+- **Fork fix (load-bearing):** the syscall frame now captures the user's
+  callee-saved regs (`rbx`/`rbp`/`r12-r15`) so a forked child resumes with them
+  intact — previously they came back zeroed, silently corrupting e.g. the
+  `argv` pointer the shell held in `rbp`.
 
 **Rung 2 — programs that do file I/O** (busybox `cat`/`ls`/`echo`):
 - A real **per-process fd table** (today fds 0/1/2 are hardwired).

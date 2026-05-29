@@ -37,6 +37,8 @@ rm -f "$VDISK"
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/init.elf  /bin/init
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/sh.elf    /bin/sh
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/hello.elf /bin/hello
+[ -f user/build/mhello.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/mhello.elf /bin/mhello
 
 step "Volume contents"
 "$DISKUTIL" --diskfile "$VDISK" --ls /

@@ -30,7 +30,9 @@ static void init_launch(void *arg) {
     task_set_vmspace(vm);             /* attach + make active for the load below */
 
     uint64_t entry, rsp;
-    int r = user_load_path(vm, "/bin/init", &entry, &rsp);
+    char *argv[] = { (char *)"/bin/init", nullptr };
+    char *envp[] = { (char *)"PATH=/bin", (char *)"TERM=vibeos", nullptr };
+    int r = user_load_path(vm, "/bin/init", argv, envp, &entry, &rsp);
     if (r != 0) panic("init: failed to load /bin/init (%d) — is the volume populated?", r);
     kprintf("[init] /bin/init loaded, entry=%lx rsp=%lx -> ring 3\n",
             (unsigned long)entry, (unsigned long)rsp);

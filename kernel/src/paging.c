@@ -247,6 +247,10 @@ int vmspace_query(vmspace_t *vm, uint64_t va, uint64_t *pa_out) {
     return query_at(vm->pml4_phys, va, pa_out);
 }
 
+void vmspace_unmap(vmspace_t *vm, uint64_t va, size_t pages) {
+    unmap_at(vm->pml4_phys, va, pages);
+}
+
 /* Eager fork: deep-copy the parent's user half (4 KiB leaves only — user
    mappings are never large pages) into a brand-new address space. */
 vmspace_t *vmspace_fork(vmspace_t *parent) {

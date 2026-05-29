@@ -18,7 +18,15 @@ syscall_entry:
     movq    g_kernel_rsp(%rip), %rsp
 
     /* Build a syscall_frame_t on the kernel stack (see syscall.c). Pushes go
-       high->low, so the last push (rax) is the struct's first field. */
+       high->low, so the last push (rax) is the struct's first field. The
+       callee-saved registers are highest (pushed first) — captured so fork can
+       clone the parent's rbx/rbp/r12-r15 into the child. */
+    pushq   %r15
+    pushq   %r14
+    pushq   %r13
+    pushq   %r12
+    pushq   %rbp
+    pushq   %rbx
     pushq   g_user_rsp(%rip)        /* .user_rsp */
     pushq   %r11                    /* .r11  (user rflags) */
     pushq   %rcx                    /* .rcx  (user rip)    */
@@ -66,7 +74,15 @@ fork_child_return:
     popq    %r9
     popq    %rcx                    /* user rip */
     popq    %r11                    /* user rflags */
-    popq    %rsp                    /* user rsp */
+    /* rsp now points at .user_rsp; the callee-saved regs sit just above it.
+       Restore them, then load the user stack last (it overwrites rsp). */
+    movq    8(%rsp),  %rbx
+    movq    16(%rsp), %rbp
+    movq    24(%rsp), %r12
+    movq    32(%rsp), %r13
+    movq    40(%rsp), %r14
+    movq    48(%rsp), %r15
+    movq    0(%rsp),  %rsp          /* user rsp */
     sysretq
     .size   fork_child_return, . - fork_child_return
 

@@ -18,6 +18,11 @@ typedef struct syscall_frame {
     uint64_t rcx;                          /* user return rip */
     uint64_t r11;                          /* user rflags */
     uint64_t user_rsp;
+    /* Callee-saved user regs. A normal syscall preserves these via the C ABI,
+       so the return path leaves them alone — but fork must clone them into the
+       child (whose kernel context would otherwise hand back zeros), or the
+       child resumes with a corrupt rbp/rbx/r12-r15 (e.g. losing argv). */
+    uint64_t rbx, rbp, r12, r13, r14, r15;
 } syscall_frame_t;
 
 /* Tail that a freshly-forked child's kernel stack returns into: pops a
@@ -48,11 +53,12 @@ void user_heap_init(uint64_t start, uint64_t max);
 
 /* Read a static ET_EXEC x86_64 ELF from the mounted filesystem at `path` and
    load it into address space `vm` (low half, user pages), building the System V
-   initial stack with argv[0] = path. `vm` must be the active address space
-   (CR3) so the loader can populate it through the user VAs. On success returns
-   0 and fills the entry point and initial user rsp; negative on FS error or a
-   bad/unsupported image. */
+   initial stack from the kernel-side `argv`/`envp` arrays (NULL-terminated) plus
+   a real auxv. `vm` must be the active address space (CR3) so the loader can
+   populate it through the user VAs. On success returns 0 and fills the entry
+   point and initial user rsp; negative on FS error or a bad/unsupported image. */
 int user_load_path(struct vmspace *vm, const char *path,
+                   char *const argv[], char *const envp[],
                    uint64_t *entry_out, uint64_t *rsp_out);
 
 __attribute__((noreturn))

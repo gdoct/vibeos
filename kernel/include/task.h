@@ -54,6 +54,8 @@ typedef struct task {
        feed wait4 (a parent sleeps on child_wq until a child becomes ZOMBIE). */
     struct vmspace *vm;
     uint64_t      brk_start, brk_cur, brk_max;
+    uint64_t      fs_base;      /* TLS base (arch_prctl ARCH_SET_FS); per-task FS_BASE MSR */
+    uint64_t      mmap_next;    /* bump pointer for anonymous mmap() in the user half */
     struct task  *parent;
     int           exit_code;
     wait_queue_t  child_wq;

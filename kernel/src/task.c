@@ -29,6 +29,13 @@
 
 #define KSTACK_PAGES   4   /* 16 KiB kernel stack per task */
 
+#define MSR_FS_BASE    0xC0000100u
+
+static inline void wrmsr(uint32_t msr, uint64_t val) {
+    __asm__ volatile("wrmsr" :: "c"(msr), "a"((uint32_t)val),
+                     "d"((uint32_t)(val >> 32)));
+}
+
 extern "C" void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern "C" __attribute__((noreturn)) void task_trampoline(void);
 extern "C" void fork_child_return(void);
@@ -134,10 +141,20 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     t->brk_start = parent->brk_start;
     t->brk_cur   = parent->brk_cur;
     t->brk_max   = parent->brk_max;
+    t->fs_base   = parent->fs_base;     /* child shares the TLS layout (AS copied) */
+    t->mmap_next = parent->mmap_next;
 
     /* Craft the child stack: context_switch -> fork_child_return, which finds a
-       copy of the parent's syscall frame (rax forced to 0) and sysrets. */
+       copy of the parent's syscall frame (rax forced to 0) and sysrets. The
+       callee-saved regs are cloned too, so the child resumes with the parent's
+       rbx/rbp/r12-r15 intact (else it would return to ring 3 with them zeroed). */
     uint64_t *sp = (uint64_t *)t->stack_top;
+    *--sp = frame->r15;
+    *--sp = frame->r14;
+    *--sp = frame->r13;
+    *--sp = frame->r12;
+    *--sp = frame->rbp;
+    *--sp = frame->rbx;
     *--sp = frame->user_rsp;
     *--sp = frame->r11;
     *--sp = frame->rcx;
@@ -167,6 +184,7 @@ static void apply_task_mm(task_t *t) {
     if (t->vm) {                 /* user task (BSP-pinned): set the kernel stack */
         tss_set_rsp0(t->stack_top);
         g_kernel_rsp = t->stack_top;
+        wrmsr(MSR_FS_BASE, t->fs_base);   /* restore this task's TLS base */
     }
 }
 
