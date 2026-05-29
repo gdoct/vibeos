@@ -10,6 +10,7 @@
 #include "kmalloc.h"
 #include "paging.h"
 #include "apic.h"
+#include "smp.h"
 #include "fs.h"
 #include "usermode.h"
 #include "../../boot/include/bootinfo.h"
@@ -241,6 +242,11 @@ extern "C" void kmain(BootInfo *bi) {
     /* Now take interrupts. From here virtio completions arrive via IRQ
        and the timer drives preemption + sleeper wakeups. */
     irq_enable();
+
+    /* Bring up the other CPUs (uses the timer for SIPI pacing, so it runs
+       after irq_enable). They come online and park until the scheduler is
+       SMP-aware. */
+    smp_init();
 
     device_dump();
 

@@ -27,6 +27,15 @@ int  apic_enabled(void);
 /* Acknowledge the in-service interrupt to the local APIC. */
 void lapic_eoi(void);
 
+/* ---- SMP (ROADMAP §1) ---- */
+int      apic_cpu_count(void);        /* enabled CPUs found in the MADT */
+uint8_t  apic_cpu_apic_id(int i);     /* APIC id of the i-th CPU */
+uint8_t  apic_bsp_id(void);           /* APIC id of the boot CPU */
+uint32_t apic_local_id(void);         /* APIC id of the calling CPU */
+void     apic_send_init(uint8_t dest_apic_id);
+void     apic_send_sipi(uint8_t dest_apic_id, uint8_t vector);
+void     apic_enable_local(void);     /* AP software-enables its own LAPIC */
+
 /* Vector the LAPIC timer and routed PCI INTx land on (both dispatched
    through irq_common, so they reuse irq_register: irq 0 and irq 11). */
 #define APIC_TIMER_VECTOR   0x20

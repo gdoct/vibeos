@@ -103,6 +103,7 @@ KERNEL_C_SRCS = \
 	kernel/src/pic.c \
 	kernel/src/irq.c \
 	kernel/src/apic.c \
+	kernel/src/smp.c \
 	kernel/src/task.c \
 	kernel/src/tss.c \
 	kernel/src/syscall.c \
@@ -114,7 +115,7 @@ KERNEL_C_SRCS = \
 	kernel/src/drivers/pci.c \
 	kernel/src/drivers/virtio_blk.c \
 	kernel/src/drivers/timer.c
-KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S kernel/src/usermode.S
+KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S kernel/src/usermode.S kernel/src/ap_boot.S
 
 KERNEL_C_OBJS = $(KERNEL_C_SRCS:kernel/src/%.c=kernel/build/%.o)
 KERNEL_S_OBJS = $(KERNEL_S_SRCS:kernel/src/%.S=kernel/build/%.o)
@@ -229,7 +230,7 @@ $(VDISK): | boot/build
 	truncate -s $(VDISK_BYTES) $@
 
 run: $(IMG) $(VDISK)
-	$(QEMU) -machine q35 -m 256 \
+	$(QEMU) -machine q35 -m 256 -smp 4 \
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 	  -drive format=raw,file=$(IMG) \
 	  -drive if=none,id=vd0,format=raw,file=$(VDISK) \

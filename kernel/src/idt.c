@@ -47,3 +47,9 @@ void idt_init(void) {
 
     kprintf("[idt] installed: 32 exception + 16 IRQ vectors\n");
 }
+
+/* Load the (already-built) IDT on the calling CPU. APs call this so they
+   share the BSP's IDT without rebuilding it. */
+void idt_load(void) {
+    __asm__ volatile("lidt %0" : : "m"(g_idtr));
+}

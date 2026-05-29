@@ -18,6 +18,7 @@ extern "C" {
 
 void gdt_init(void);   /* installs our own GDT, reloads segments */
 void idt_init(void);   /* installs IDT with exception handlers for vectors 0-31 */
+void idt_load(void);   /* load the already-built IDT on the calling CPU (APs) */
 
 /* Point an arbitrary IDT vector at a raw handler (e.g. the LAPIC spurious
    stub). Interrupt gate, kernel CS, DPL 0. */

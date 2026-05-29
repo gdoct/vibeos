@@ -1,0 +1,33 @@
+#ifndef VIBEOS_SMP_H
+#define VIBEOS_SMP_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Fixed low physical page the AP trampoline is copied to and where APs start
+   in real mode (SIPI vector = this >> 12). Must be page-aligned and < 1 MiB. */
+#define AP_TRAMPOLINE_PHYS  0x8000
+
+#define SMP_MAX_CPUS  8
+
+struct cpu {
+    uint32_t index;       /* 0 = BSP */
+    uint32_t apic_id;
+    volatile int online;
+};
+
+/* Bring up the application processors. Call after apic_init (LAPIC up, MADT
+   parsed) and paging_init, with interrupts enabled (uses the timer for the
+   SIPI delays). APs that don't have work yet park in a hlt loop. */
+void smp_init(void);
+
+int  smp_cpu_count(void);   /* CPUs online, including the BSP */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

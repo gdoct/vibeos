@@ -1,4 +1,10 @@
 #include "kernel.h"
+#include "spinlock.h"
+
+/* Serializes whole kprintf lines so output from different CPUs doesn't
+   interleave mid-line. kputc/kputs/kvprintf themselves are unlocked (callers
+   that pre-hold this, or single-char paths, use them directly). */
+static spinlock_t print_lock = SPINLOCK_INIT;
 
 void kputc(char c) {
     if (c == '\n') serial_putc('\r');
@@ -90,6 +96,8 @@ void kvprintf(const char *fmt, va_list ap) {
 void kprintf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
+    spin_lock(&print_lock);
     kvprintf(fmt, ap);
+    spin_unlock(&print_lock);
     va_end(ap);
 }

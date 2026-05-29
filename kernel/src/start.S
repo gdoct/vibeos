@@ -90,6 +90,7 @@ _start:
        all other slots stay 0. ~20 KiB of zeros in the image — negligible. */
     .section .boot.data, "aw", @progbits
     .balign 4096
+    .globl boot_pml4       /* reused as the AP-bringup CR3 (identity+kernel+dm) */
 boot_pml4:     .skip 4096
 boot_pdpt_id:  .skip 4096
 boot_pdpt_dm:  .skip 4096

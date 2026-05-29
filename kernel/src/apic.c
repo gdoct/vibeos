@@ -72,6 +72,12 @@ typedef struct {
 #define LAPIC_TIMER_INIT 0x380
 #define LAPIC_TIMER_CUR  0x390
 #define LAPIC_TIMER_DIV  0x3E0
+#define LAPIC_ICR_LO     0x300   /* interrupt command (write low triggers) */
+#define LAPIC_ICR_HI     0x310   /* destination APIC id in bits 31:24 */
+#define ICR_DELIVERY_PENDING (1u << 12)
+
+#define MADT_LAPIC       0       /* Processor Local APIC entry */
+#define MAX_CPUS         8
 
 #define LVT_MASKED       (1u << 16)
 #define LVT_PERIODIC     (1u << 17)
@@ -86,6 +92,8 @@ static uint64_t g_ioapic_base = 0;
 static uint32_t g_ioapic_gsi_base = 0;
 static uint8_t  g_bsp_id = 0;
 static int      g_enabled = 0;
+static uint8_t  g_cpu_ids[MAX_CPUS];   /* APIC ids of enabled CPUs (from MADT) */
+static int      g_ncpu = 0;
 
 int apic_enabled(void) { return g_enabled; }
 
@@ -180,6 +188,10 @@ static int parse_madt(const acpi_madt_t *madt) {
         uint8_t len  = p[1];
         if (len < 2 || p + len > end) break;
         switch (type) {
+        case MADT_LAPIC:                            /* type 0: a CPU */
+            if ((*(const uint32_t *)(p + 4) & 1) && g_ncpu < MAX_CPUS)
+                g_cpu_ids[g_ncpu++] = p[3];         /* p[3] = APIC id */
+            break;
         case MADT_IOAPIC:
             if (!found_ioapic) {
                 g_ioapic_base     = *(const uint32_t *)(p + 4);
@@ -284,4 +296,32 @@ int apic_init(const BootInfo *bi, uint32_t tick_hz) {
     kprintf("[apic] LAPIC id=%u, timer %lu ticks/s (init=%u), PCI INTx -> vec %x\n",
             g_bsp_id, (unsigned long)per_sec, init_count, APIC_PCI_VECTOR);
     return 1;
+}
+
+/* ---- SMP support (ROADMAP §1) ---- */
+
+int     apic_cpu_count(void)       { return g_ncpu; }
+uint8_t apic_cpu_apic_id(int i)    { return (i >= 0 && i < g_ncpu) ? g_cpu_ids[i] : 0; }
+uint8_t apic_bsp_id(void)          { return g_bsp_id; }
+uint32_t apic_local_id(void)       { return lapic_read(LAPIC_ID) >> 24; }
+
+static void icr_send(uint8_t dest, uint32_t low) {
+    lapic_write(LAPIC_ICR_HI, (uint32_t)dest << 24);
+    lapic_write(LAPIC_ICR_LO, low);
+    while (lapic_read(LAPIC_ICR_LO) & ICR_DELIVERY_PENDING) __asm__ volatile("pause");
+}
+
+/* INIT IPI (assert, edge) then a STARTUP IPI carrying the trampoline page as
+   its vector. The BSP paces these with delays (see smp.c). */
+void apic_send_init(uint8_t dest)              { icr_send(dest, 0x00004500u); }
+void apic_send_sipi(uint8_t dest, uint8_t vec) { icr_send(dest, 0x00004600u | vec); }
+
+/* Software-enable the calling CPU's local APIC (an AP does this for itself;
+   the BSP already did it in apic_init). */
+void apic_enable_local(void) {
+    wrmsr(IA32_APIC_BASE, rdmsr(IA32_APIC_BASE) | APIC_BASE_ENABLE);
+    lapic_write(LAPIC_SVR, SVR_ENABLE | APIC_SPURIOUS_VECTOR);
+    lapic_write(LAPIC_LVT_LINT0, LVT_MASKED);
+    lapic_write(LAPIC_LVT_LINT1, LVT_MASKED);
+    lapic_write(LAPIC_LVT_ERROR, LVT_MASKED);
 }
