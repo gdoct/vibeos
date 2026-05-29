@@ -1,5 +1,5 @@
-#ifndef MYOS_BOOT_GOP_H
-#define MYOS_BOOT_GOP_H
+#ifndef VIBEOS_BOOT_GOP_H
+#define VIBEOS_BOOT_GOP_H
 
 #include "../include/efi.h"
 #include "../include/bootinfo.h"

@@ -5,8 +5,8 @@
 }
 
 <section class="hero">
-    <h1>MyFS Disk Explorer</h1>
-    <p>Open a disk image, browse directories, preview file contents, and download files from MyFS v1.0 volumes.</p>
+    <h1>VibeFS Disk Explorer</h1>
+    <p>Open a disk image, browse directories, preview file contents, and download files from VibeFS v1.0 volumes.</p>
 </section>
 
 <section class="panel">
@@ -104,7 +104,7 @@
                             <td>@entry.Type</td>
                             <td>@entry.Size</td>
                             <td>
-                                @if (entry.Type == DiskUtil.Core.Filesystems.MyFs.v1_0.MyFsNodeType.Directory)
+                                @if (entry.Type == DiskUtil.Core.Filesystems.VibeFs.v1_0.VibeFsNodeType.Directory)
                                 {
                                     <a class="action-link"
                                        asp-page="/Index"

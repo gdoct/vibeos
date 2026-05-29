@@ -1,5 +1,5 @@
-#ifndef MYOS_VIRTIO_H
-#define MYOS_VIRTIO_H
+#ifndef VIBEOS_VIRTIO_H
+#define VIBEOS_VIRTIO_H
 
 #include <stdint.h>
 

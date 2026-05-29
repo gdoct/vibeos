@@ -1,5 +1,5 @@
-#ifndef MYOS_PAGING_H
-#define MYOS_PAGING_H
+#ifndef VIBEOS_PAGING_H
+#define VIBEOS_PAGING_H
 
 #include <stdint.h>
 #include <stddef.h>

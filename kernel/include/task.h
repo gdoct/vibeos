@@ -1,5 +1,5 @@
-#ifndef MYOS_TASK_H
-#define MYOS_TASK_H
+#ifndef VIBEOS_TASK_H
+#define VIBEOS_TASK_H
 
 #include <stdint.h>
 #include <stddef.h>

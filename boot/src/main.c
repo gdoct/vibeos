@@ -39,13 +39,13 @@ extern "C" EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *
     gBS = SystemTable->BootServices;
 
     if (gST->ConOut) gST->ConOut->ClearScreen(gST->ConOut);
-    put(u"[boot] MyOS bootloader\r\n");
+    put(u"[boot] VibeOS bootloader\r\n");
 
     /* 1. Read the kernel ELF off the ESP. */
     VOID *kernel_image = 0;
     UINTN kernel_size = 0;
-    EFI_STATUS s = fs_read_file(u"\\myos\\kernel.elf", &kernel_image, &kernel_size);
-    if (EFI_ERROR(s)) panic(u"cannot read \\myos\\kernel.elf", s);
+    EFI_STATUS s = fs_read_file(u"\\vibeos\\kernel.elf", &kernel_image, &kernel_size);
+    if (EFI_ERROR(s)) panic(u"cannot read \\vibeos\\kernel.elf", s);
     put(u"[boot] kernel.elf loaded, ");
     put_dec(kernel_size);
     put(u" bytes\r\n");

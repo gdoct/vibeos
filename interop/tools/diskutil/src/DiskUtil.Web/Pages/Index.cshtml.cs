@@ -1,5 +1,5 @@
 using System.Text;
-using DiskUtil.Core.Filesystems.MyFs.v1_0;
+using DiskUtil.Core.Filesystems.VibeFs.v1_0;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 
@@ -28,7 +28,7 @@ public class IndexModel : PageModel
     [BindProperty(SupportsGet = true)]
     public string? PreviewFilePath { get; set; }
 
-    public IReadOnlyList<MyFsNode> Entries { get; private set; } = Array.Empty<MyFsNode>();
+    public IReadOnlyList<VibeFsNode> Entries { get; private set; } = Array.Empty<VibeFsNode>();
 
     public string? ErrorMessage { get; private set; }
 
@@ -63,7 +63,7 @@ public class IndexModel : PageModel
 
         try
         {
-            using var volume = MyFsVolume.Open(ImagePath);
+            using var volume = VibeFsVolume.Open(ImagePath);
             DirectoryPath = NormalizePath(DirectoryPath);
             Entries = volume.ListDirectory(DirectoryPath);
 
@@ -76,7 +76,7 @@ public class IndexModel : PageModel
         {
             _logger.LogWarning(ex, "Failed to open or read image {ImagePath}", ImagePath);
             ErrorMessage = ex.Message;
-            Entries = Array.Empty<MyFsNode>();
+            Entries = Array.Empty<VibeFsNode>();
         }
     }
 
@@ -85,9 +85,9 @@ public class IndexModel : PageModel
         try
         {
             var resolvedImagePath = ResolveImagePathOrThrow(imagePath);
-            using var volume = MyFsVolume.Open(resolvedImagePath);
+            using var volume = VibeFsVolume.Open(resolvedImagePath);
             var node = volume.GetNode(NormalizePath(filePath));
-            if (node.Type != MyFsNodeType.File)
+            if (node.Type != VibeFsNodeType.File)
             {
                 return BadRequest("The selected path is not a file.");
             }
@@ -119,7 +119,7 @@ public class IndexModel : PageModel
                 throw new InvalidOperationException("Directory name is required.");
             }
 
-            using var volume = MyFsVolume.OpenReadWrite(ResolveImagePathOrThrow(imagePath));
+            using var volume = VibeFsVolume.OpenReadWrite(ResolveImagePathOrThrow(imagePath));
             volume.CreateDirectory(JoinPath(parentPath, name));
             StatusMessage = $"Directory '{name}' created.";
         }
@@ -150,7 +150,7 @@ public class IndexModel : PageModel
             using var ms = new MemoryStream();
             uploadFile.CopyTo(ms);
 
-            using var volume = MyFsVolume.OpenReadWrite(ResolveImagePathOrThrow(imagePath));
+            using var volume = VibeFsVolume.OpenReadWrite(ResolveImagePathOrThrow(imagePath));
             var targetPath = JoinPath(NormalizePath(directoryPath), Path.GetFileName(uploadFile.FileName));
             volume.WriteFile(targetPath, ms.ToArray());
             StatusMessage = $"Uploaded '{uploadFile.FileName}'.";
@@ -169,7 +169,7 @@ public class IndexModel : PageModel
         var resolvedImagePath = ResolveImagePathOrNull(imagePath);
         try
         {
-            using var volume = MyFsVolume.OpenReadWrite(ResolveImagePathOrThrow(imagePath));
+            using var volume = VibeFsVolume.OpenReadWrite(ResolveImagePathOrThrow(imagePath));
             volume.Delete(NormalizePath(targetPath));
             StatusMessage = $"Deleted '{targetPath}'.";
         }
@@ -195,7 +195,7 @@ public class IndexModel : PageModel
             }
 
             var destination = JoinPath(NormalizePath(directoryPath), destinationName);
-            using var volume = MyFsVolume.OpenReadWrite(ResolveImagePathOrThrow(imagePath));
+            using var volume = VibeFsVolume.OpenReadWrite(ResolveImagePathOrThrow(imagePath));
             volume.CopyFile(source, destination);
             StatusMessage = $"Copied '{source}' to '{destination}'.";
         }
@@ -235,10 +235,10 @@ public class IndexModel : PageModel
         return null;
     }
 
-    private void LoadPreview(MyFsVolume volume, string filePath)
+    private void LoadPreview(VibeFsVolume volume, string filePath)
     {
         var node = volume.GetNode(filePath);
-        if (node.Type != MyFsNodeType.File)
+        if (node.Type != VibeFsNodeType.File)
         {
             ErrorMessage = "Preview is available for files only.";
             return;

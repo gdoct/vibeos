@@ -1,4 +1,4 @@
-﻿using DiskUtil.Core.Filesystems.MyFs.v1_0;
+﻿using DiskUtil.Core.Filesystems.VibeFs.v1_0;
 
 return Run(args);
 
@@ -28,7 +28,7 @@ static int Run(string[] args)
 			case "import":
 				if (commandArgs.Count != 2)
 				{
-					throw new ArgumentException("Import expects: --import|-i <local-file> <myfs-file>");
+					throw new ArgumentException("Import expects: --import|-i <local-file> <vibefs-file>");
 				}
 
 				ImportFile(diskFile!, commandArgs[0], commandArgs[1]);
@@ -37,7 +37,7 @@ static int Run(string[] args)
 			case "export":
 				if (commandArgs.Count != 2)
 				{
-					throw new ArgumentException("Export expects: --export|-e <myfs-file> <local-file>");
+					throw new ArgumentException("Export expects: --export|-e <vibefs-file> <local-file>");
 				}
 
 				ExportFile(diskFile!, commandArgs[0], commandArgs[1]);
@@ -46,7 +46,7 @@ static int Run(string[] args)
 			case "ls":
 				if (commandArgs.Count > 1)
 				{
-					throw new ArgumentException("List expects: --ls [myfs-path]");
+					throw new ArgumentException("List expects: --ls [vibefs-path]");
 				}
 
 				var path = commandArgs.Count == 1 ? commandArgs[0] : "/";
@@ -133,7 +133,7 @@ static string? GetValue(string[] args, string key)
 	return null;
 }
 
-static void ImportFile(string diskFile, string localPath, string myfsPath)
+static void ImportFile(string diskFile, string localPath, string vibeFsPath)
 {
 	if (File.Exists(localPath) == false)
 	{
@@ -141,15 +141,15 @@ static void ImportFile(string diskFile, string localPath, string myfsPath)
 	}
 
 	var bytes = File.ReadAllBytes(localPath);
-	using var volume = MyFsVolume.OpenReadWrite(diskFile);
-	volume.WriteFile(myfsPath, bytes);
-	Console.WriteLine($"Imported '{localPath}' -> '{myfsPath}'");
+	using var volume = VibeFsVolume.OpenReadWrite(diskFile);
+	volume.WriteFile(vibeFsPath, bytes);
+	Console.WriteLine($"Imported '{localPath}' -> '{vibeFsPath}'");
 }
 
-static void ExportFile(string diskFile, string myfsPath, string localPath)
+static void ExportFile(string diskFile, string vibeFsPath, string localPath)
 {
-	using var volume = MyFsVolume.Open(diskFile);
-	var bytes = volume.ReadFileBytes(myfsPath);
+	using var volume = VibeFsVolume.Open(diskFile);
+	var bytes = volume.ReadFileBytes(vibeFsPath);
 
 	var localDir = Path.GetDirectoryName(localPath);
 	if (string.IsNullOrWhiteSpace(localDir) == false)
@@ -158,13 +158,13 @@ static void ExportFile(string diskFile, string myfsPath, string localPath)
 	}
 
 	File.WriteAllBytes(localPath, bytes);
-	Console.WriteLine($"Exported '{myfsPath}' -> '{localPath}'");
+	Console.WriteLine($"Exported '{vibeFsPath}' -> '{localPath}'");
 }
 
-static void ListPath(string diskFile, string myfsPath)
+static void ListPath(string diskFile, string vibeFsPath)
 {
-	using var volume = MyFsVolume.Open(diskFile);
-	var normalizedPath = string.IsNullOrWhiteSpace(myfsPath) ? "/" : myfsPath;
+	using var volume = VibeFsVolume.Open(diskFile);
+	var normalizedPath = string.IsNullOrWhiteSpace(vibeFsPath) ? "/" : vibeFsPath;
 	var entries = volume.ListDirectory(normalizedPath);
 
 	if (entries.Count == 0)
@@ -175,17 +175,17 @@ static void ListPath(string diskFile, string myfsPath)
 
 	foreach (var entry in entries)
 	{
-		var type = entry.Type == MyFsNodeType.Directory ? "dir " : "file";
+		var type = entry.Type == VibeFsNodeType.Directory ? "dir " : "file";
 		Console.WriteLine($"{type}  {entry.Size,10}  {entry.FullPath}");
 	}
 }
 
 static void PrintUsage()
 {
-	Console.WriteLine("DiskTool.CLI - MyFS disk utility");
+	Console.WriteLine("DiskTool.CLI - VibeFS disk utility");
 	Console.WriteLine();
 	Console.WriteLine("Usage:");
-	Console.WriteLine("  disktool-cli --diskfile <diskfile> --import|-i <local-file> <myfs-file>");
-	Console.WriteLine("  disktool-cli --diskfile <diskfile> --export|-e <myfs-file> <local-file>");
-	Console.WriteLine("  disktool-cli --diskfile <diskfile> --ls [myfs-path]");
+	Console.WriteLine("  disktool-cli --diskfile <diskfile> --import|-i <local-file> <vibefs-file>");
+	Console.WriteLine("  disktool-cli --diskfile <diskfile> --export|-e <vibefs-file> <local-file>");
+	Console.WriteLine("  disktool-cli --diskfile <diskfile> --ls [vibefs-path]");
 }

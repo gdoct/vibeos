@@ -3,7 +3,7 @@
 Cross-platform C# utility for interacting with virtual disk images used by the OS project.
 
 ## Current status
-The solution is scaffolded and includes a working MyFS explorer with write operations.
+The solution is scaffolded and includes a working VibeFS explorer with write operations.
 
 Projects:
 - `DiskUtil.Core` (`src/DiskUtil.Core`): Core library for filesystem and disk image logic.
@@ -70,12 +70,12 @@ Suggested namespace/folder layout:
 ```text
 DiskUtil.Core/
     Filesystems/
-        MyFS/
+        VibeFS/
             v1_0/
 ```
 
 ## Implemented features
-- MyFS v1.0 reader in `DiskUtil.Core`:
+- VibeFS v1.0 reader in `DiskUtil.Core`:
     - Superblock and inode parsing
     - Directory traversal by absolute path
     - File reads with direct + single/double/triple-indirect block support
@@ -97,4 +97,4 @@ DiskUtil.Core/
 
 ## Current limitations
 - Web delete only supports files and empty directories.
-- The web app assumes the image starts with a MyFS superblock at block 0.
+- The web app assumes the image starts with a VibeFS superblock at block 0.

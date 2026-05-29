@@ -5,7 +5,7 @@
 #include "timer.h"
 
 /*
- * MyFS v1 — a tiny, non-journaled, writable filesystem (ROADMAP §2).
+ * VibeFS v1 — a tiny, non-journaled, writable filesystem (ROADMAP §2).
  *
  * Design in one breath: 4 KiB FS blocks over a 512-byte-sector block device;
  * a superblock, an inode bitmap, a data bitmap, a fixed inode table, then the
@@ -774,7 +774,7 @@ int fs_mount(block_device_t *dev) {
     bread(0, &g.sb);
     if (g.sb.magic != FS_MAGIC || g.sb.version != FS_VERSION ||
         g.sb.block_size != FS_BLOCK_SIZE) {
-        kprintf("[fs] %s: no MYFS volume (magic=%x) -> formatting\n",
+        kprintf("[fs] %s: no VIBEFS volume (magic=%x) -> formatting\n",
                 dev->dev.name, g.sb.magic);
         mkfs();
         bread(0, &g.sb);

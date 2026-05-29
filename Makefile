@@ -1,9 +1,9 @@
-# MyOS top-level build.
+# VibeOS top-level build.
 #
 # Produces:
 #   boot/build/BOOTX64.EFI   — UEFI bootloader (PE32+)
 #   kernel/build/kernel.elf  — ET_EXEC kernel, higher-half (-2 GiB), loaded at 1 MiB phys
-#   boot/build/myos.img      — FAT disk image, bootable in QEMU+OVMF
+#   boot/build/vibeos.img    — FAT disk image, bootable in QEMU+OVMF
 #
 # Toolchain: g++ + GNU ld. Bootloader uses i386pep emulation for PE32+;
 # kernel uses default elf_x86_64.
@@ -18,101 +18,101 @@ OVMF    ?= /usr/share/OVMF/OVMF_CODE_4M.fd
 # --- Bootloader (UEFI PE32+) ---
 
 BOOT_CFLAGS = \
-  -m64 \
-  -ffreestanding \
-  -fno-stack-protector \
-  -fshort-wchar \
-  -mno-red-zone \
-  -mno-sse \
-  -mno-mmx \
-  -fpic \
-  -nostdlib \
-  -fpermissive \
-  -Iboot/include \
-  -O2 \
-  -Wall -Wextra -Wno-unused-parameter \
-  -std=c++17
+	-m64 \
+	-ffreestanding \
+	-fno-stack-protector \
+	-fshort-wchar \
+	-mno-red-zone \
+	-mno-sse \
+	-mno-mmx \
+	-fpic \
+	-nostdlib \
+	-fpermissive \
+	-Iboot/include \
+	-O2 \
+	-Wall -Wextra -Wno-unused-parameter \
+	-std=c++17
 
 # Boot is linked as an ELF DSO with a UEFI-shaped section layout, then
 # objcopy converts it to PE32+ (pei-x86-64). This is the canonical recipe
 # that gnu-efi/edk2 toolchains use and is what actually produces a PE
 # image OVMF will load.
 BOOT_LDFLAGS = \
-  -nostdlib \
-  -shared \
-  -Bsymbolic \
-  --no-undefined \
-  -T boot/efi.lds \
-  -e efi_main
+	-nostdlib \
+	-shared \
+	-Bsymbolic \
+	--no-undefined \
+	-T boot/efi.lds \
+	-e efi_main
 
 BOOT_OBJCOPY_SECTIONS = \
-  -j .text -j .sdata -j .data -j .rodata \
-  -j .rel  -j .rela  -j .reloc \
-  -j .dynamic
+	-j .text -j .sdata -j .data -j .rodata \
+	-j .rel  -j .rela  -j .reloc \
+	-j .dynamic
 
 BOOT_SRCS = boot/src/main.c boot/src/util.c boot/src/fs.c \
-            boot/src/elf.c  boot/src/gop.c  boot/src/mmap.c
+	          boot/src/elf.c  boot/src/gop.c  boot/src/mmap.c
 BOOT_OBJS = $(BOOT_SRCS:boot/src/%.c=boot/build/%.o) boot/build/reloc.o
 
 EFI = boot/build/BOOTX64.EFI
-IMG = boot/build/myos.img
+IMG = boot/build/vibeos.img
 ESP = boot/build/esp
 
 # --- Kernel (ET_EXEC ELF64) ---
 
 KERNEL_CFLAGS = \
-  -m64 \
-  -ffreestanding \
-  -fno-stack-protector \
-  -fno-pic \
-  -fno-pie \
-  -mcmodel=kernel \
-  -mno-red-zone \
-  -mno-sse \
-  -mno-mmx \
-  -mno-80387 \
-  -nostdlib \
-  -fno-exceptions \
-  -fno-rtti \
-  -Ikernel/include \
-  -Iboot/include \
-  -O2 \
-  -Wall -Wextra -Wno-unused-parameter \
-  -std=c++17
+	-m64 \
+	-ffreestanding \
+	-fno-stack-protector \
+	-fno-pic \
+	-fno-pie \
+	-mcmodel=kernel \
+	-mno-red-zone \
+	-mno-sse \
+	-mno-mmx \
+	-mno-80387 \
+	-nostdlib \
+	-fno-exceptions \
+	-fno-rtti \
+	-Ikernel/include \
+	-Iboot/include \
+	-O2 \
+	-Wall -Wextra -Wno-unused-parameter \
+	-std=c++17
 
 KERNEL_LDFLAGS = \
-  -nostdlib \
-  -static \
-  -no-pie \
-  -z max-page-size=0x1000 \
-  -T kernel/linker.ld
+	-nostdlib \
+	-static \
+	-no-pie \
+	-z max-page-size=0x1000 \
+	-T kernel/linker.ld
 
 KERNEL_C_SRCS = \
-  kernel/src/main.c \
-  kernel/src/string.c \
-  kernel/src/serial.c \
-  kernel/src/kio.c \
-  kernel/src/panic.c \
-  kernel/src/pmm.c \
-  kernel/src/paging.c \
-  kernel/src/kmalloc.c \
-  kernel/src/device.c \
-  kernel/src/fs.c \
-  kernel/src/idt.c \
-  kernel/src/exception.c \
-  kernel/src/pic.c \
-  kernel/src/irq.c \
-  kernel/src/apic.c \
-  kernel/src/task.c \
-  kernel/src/tss.c \
-  kernel/src/syscall.c \
-  kernel/src/elf64.c \
-  kernel/src/drivers/fb.c \
-  kernel/src/drivers/font.c \
-  kernel/src/drivers/ramdisk.c \
-  kernel/src/drivers/pci.c \
-  kernel/src/drivers/virtio_blk.c \
-  kernel/src/drivers/timer.c
+	kernel/src/main.c \
+	kernel/src/string.c \
+	kernel/src/serial.c \
+	kernel/src/kio.c \
+	kernel/src/panic.c \
+	kernel/src/pmm.c \
+	kernel/src/paging.c \
+	kernel/src/kmalloc.c \
+	kernel/src/device.c \
+	kernel/src/fs.c \
+	kernel/src/idt.c \
+	kernel/src/exception.c \
+	kernel/src/pic.c \
+	kernel/src/irq.c \
+	kernel/src/apic.c \
+	kernel/src/task.c \
+	kernel/src/tss.c \
+	kernel/src/syscall.c \
+	kernel/src/elf64.c \
+	kernel/src/drivers/fb.c \
+	kernel/src/drivers/font.c \
+	kernel/src/drivers/ramdisk.c \
+	kernel/src/drivers/pci.c \
+	kernel/src/drivers/virtio_blk.c \
+	kernel/src/drivers/timer.c
 KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S kernel/src/usermode.S
 
 KERNEL_C_OBJS = $(KERNEL_C_SRCS:kernel/src/%.c=kernel/build/%.o)
@@ -127,10 +127,10 @@ KERNEL_ELF = kernel/build/kernel.elf
 # --- Userspace (ROADMAP §3) ---
 
 USER_CFLAGS = \
-  -m64 -ffreestanding -fno-pic -fno-pie \
-  -mno-red-zone -mno-sse -mno-mmx \
-  -nostdlib -fno-exceptions -fno-rtti -fno-stack-protector \
-  -O2 -Wall -Wextra -Wno-unused-parameter -std=c++17
+	-m64 -ffreestanding -fno-pic -fno-pie \
+	-mno-red-zone -mno-sse -mno-mmx \
+	-nostdlib -fno-exceptions -fno-rtti -fno-stack-protector \
+	-O2 -Wall -Wextra -Wno-unused-parameter -std=c++17
 USER_LDFLAGS = -nostdlib -static -no-pie -T user/user.ld
 
 USER_INIT  = user/build/init.elf
@@ -215,15 +215,15 @@ $(HELLO_BLOB_OBJ): $(USER_HELLO) | kernel/build
 image: $(IMG)
 
 $(IMG): $(EFI) $(KERNEL_ELF)
-	@mkdir -p $(ESP)/EFI/BOOT $(ESP)/myos
+	@mkdir -p $(ESP)/EFI/BOOT $(ESP)/vibeos
 	cp $(EFI) $(ESP)/EFI/BOOT/BOOTX64.EFI
-	cp $(KERNEL_ELF) $(ESP)/myos/kernel.elf
+	cp $(KERNEL_ELF) $(ESP)/vibeos/kernel.elf
 	@printf 'fs0:\r\nEFI\\BOOT\\BOOTX64.EFI\r\n' > $(ESP)/startup.nsh
 	dd if=/dev/zero of=$@ bs=1M count=64 status=none
 	mformat -i $@ -F ::
-	mmd -i $@ ::/EFI ::/EFI/BOOT ::/myos
+	mmd -i $@ ::/EFI ::/EFI/BOOT ::/vibeos
 	mcopy -i $@ $(ESP)/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
-	mcopy -i $@ $(ESP)/myos/kernel.elf ::/myos/kernel.elf
+	mcopy -i $@ $(ESP)/vibeos/kernel.elf ::/vibeos/kernel.elf
 	mcopy -i $@ $(ESP)/startup.nsh ::/startup.nsh
 
 VDISK = boot/build/vdisk.img

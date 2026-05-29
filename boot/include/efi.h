@@ -1,5 +1,5 @@
-#ifndef MYOS_EFI_H
-#define MYOS_EFI_H
+#ifndef VIBEOS_EFI_H
+#define VIBEOS_EFI_H
 
 #include <stdint.h>
 #include <stddef.h>

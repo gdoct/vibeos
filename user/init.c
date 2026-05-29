@@ -1,5 +1,5 @@
 /*
- * MyOS init — the first userspace program (ROADMAP §3, Milestone B).
+ * VibeOS init — the first userspace program (ROADMAP §3, Milestone B).
  *
  * Freestanding: no libc. Talks to the kernel through the Linux x86_64 syscall
  * ABI (rax = number; args in rdi, rsi, rdx, r10, r8, r9; `syscall` clobbers

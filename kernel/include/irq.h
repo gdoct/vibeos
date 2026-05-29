@@ -1,5 +1,5 @@
-#ifndef MYOS_IRQ_H
-#define MYOS_IRQ_H
+#ifndef VIBEOS_IRQ_H
+#define VIBEOS_IRQ_H
 
 #include <stdint.h>
 #include "regs.h"

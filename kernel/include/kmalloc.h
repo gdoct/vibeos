@@ -1,5 +1,5 @@
-#ifndef MYOS_KMALLOC_H
-#define MYOS_KMALLOC_H
+#ifndef VIBEOS_KMALLOC_H
+#define VIBEOS_KMALLOC_H
 
 #include <stddef.h>
 

@@ -1,5 +1,5 @@
-#ifndef MYOS_BOOT_ELFLOADER_H
-#define MYOS_BOOT_ELFLOADER_H
+#ifndef VIBEOS_BOOT_ELFLOADER_H
+#define VIBEOS_BOOT_ELFLOADER_H
 
 #include "../include/efi.h"
 

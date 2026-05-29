@@ -1,5 +1,5 @@
-#ifndef MYOS_TIMER_H
-#define MYOS_TIMER_H
+#ifndef VIBEOS_TIMER_H
+#define VIBEOS_TIMER_H
 
 #include <stdint.h>
 

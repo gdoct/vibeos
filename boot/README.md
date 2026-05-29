@@ -1,26 +1,26 @@
 # Boot
 
-This part contains the boot phase of MyOS.
+This part contains the boot phase of VibeOS.
 
 The boot phase is responsible for getting the system from power-on to a running kernel. Its job is not to start services or applications. Its job is to prepare the machine, load the kernel into memory, and transfer control to the kernel entry point.
 
 ## Target
 
-The boot target is fixed for MyOS:
+The boot target is fixed for VibeOS:
 
 - **Firmware**: UEFI (no legacy BIOS / no MBR / no GRUB)
 - **CPU**: x86_64, long mode (UEFI already places us here)
 - **Kernel format**: ELF64, statically linked, position-fixed at a known virtual address
 - **Bootloader format**: PE32+ EFI application (`BOOTX64.EFI`)
 
-The bootloader is itself a UEFI application loaded by the firmware from the EFI System Partition (ESP) at the standard fallback path `\EFI\BOOT\BOOTX64.EFI`. The kernel lives on the same FAT partition as `\myos\kernel.elf`.
+The bootloader is itself a UEFI application loaded by the firmware from the EFI System Partition (ESP) at the standard fallback path `\EFI\BOOT\BOOTX64.EFI`. The kernel lives on the same FAT partition as `\vibeos\kernel.elf`.
 
 ## Scope
 
 The boot phase does only the minimum required to start the kernel:
 
 - run as a UEFI application from the firmware boot path
-- locate `\myos\kernel.elf` on the ESP
+- locate `\vibeos\kernel.elf` on the ESP
 - read and validate its ELF64 header
 - allocate physical memory and load each `PT_LOAD` segment at its requested physical address
 - pull together the boot info the kernel needs (framebuffer, memory map, ACPI RSDP)
@@ -72,11 +72,11 @@ The `BootInfo` struct is versioned with a magic value and `version` field so ker
 
 ### Phase 1 — Skeleton UEFI application
 
-Stand up the build and a do-nothing `efi_main` that prints "MyOS boot" and waits for a key. This proves the toolchain (`clang -target x86_64-unknown-windows` + `lld-link /subsystem:efi_application`), the ESP layout, and the QEMU+OVMF run loop.
+Stand up the build and a do-nothing `efi_main` that prints "VibeOS boot" and waits for a key. This proves the toolchain (`clang -target x86_64-unknown-windows` + `lld-link /subsystem:efi_application`), the ESP layout, and the QEMU+OVMF run loop.
 
 ### Phase 2 — Read the kernel from the ESP
 
-Use `EFI_LOADED_IMAGE_PROTOCOL` → `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` to open `\myos\kernel.elf`. Read it into a transient `AllocatePool` buffer. Confirm the file is reachable and the size is sane.
+Use `EFI_LOADED_IMAGE_PROTOCOL` → `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` to open `\vibeos\kernel.elf`. Read it into a transient `AllocatePool` buffer. Confirm the file is reachable and the size is sane.
 
 ### Phase 3 — Parse and load the ELF
 
@@ -107,7 +107,7 @@ At this point the bootloader is "frozen": further startup work moves into the ke
 ## Building and Running
 
 ```
-make           # builds build/BOOTX64.EFI and build/myos.img
+make           # builds build/BOOTX64.EFI and build/vibeos.img
 make run       # qemu-system-x86_64 + OVMF, boots the image
 ```
 

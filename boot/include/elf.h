@@ -1,5 +1,5 @@
-#ifndef MYOS_ELF_H
-#define MYOS_ELF_H
+#ifndef VIBEOS_ELF_H
+#define VIBEOS_ELF_H
 
 #include <stdint.h>
 

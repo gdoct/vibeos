@@ -1,5 +1,5 @@
-#ifndef MYOS_BOOT_UTIL_H
-#define MYOS_BOOT_UTIL_H
+#ifndef VIBEOS_BOOT_UTIL_H
+#define VIBEOS_BOOT_UTIL_H
 
 #include "../include/efi.h"
 

@@ -142,7 +142,7 @@ static void paint_splash(fb_device_t *fb) {
     /* Title bar. */
     fb->fill_rect(fb, 0, 0, fb->width, FB_FONT_H * 2, teal);
     fb->draw_text(fb, FB_FONT_W, FB_FONT_H/2,
-                  "MyOS kernel", white, teal);
+                  "VibeOS kernel", white, teal);
 }
 
 static void selftest_block(block_device_t *bd) {
@@ -175,7 +175,7 @@ static uint8_t fs_pat(uint64_t off) { return (uint8_t)(off * 2654435761u + 0xABu
    clean remount and recovery across a forced-dirty fsck. Runs on the boot stack
    with virtio polling (no scheduler yet), like selftest_block above. */
 static void selftest_fs(block_device_t *dev) {
-    const char *msg = "Hello, MyFS!\n";
+    const char *msg = "Hello, VibeFS!\n";
     uint32_t mlen = (uint32_t)kstrlen(msg);
     uint32_t spb  = FS_BLOCK_SIZE / dev->block_size;
     int r, fd, got;
@@ -441,7 +441,7 @@ extern "C" void kmain(BootInfo *bi) {
     bi = (BootInfo *)phys_to_virt((uint64_t)(uintptr_t)bi);
 
     serial_init();
-    kprintf("\n[kernel] MyOS booting (BootInfo @ %p)\n", bi);
+    kprintf("\n[kernel] VibeOS booting (BootInfo @ %p)\n", bi);
 
     gdt_init();
     idt_init();

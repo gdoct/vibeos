@@ -1,5 +1,5 @@
-#ifndef MYOS_BLOCK_H
-#define MYOS_BLOCK_H
+#ifndef VIBEOS_BLOCK_H
+#define VIBEOS_BLOCK_H
 
 #include <stdint.h>
 #include "device.h"

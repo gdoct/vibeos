@@ -1,9 +1,9 @@
 using System.Buffers.Binary;
 using System.Text;
 
-namespace DiskUtil.Core.Filesystems.MyFs.v1_0;
+namespace DiskUtil.Core.Filesystems.VibeFs.v1_0;
 
-public sealed class MyFsVolume : IDisposable
+public sealed class VibeFsVolume : IDisposable
 {
     private const uint FsMagic = 0x4D594653;
     private const uint FsVersion = 2;
@@ -23,7 +23,7 @@ public sealed class MyFsVolume : IDisposable
     private readonly byte[] _dataBitmap;
     private readonly Dictionary<uint, uint[]> _pointerBlockCache = new();
 
-    public MyFsVolume(Stream stream, bool ownsStream = false)
+    public VibeFsVolume(Stream stream, bool ownsStream = false)
     {
         if (stream is null)
         {
@@ -43,24 +43,24 @@ public sealed class MyFsVolume : IDisposable
         _dataBitmap = ReadBitmap(_superblock.DataBitmapBlock, _superblock.DataBitmapBlocks);
     }
 
-    public static MyFsVolume Open(string imagePath)
+    public static VibeFsVolume Open(string imagePath)
     {
         if (string.IsNullOrWhiteSpace(imagePath))
         {
             throw new ArgumentException("Image path is required.", nameof(imagePath));
         }
 
-        return new MyFsVolume(File.Open(imagePath, FileMode.Open, FileAccess.Read, FileShare.Read), ownsStream: true);
+        return new VibeFsVolume(File.Open(imagePath, FileMode.Open, FileAccess.Read, FileShare.Read), ownsStream: true);
     }
 
-    public static MyFsVolume OpenReadWrite(string imagePath)
+    public static VibeFsVolume OpenReadWrite(string imagePath)
     {
         if (string.IsNullOrWhiteSpace(imagePath))
         {
             throw new ArgumentException("Image path is required.", nameof(imagePath));
         }
 
-        return new MyFsVolume(File.Open(imagePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read), ownsStream: true);
+        return new VibeFsVolume(File.Open(imagePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read), ownsStream: true);
     }
 
     public static void Format(Stream stream, uint totalBlocks)
@@ -77,7 +77,7 @@ public sealed class MyFsVolume : IDisposable
 
         if (totalBlocks < 16)
         {
-            throw new ArgumentOutOfRangeException(nameof(totalBlocks), "MyFS image must be at least 16 blocks.");
+            throw new ArgumentOutOfRangeException(nameof(totalBlocks), "VibeFS image must be at least 16 blocks.");
         }
 
         stream.SetLength((long)totalBlocks * FsBlockSize);
@@ -159,7 +159,7 @@ public sealed class MyFsVolume : IDisposable
 
         var rootInodeBlock = new byte[FsBlockSize];
         var rootInodeSpan = rootInodeBlock.AsSpan(InodeSize, InodeSize);
-        BinaryPrimitives.WriteUInt16LittleEndian(rootInodeSpan.Slice(0, 2), (ushort)MyFsNodeType.Directory);
+        BinaryPrimitives.WriteUInt16LittleEndian(rootInodeSpan.Slice(0, 2), (ushort)VibeFsNodeType.Directory);
         BinaryPrimitives.WriteUInt16LittleEndian(rootInodeSpan.Slice(2, 2), 2);
         BinaryPrimitives.WriteUInt64LittleEndian(rootInodeSpan.Slice(4, 8), FsBlockSize);
         BinaryPrimitives.WriteUInt32LittleEndian(rootInodeSpan.Slice(20, 4), dataStartBlock);
@@ -167,23 +167,23 @@ public sealed class MyFsVolume : IDisposable
 
         var rootDirectoryBlock = new byte[FsBlockSize];
         var offset = 0;
-        WriteDirectoryEntry(rootDirectoryBlock, ref offset, 1, ".", (byte)MyFsNodeType.Directory, 12);
-        WriteDirectoryEntry(rootDirectoryBlock, ref offset, 1, "..", (byte)MyFsNodeType.Directory, 12);
+        WriteDirectoryEntry(rootDirectoryBlock, ref offset, 1, ".", (byte)VibeFsNodeType.Directory, 12);
+        WriteDirectoryEntry(rootDirectoryBlock, ref offset, 1, "..", (byte)VibeFsNodeType.Directory, 12);
         WriteDirectoryEntry(rootDirectoryBlock, ref offset, 0, string.Empty, 0, checked((ushort)(FsBlockSize - offset)));
         WriteBlockStatic(stream, dataStartBlock, rootDirectoryBlock);
         stream.Flush();
     }
 
-    public IReadOnlyList<MyFsNode> ListDirectory(string path)
+    public IReadOnlyList<VibeFsNode> ListDirectory(string path)
     {
         var normalizedPath = NormalizeAbsolutePath(path);
         var resolved = ResolvePath(normalizedPath);
-        if (resolved.Inode.Type != (ushort)MyFsNodeType.Directory)
+        if (resolved.Inode.Type != (ushort)VibeFsNodeType.Directory)
         {
             throw new InvalidOperationException($"Path '{normalizedPath}' is not a directory.");
         }
 
-        var entries = new List<MyFsNode>();
+        var entries = new List<VibeFsNode>();
         foreach (var dirEntry in EnumerateDirectoryEntries(resolved.Inode))
         {
             if (dirEntry.Inode == 0)
@@ -198,7 +198,7 @@ public sealed class MyFsVolume : IDisposable
 
             var childInode = ReadInode(dirEntry.Inode);
             var fullPath = JoinPath(normalizedPath, dirEntry.Name);
-            entries.Add(new MyFsNode(
+            entries.Add(new VibeFsNode(
                 dirEntry.Inode,
                 dirEntry.Name,
                 fullPath,
@@ -207,12 +207,12 @@ public sealed class MyFsVolume : IDisposable
         }
 
         return entries
-            .OrderByDescending(x => x.Type == MyFsNodeType.Directory)
+            .OrderByDescending(x => x.Type == VibeFsNodeType.Directory)
             .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
 
-    public MyFsNode GetNode(string path)
+    public VibeFsNode GetNode(string path)
     {
         var normalizedPath = NormalizeAbsolutePath(path);
         var resolved = ResolvePath(normalizedPath);
@@ -220,7 +220,7 @@ public sealed class MyFsVolume : IDisposable
             ? "/"
             : normalizedPath.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Last();
 
-        return new MyFsNode(
+        return new VibeFsNode(
             resolved.InodeNumber,
             name,
             normalizedPath,
@@ -232,7 +232,7 @@ public sealed class MyFsVolume : IDisposable
     {
         var normalizedPath = NormalizeAbsolutePath(path);
         var resolved = ResolvePath(normalizedPath);
-        if (resolved.Inode.Type != (ushort)MyFsNodeType.File)
+        if (resolved.Inode.Type != (ushort)VibeFsNodeType.File)
         {
             throw new InvalidOperationException($"Path '{normalizedPath}' is not a file.");
         }
@@ -289,7 +289,7 @@ public sealed class MyFsVolume : IDisposable
 
         if (existing is not null)
         {
-            if (existing.Value.Inode.Type != (ushort)MyFsNodeType.File)
+            if (existing.Value.Inode.Type != (ushort)VibeFsNodeType.File)
             {
                 throw new InvalidOperationException($"Path '{normalizedPath}' is not a regular file.");
             }
@@ -307,8 +307,8 @@ public sealed class MyFsVolume : IDisposable
             }
 
             inodeNumber = AllocateInode();
-            inode = Inode.Create((ushort)MyFsNodeType.File, 1);
-            AddDirectoryEntry(parent.ParentInodeNumber, parent.ParentInode, parent.Name, inodeNumber, (byte)MyFsNodeType.File);
+            inode = Inode.Create((ushort)VibeFsNodeType.File, 1);
+            AddDirectoryEntry(parent.ParentInodeNumber, parent.ParentInode, parent.Name, inodeNumber, (byte)VibeFsNodeType.File);
         }
 
         var blockBuffer = new byte[FsBlockSize];
@@ -349,7 +349,7 @@ public sealed class MyFsVolume : IDisposable
 
         var parent = ResolveParentPath(normalizedPath);
         var inodeNumber = AllocateInode();
-        var inode = Inode.Create((ushort)MyFsNodeType.Directory, 2);
+        var inode = Inode.Create((ushort)VibeFsNodeType.Directory, 2);
 
         var firstBlock = AllocateDataBlock();
         inode.Direct[0] = firstBlock;
@@ -357,13 +357,13 @@ public sealed class MyFsVolume : IDisposable
 
         var block = new byte[FsBlockSize];
         var offset = 0;
-        WriteDirectoryEntry(block, ref offset, inodeNumber, ".", (byte)MyFsNodeType.Directory, 12);
-        WriteDirectoryEntry(block, ref offset, parent.ParentInodeNumber, "..", (byte)MyFsNodeType.Directory, 12);
+        WriteDirectoryEntry(block, ref offset, inodeNumber, ".", (byte)VibeFsNodeType.Directory, 12);
+        WriteDirectoryEntry(block, ref offset, parent.ParentInodeNumber, "..", (byte)VibeFsNodeType.Directory, 12);
         WriteDirectoryEntry(block, ref offset, 0, string.Empty, 0, checked((ushort)(FsBlockSize - offset)));
         WriteBlock(firstBlock, block);
 
         WriteInode(inodeNumber, inode);
-        AddDirectoryEntry(parent.ParentInodeNumber, parent.ParentInode, parent.Name, inodeNumber, (byte)MyFsNodeType.Directory);
+        AddDirectoryEntry(parent.ParentInodeNumber, parent.ParentInode, parent.Name, inodeNumber, (byte)VibeFsNodeType.Directory);
 
         parent.ParentInode.Links++;
         WriteInode(parent.ParentInodeNumber, parent.ParentInode);
@@ -385,14 +385,14 @@ public sealed class MyFsVolume : IDisposable
             ?? throw new FileNotFoundException($"Path '{normalizedPath}' was not found.", normalizedPath);
 
         var inode = ReadInode(entry.Inode);
-        if (inode.Type == (ushort)MyFsNodeType.Directory && !IsDirectoryEmpty(inode))
+        if (inode.Type == (ushort)VibeFsNodeType.Directory && !IsDirectoryEmpty(inode))
         {
             throw new InvalidOperationException("Directory is not empty.");
         }
 
         RemoveDirectoryEntry(parent.ParentInodeNumber, parent.ParentInode, parent.Name);
 
-        if (inode.Type == (ushort)MyFsNodeType.Directory && parent.ParentInode.Links > 0)
+        if (inode.Type == (ushort)VibeFsNodeType.Directory && parent.ParentInode.Links > 0)
         {
             parent.ParentInode.Links--;
             WriteInode(parent.ParentInodeNumber, parent.ParentInode);
@@ -408,7 +408,7 @@ public sealed class MyFsVolume : IDisposable
     public void CopyFile(string sourcePath, string destinationPath)
     {
         var source = GetNode(sourcePath);
-        if (source.Type != MyFsNodeType.File)
+        if (source.Type != VibeFsNodeType.File)
         {
             throw new InvalidOperationException("Only regular files can be copied.");
         }
@@ -448,28 +448,28 @@ public sealed class MyFsVolume : IDisposable
 
         if (superblock.Magic != FsMagic)
         {
-            throw new MyFsFormatException($"Invalid magic 0x{superblock.Magic:X8}; expected 0x{FsMagic:X8}.");
+            throw new VibeFsFormatException($"Invalid magic 0x{superblock.Magic:X8}; expected 0x{FsMagic:X8}.");
         }
 
         if (superblock.Version != FsVersion)
         {
-            throw new MyFsFormatException($"Unsupported MyFS version {superblock.Version}; expected {FsVersion}.");
+            throw new VibeFsFormatException($"Unsupported VibeFS version {superblock.Version}; expected {FsVersion}.");
         }
 
         if (superblock.BlockSize != FsBlockSize)
         {
-            throw new MyFsFormatException(
+            throw new VibeFsFormatException(
                 $"Unsupported block size {superblock.BlockSize}; expected {FsBlockSize}.");
         }
 
         if (superblock.InodeCount == 0 || superblock.RootInode == 0 || superblock.RootInode >= superblock.InodeCount)
         {
-            throw new MyFsFormatException("Invalid inode table metadata in superblock.");
+            throw new VibeFsFormatException("Invalid inode table metadata in superblock.");
         }
 
         if (superblock.DataBlocks == 0 || superblock.DataStartBlock >= superblock.TotalBlocks)
         {
-            throw new MyFsFormatException("Invalid data-area metadata in superblock.");
+            throw new VibeFsFormatException("Invalid data-area metadata in superblock.");
         }
 
         return superblock;
@@ -513,7 +513,7 @@ public sealed class MyFsVolume : IDisposable
         var components = path.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         foreach (var component in components)
         {
-            if (currentInode.Type != (ushort)MyFsNodeType.Directory)
+            if (currentInode.Type != (ushort)VibeFsNodeType.Directory)
             {
                 return null;
             }
@@ -590,7 +590,7 @@ public sealed class MyFsVolume : IDisposable
     {
         if (inodeNumber >= _superblock.InodeCount)
         {
-            throw new MyFsFormatException($"Inode index {inodeNumber} is out of range.");
+            throw new VibeFsFormatException($"Inode index {inodeNumber} is out of range.");
         }
 
         var inodeTableBlock = _superblock.InodeTableBlock + (inodeNumber / InodesPerBlock);
@@ -849,7 +849,7 @@ public sealed class MyFsVolume : IDisposable
     {
         if (!_canWrite)
         {
-            throw new InvalidOperationException("Volume is read-only. Open with MyFsVolume.OpenReadWrite for mutations.");
+            throw new InvalidOperationException("Volume is read-only. Open with VibeFsVolume.OpenReadWrite for mutations.");
         }
     }
 
@@ -870,7 +870,7 @@ public sealed class MyFsVolume : IDisposable
 
         var parentPath = parts.Length == 1 ? "/" : "/" + string.Join('/', parts.Take(parts.Length - 1));
         var parent = ResolvePath(parentPath);
-        if (parent.Inode.Type != (ushort)MyFsNodeType.Directory)
+        if (parent.Inode.Type != (ushort)VibeFsNodeType.Directory)
         {
             throw new InvalidOperationException($"Parent path '{parentPath}' is not a directory.");
         }
@@ -1207,13 +1207,13 @@ public sealed class MyFsVolume : IDisposable
         return directoryPath == "/" ? "/" + name : directoryPath + "/" + name;
     }
 
-    private static MyFsNodeType MapType(ushort inodeType)
+    private static VibeFsNodeType MapType(ushort inodeType)
     {
         return inodeType switch
         {
-            1 => MyFsNodeType.File,
-            2 => MyFsNodeType.Directory,
-            _ => MyFsNodeType.Unknown
+            1 => VibeFsNodeType.File,
+            2 => VibeFsNodeType.Directory,
+            _ => VibeFsNodeType.Unknown
         };
     }
 

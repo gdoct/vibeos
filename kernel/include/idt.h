@@ -1,5 +1,5 @@
-#ifndef MYOS_IDT_H
-#define MYOS_IDT_H
+#ifndef VIBEOS_IDT_H
+#define VIBEOS_IDT_H
 
 #include <stdint.h>
 

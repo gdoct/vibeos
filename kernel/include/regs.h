@@ -1,5 +1,5 @@
-#ifndef MYOS_REGS_H
-#define MYOS_REGS_H
+#ifndef VIBEOS_REGS_H
+#define VIBEOS_REGS_H
 
 #include <stdint.h>
 

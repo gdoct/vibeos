@@ -1,5 +1,5 @@
-#ifndef MYOS_SPINLOCK_H
-#define MYOS_SPINLOCK_H
+#ifndef VIBEOS_SPINLOCK_H
+#define VIBEOS_SPINLOCK_H
 
 #include <stdint.h>
 #include "irq.h"

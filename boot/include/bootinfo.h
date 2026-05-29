@@ -1,9 +1,9 @@
-#ifndef MYOS_BOOTINFO_H
-#define MYOS_BOOTINFO_H
+#ifndef VIBEOS_BOOTINFO_H
+#define VIBEOS_BOOTINFO_H
 
 #include <stdint.h>
 
-#define BOOTINFO_MAGIC   0x4D594F53424F4F54ULL  /* "MYOSBOOT" little-endian */
+#define BOOTINFO_MAGIC   0x544F4F4253454249ULL  /* "VIBEBOOT" little-endian */
 #define BOOTINFO_VERSION 1
 
 typedef enum {

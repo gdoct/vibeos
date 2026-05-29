@@ -1,15 +1,15 @@
 using System.Text;
-using DiskUtil.Core.Filesystems.MyFs.v1_0;
+using DiskUtil.Core.Filesystems.VibeFs.v1_0;
 
 namespace DiskUtil.Core.Tests;
 
-public class MyFsVolumeTests
+public class VibeFsVolumeTests
 {
     [Fact]
     public void Format_ProducesReadableEmptyRoot()
     {
         using var stream = CreateFormattedImage(64);
-        using var volume = new MyFsVolume(stream);
+        using var volume = new VibeFsVolume(stream);
 
         var entries = volume.ListDirectory("/");
 
@@ -20,13 +20,13 @@ public class MyFsVolumeTests
     public void WriteAndReadFile_RoundTripsData()
     {
         using var stream = CreateFormattedImage(64);
-        using (var volume = new MyFsVolume(stream))
+        using (var volume = new VibeFsVolume(stream))
         {
             volume.WriteFile("/hello.txt", Encoding.UTF8.GetBytes("Hello from write path\n"));
         }
 
         stream.Position = 0;
-        using var reopened = new MyFsVolume(stream);
+        using var reopened = new VibeFsVolume(stream);
 
         var bytes = reopened.ReadFileBytes("/hello.txt");
         var text = Encoding.UTF8.GetString(bytes);
@@ -38,7 +38,7 @@ public class MyFsVolumeTests
     public void CreateCopyDelete_RoundTripBehaviorIsCorrect()
     {
         using var stream = CreateFormattedImage(128);
-        using (var volume = new MyFsVolume(stream))
+        using (var volume = new VibeFsVolume(stream))
         {
             volume.CreateDirectory("/docs");
             volume.WriteFile("/docs/a.txt", Encoding.UTF8.GetBytes("A"));
@@ -51,7 +51,7 @@ public class MyFsVolumeTests
         }
 
         stream.Position = 0;
-        using var reopened = new MyFsVolume(stream);
+        using var reopened = new VibeFsVolume(stream);
         var remaining = reopened.ListDirectory("/docs");
         var b = Assert.Single(remaining);
         Assert.Equal("b.txt", b.Name);
@@ -66,13 +66,13 @@ public class MyFsVolumeTests
         stream.WriteByte(0x00);
         stream.Position = 0;
 
-        Assert.Throws<MyFsFormatException>(() => new MyFsVolume(stream));
+        Assert.Throws<VibeFsFormatException>(() => new VibeFsVolume(stream));
     }
 
     private static MemoryStream CreateFormattedImage(uint blocks)
     {
         var stream = new MemoryStream();
-        MyFsVolume.Format(stream, blocks);
+        VibeFsVolume.Format(stream, blocks);
         stream.Position = 0;
         return stream;
     }

@@ -1,5 +1,5 @@
-#ifndef MYOS_FS_H
-#define MYOS_FS_H
+#ifndef VIBEOS_FS_H
+#define VIBEOS_FS_H
 
 #include <stdint.h>
 #include "block.h"
@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 /*
- * MyFS v1 — a tiny, non-journaled, writable filesystem over block_device_t.
+ * VibeFS v1 — a tiny, non-journaled, writable filesystem over block_device_t.
  *
  * One volume, 4 KiB FS blocks (8 underlying 512-byte sectors). The on-disk
  * inode table is the source of truth; the two bitmaps are a derived cache that
@@ -20,7 +20,7 @@ extern "C" {
  */
 
 #define FS_BLOCK_SIZE   4096u
-#define FS_MAGIC        0x4D594653u    /* 'MYFS' little-endian */
+#define FS_MAGIC        0x53464256u    /* 'VBFS' little-endian */
 #define FS_VERSION      2u             /* v2: double/triple indirect + 64-bit size */
 
 #define FS_NAME_MAX     60             /* bytes; not counting a NUL */

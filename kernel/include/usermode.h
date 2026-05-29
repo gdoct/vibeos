@@ -1,5 +1,5 @@
-#ifndef MYOS_USERMODE_H
-#define MYOS_USERMODE_H
+#ifndef VIBEOS_USERMODE_H
+#define VIBEOS_USERMODE_H
 
 #include <stdint.h>
 

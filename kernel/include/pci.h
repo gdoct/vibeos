@@ -1,5 +1,5 @@
-#ifndef MYOS_PCI_H
-#define MYOS_PCI_H
+#ifndef VIBEOS_PCI_H
+#define VIBEOS_PCI_H
 
 #include <stdint.h>
 

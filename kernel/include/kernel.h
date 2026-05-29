@@ -1,5 +1,5 @@
-#ifndef MYOS_KERNEL_H
-#define MYOS_KERNEL_H
+#ifndef VIBEOS_KERNEL_H
+#define VIBEOS_KERNEL_H
 
 #include <stdint.h>
 #include <stddef.h>

@@ -1,5 +1,5 @@
-#ifndef MYOS_FB_H
-#define MYOS_FB_H
+#ifndef VIBEOS_FB_H
+#define VIBEOS_FB_H
 
 #include <stdint.h>
 #include "device.h"

@@ -1,5 +1,5 @@
-#ifndef MYOS_APIC_H
-#define MYOS_APIC_H
+#ifndef VIBEOS_APIC_H
+#define VIBEOS_APIC_H
 
 #include <stdint.h>
 #include "../../boot/include/bootinfo.h"

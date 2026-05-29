@@ -1,5 +1,5 @@
 /*
- * MyOS kernel link script — higher-half kernel (ROADMAP §3, Phase 0).
+ * VibeOS kernel link script — higher-half kernel (ROADMAP §3, Phase 0).
  *
  * The kernel runs at -2 GiB (0xFFFFFFFF80000000 + physical), so the entire
  * low canonical half is free for userspace. The bootloader, however, still

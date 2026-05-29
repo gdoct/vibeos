@@ -1,5 +1,5 @@
-#ifndef MYOS_PMM_H
-#define MYOS_PMM_H
+#ifndef VIBEOS_PMM_H
+#define VIBEOS_PMM_H
 
 #include <stdint.h>
 #include <stddef.h>

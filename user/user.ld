@@ -4,7 +4,7 @@
  * Static ET_EXEC linked at 4 MiB — comfortably inside the low half the kernel
  * now leaves free (Phase 0). Page-aligned segments so the loader maps clean
  * 4 KiB pages. (§4's Linux binaries will use their own base, typically the
- * same 0x400000; nothing here is MyOS-specific except the value.)
+ * same 0x400000; nothing here is VibeOS-specific except the value.)
  */
 
 OUTPUT_FORMAT(elf64-x86-64)

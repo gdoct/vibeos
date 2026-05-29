@@ -1,4 +1,4 @@
-# MyOS — what we have, what's next
+# VibeOS — what we have, what's next
 
 This document is the running picture of where the project is and the
 order of next steps. It's the place to come back to when "what should I
@@ -12,7 +12,7 @@ the host).
 
 ### Boot chain
 - **UEFI bootloader** ([boot/](boot/)) — PE32+ application. Reads
-  `\myos\kernel.elf` off the ESP, validates the ELF, allocates each
+  `\vibeos\kernel.elf` off the ESP, validates the ELF, allocates each
   `PT_LOAD` segment at its `p_paddr`, queries GOP for a linear
   framebuffer, fetches the memory map, calls `ExitBootServices`, and
   jumps to the kernel entry with `rdi = BootInfo*`. Built as an ELF DSO
@@ -118,7 +118,7 @@ the host).
   ports 0xCF8/0xCFC, `pci_find(vendor, dev_lo, dev_hi)`.
 
 ### Filesystem
-- **MyFS v1** ([kernel/src/fs.c](kernel/src/fs.c),
+- **VibeFS v1** ([kernel/src/fs.c](kernel/src/fs.c),
   [kernel/include/fs.h](kernel/include/fs.h)) — a tiny, non-journaled,
   writable filesystem over any `block_device_t`. 4 KiB FS blocks (8 sectors);
   superblock / inode bitmap / data bitmap / fixed inode table / data area.
@@ -133,7 +133,7 @@ the host).
   dangling directory entries, and frees orphans. Verified end-to-end on
   virtio-blk: format, a 64 KiB indirect-block file round-trip, `readdir`,
   `unlink`, persistence across a clean unmount/remount **and across a reboot**
-  (the `MYFS` magic + file bytes are visible in the host `vdisk.img`), plus a
+  (the `VIBEFS` magic + file bytes are visible in the host `vdisk.img`), plus a
   forced-dirty `fsck` that rebuilds a deliberately-wiped data bitmap with the
   data left intact.
 
@@ -222,7 +222,7 @@ today" above:
   today, so this is no longer blocking); the ACPI `_PRT` (we route all
   PCI GSIs to one shared vector instead of resolving each device's pin —
   correct for shared INTx, revisit if we need per-device routing).
-- **Filesystem (MyFS v1)** — the §2 follow-up below, finished end-to-end:
+- **Filesystem (VibeFS v1)** — the §2 follow-up below, finished end-to-end:
   on-disk format, direct + single-indirect blocks, the full kernel file API,
   crash-safe ordered writes, and a dirty-mount `fsck`. Folded into "What works
   today" above. *Deferred:* no journaling, no rename, single global mounted
@@ -250,7 +250,7 @@ N>1.
 
 ### 2. Filesystem: simple read/write from day one
 
-**✅ Shipped (MyFS v1).** Built as described below — see the *Filesystem*
+**✅ Shipped (VibeFS v1).** Built as described below — see the *Filesystem*
 section under "What works today". The design notes here are kept as the
 record of what was built and what was intentionally deferred. **Userspace
 (below) is now the next step.**
@@ -319,7 +319,7 @@ Files: [kernel/src/usermode.S](kernel/src/usermode.S),
 [kernel/src/elf64.c](kernel/src/elf64.c), [user/](user/), and the
 higher-half relink in [kernel/src/start.S](kernel/src/start.S) +
 [kernel/linker.ld](kernel/linker.ld). **Milestone B (below) is next:**
-per-process address spaces, `fork`/`execve`, the host MyFS populate tool,
+per-process address spaces, `fork`/`execve`, the host VibeFS populate tool,
 and console input. The detailed spec is kept below as the build record.
 
 **Why now.** Everything until here has been kernel-only. Userspace
@@ -496,7 +496,7 @@ pointers are dereferenced directly). **Phase 5(B) is next.**
 
 **Phase 5(B) — host FS populate tool + console input.**
 - Flesh out [interop/tools/diskutil](interop/tools/diskutil/) into a
-  host tool that writes files into `vdisk.img` in MyFS format (reusing
+  host tool that writes files into `vdisk.img` in VibeFS format (reusing
   the on-disk structs in [kernel/include/fs.h](kernel/include/fs.h)).
   Add a `make image` step that installs `/bin/init` (and later
   `busybox`, `tcc`). Retires the embedded-blob hack.
@@ -507,7 +507,7 @@ pointers are dereferenced directly). **Phase 5(B) is next.**
 - **SYSCALL/SYSRET, not `int 0x80`** — matches §4's Linux x86-64 path.
 - **Higher-half relink up front (Phase 0)** — frees the low half so §4
   binaries linked at `0x400000` need no further address-space rework.
-- **Embed `init.elf` as a blob for Milestone A**, build the host MyFS
+- **Embed `init.elf` as a blob for Milestone A**, build the host VibeFS
   populate tool in Milestone B.
 
 **Unlocks.** Multiple isolated processes, signals, fork/exec — basically
