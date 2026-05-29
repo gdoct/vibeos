@@ -17,6 +17,8 @@ size_t kstrlen(const char *s);
 void serial_init(void);
 void serial_putc(char c);
 void serial_write(const char *s, size_t n);
+int  serial_rx_ready(void);   /* 1 if a received byte is waiting */
+char serial_getc(void);       /* read one received byte (call when rx_ready) */
 
 void kputc(char c);
 void kputs(const char *s);

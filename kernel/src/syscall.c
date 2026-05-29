@@ -2,6 +2,7 @@
 #include "pmm.h"
 #include "paging.h"
 #include "task.h"
+#include "tty.h"
 #include "usermode.h"
 
 /*
@@ -107,8 +108,9 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
 }
 
 static int64_t sys_read(int fd, void *buf, uint64_t n) {
-    (void)fd; (void)buf; (void)n;
-    return 0;                                   /* no console input yet -> EOF */
+    if (fd == 0)                                /* stdin -> serial console TTY */
+        return tty_read((char *)buf, (uint32_t)n);
+    return -9;                                  /* -EBADF */
 }
 
 __attribute__((noreturn))

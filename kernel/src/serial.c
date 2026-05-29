@@ -11,6 +11,7 @@
 #define UART_MCR    4   /* W:  modem control */
 #define UART_LSR    5   /* R:  line status */
 
+#define LSR_DR      (1u << 0)   /* data ready (a byte waiting in RBR/FIFO) */
 #define LSR_THRE    (1u << 5)
 
 static int serial_ready = 0;
@@ -37,4 +38,15 @@ void serial_write(const char *s, size_t n) {
         if (s[i] == '\n') serial_putc('\r');
         serial_putc(s[i]);
     }
+}
+
+/* Receive side. We don't use the UART RX interrupt; the TTY polls these from
+   the timer tick (see tty_poll), which is plenty for interactive typing and
+   avoids routing an ISA IRQ through the I/O APIC. */
+int serial_rx_ready(void) {
+    return serial_ready && (inb(COM1 + UART_LSR) & LSR_DR);
+}
+
+char serial_getc(void) {
+    return (char)inb(COM1 + UART_DATA);
 }

@@ -3,6 +3,7 @@
 #include "irq.h"
 #include "timer.h"
 #include "task.h"
+#include "tty.h"
 
 /*
  * 8254 PIT, channel 0, mode 3 (square wave). Fires IRQ0 at the requested
@@ -40,6 +41,7 @@ static void wake_due_sleepers(void) {
 static void on_tick(uint8_t irq, regs_t *regs) {
     (void)irq; (void)regs;
     g_ticks++;
+    tty_poll();     /* drain the serial console into the TTY line discipline */
     wake_due_sleepers();
     sched_tick();   /* no-op until sched_init has run */
 }

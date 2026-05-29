@@ -35,6 +35,7 @@ rm -f "$VDISK"
 "$DISKUTIL" --create-volume "$VDISK_SIZE" "$VDISK"
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /bin
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/init.elf  /bin/init
+"$DISKUTIL" --diskfile "$VDISK" --import user/build/sh.elf    /bin/sh
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/hello.elf /bin/hello
 
 step "Volume contents"

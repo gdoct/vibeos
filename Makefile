@@ -106,6 +106,7 @@ KERNEL_C_SRCS = \
 	kernel/src/task.c \
 	kernel/src/tss.c \
 	kernel/src/syscall.c \
+	kernel/src/tty.c \
 	kernel/src/elf64.c \
 	kernel/src/drivers/fb.c \
 	kernel/src/drivers/font.c \
@@ -132,6 +133,7 @@ USER_LDFLAGS = -nostdlib -static -no-pie -T user/user.ld
 
 USER_INIT  = user/build/init.elf
 USER_HELLO = user/build/hello.elf
+USER_SH    = user/build/sh.elf
 
 .PHONY: all clean run image kernel user
 all: $(EFI) $(KERNEL_ELF) user
@@ -174,7 +176,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH)
 
 user/build:
 	mkdir -p user/build
@@ -188,11 +190,17 @@ user/build/init.o: user/init.c | user/build
 user/build/hello.o: user/hello.c | user/build
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+user/build/sh.o: user/sh.c | user/build
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
 $(USER_INIT): user/build/crt0.o user/build/init.o user/user.ld
 	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/init.o -o $@
 
 $(USER_HELLO): user/build/crt0.o user/build/hello.o user/user.ld
 	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/hello.o -o $@
+
+$(USER_SH): user/build/crt0.o user/build/sh.o user/user.ld
+	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/sh.o -o $@
 
 # --- Disk image ---
 
