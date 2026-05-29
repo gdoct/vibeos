@@ -251,9 +251,25 @@ N>1.
 - Verified on QEMU `-smp 4`: all 4 CPUs come online; the shell still runs
   on the BSP.
 
-**🔜 Stage B — make the scheduler SMP (run tasks on all CPUs).** The
-current scheduler is single-`g_current`, direct task→task switch, no lock.
-Plan (xv6-style, proven correct):
+**✅ Stage B shipped (multi-CPU scheduler).** The scheduler is now xv6-style:
+each CPU runs its own `scheduler()` loop ([kernel/src/task.c](kernel/src/task.c));
+tasks switch to/from a per-CPU scheduler context, never directly to each
+other. A single `sched_lock` guards all task state and is held *across* each
+context switch, handed off as a baton (the resumed side releases it —
+`task_trampoline`/`fork_child_return` on first run, the scheduler/yielding
+task otherwise). Interrupt state is tracked per-CPU (`push_off`/`pop_off`),
+not in the lock, since the lock crosses switches. Per-CPU LAPIC timers
+preempt each core (`task_tick`); only the BSP advances the global tick and
+drains the TTY. User tasks are pinned to the BSP (so the ring-3 syscall/IRQ
+path keeps one global kernel-stack latch — no `swapgs` yet); kernel tasks run
+anywhere. **Verified on `-smp 4` (repeatedly, no faults):** kernel workers run
+on and migrate across all 4 CPUs while `/bin/sh` (fork+execve+wait4) runs on
+the BSP. *Deferred:* `swapgs` syscall/ISR path to run **user** tasks on APs;
+per-CPU run queues / work-stealing (today it's one global queue with a simple
+first-READY picker, so distribution is uneven); TLB-shootdown IPIs for
+unmapping shared pages.
+
+**Stage B design (build record), the plan that was followed:**
 - Per-CPU scheduler context + `current`/`idle`, reached via
   `apic_local_id()` (NOT `gs` — `enter_user` sets `gs=USER_DS`, so a
   `gs`-based `this_cpu()` is unsafe in the kernel without `swapgs`).
