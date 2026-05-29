@@ -16,77 +16,11 @@
 
 extern "C" block_device_t *ramdisk_init(uint64_t num_blocks);
 extern "C" block_device_t *virtio_blk_init(void);
-extern "C" uint64_t        virtio_blk_completions(void);
 
-static volatile int g_alive_workers = 0;
-static block_device_t *g_demo_vblk = nullptr;
-
-static void demo_worker(void *arg) {
-    int id = (int)(intptr_t)arg;
-    for (int i = 0; i < 3; i++) {
-        kprintf("[w%d] iter %d at tick %lu\n",
-                id, i, (unsigned long)timer_ticks());
-        /* Sleep ~500 ms by blocking on the timer sleeper list. The task
-           is off the run queue the whole time; with no other ready task
-           the idle loop hlts, so the CPU is genuinely idle between the
-           workers' wakeups rather than spinning. */
-        ksleep_ms(500);
-    }
-    g_alive_workers--;
-}
-
-/* Issues a series of blocking block_reads on virtio-blk. Each read now
-   sleeps the task until the device's completion IRQ fires, so the CPU
-   spends the disk latency running the other workers (or idling) instead
-   of spinning on used_idx. */
-static void io_worker(void *arg) {
-    (void)arg;
-    uint8_t buf[512];
-    uint64_t before = virtio_blk_completions();
-    for (uint64_t lba = 0; lba < 8; lba++) {
-        int r = block_read(g_demo_vblk, lba, 1, buf);
-        kprintf("[io] read lba %lu -> %d (tick %lu, completions=%lu)\n",
-                (unsigned long)lba, r, (unsigned long)timer_ticks(),
-                (unsigned long)virtio_blk_completions());
-    }
-    kprintf("[io] done: %lu IRQ-driven completions\n",
-            (unsigned long)(virtio_blk_completions() - before));
-    g_alive_workers--;
-}
-
-/* The userspace init program, embedded as a blob (user_blob.o / user/init.c).
-   ROADMAP §3 Milestone A loads it from memory; Milestone B reads it from the
-   filesystem via the host populate tool. */
-extern "C" const uint8_t init_elf_start[];
-extern "C" const uint8_t init_elf_end[];
-extern "C" const uint8_t hello_elf_start[];
-extern "C" const uint8_t hello_elf_end[];
-
-/* Embedded program table — the stand-in for /bin until the FS holds it
-   (ROADMAP §3 B.3). execve resolves names through prog_lookup. */
-struct embedded_prog { const char *path; const uint8_t *start; const uint8_t *end; };
-static const embedded_prog g_progs[] = {
-    { "/bin/init",  init_elf_start,  init_elf_end  },
-    { "/bin/hello", hello_elf_start, hello_elf_end },
-};
-
-static int streq(const char *a, const char *b) {
-    while (*a && *a == *b) { a++; b++; }
-    return *a == *b;
-}
-
-const void *prog_lookup(const char *path, uint64_t *size) {
-    for (unsigned i = 0; i < sizeof(g_progs) / sizeof(g_progs[0]); i++)
-        if (streq(path, g_progs[i].path)) {
-            *size = (uint64_t)(g_progs[i].end - g_progs[i].start);
-            return g_progs[i].start;
-        }
-    return nullptr;
-}
-
-/* Load /init into the (now free) low half and drop to ring 3. Runs as a task,
-   so it owns a kernel stack for syscalls/IRQs; on exit() the task dies and the
-   scheduler moves on. */
+/* Load /bin/init from the mounted root filesystem and drop to ring 3. Runs as
+   a task, so it owns a kernel stack for syscalls/IRQs; on exit() it dies and
+   the boot task halts. The program image comes off disk (user_load_path reads
+   it from VibeFS) — no embedded blob. */
 static void init_launch(void *arg) {
     (void)arg;
     /* init gets its own address space (low half private, kernel half shared). */
@@ -94,29 +28,23 @@ static void init_launch(void *arg) {
     if (!vm) panic("init: vmspace_create failed");
     task_set_vmspace(vm);             /* attach + make active for the load below */
 
-    uint64_t size = (uint64_t)(init_elf_end - init_elf_start);
     uint64_t entry, rsp;
-    int r = user_load(vm, init_elf_start, size, "/bin/init", &entry, &rsp);
-    if (r != 0) panic("init: user_load failed (%d)", r);
-    kprintf("[init] loaded init (%lu bytes), entry=%lx rsp=%lx -> ring 3\n",
-            (unsigned long)size, (unsigned long)entry, (unsigned long)rsp);
+    int r = user_load_path(vm, "/bin/init", &entry, &rsp);
+    if (r != 0) panic("init: failed to load /bin/init (%d) — is the volume populated?", r);
+    kprintf("[init] /bin/init loaded, entry=%lx rsp=%lx -> ring 3\n",
+            (unsigned long)entry, (unsigned long)rsp);
     enter_user(entry, rsp);
 }
 
 void scheduler_demo(void) {
     sched_init();
-    g_alive_workers = 2;
-    task_create("w0", demo_worker, (void *)(intptr_t)0);
-    task_create("w1", demo_worker, (void *)(intptr_t)1);
-    if (g_demo_vblk) {
-        g_alive_workers++;
-        task_create("io", io_worker, nullptr);
-    }
-    task_create("init", init_launch, nullptr);   /* userspace init in ring 3 */
-    /* Boot task blocks itself between checks too, instead of spinning. */
-    while (g_alive_workers > 0) ksleep_ms(20);
-    kprintf("[demo] all workers exited at tick %lu\n",
-            (unsigned long)timer_ticks());
+    /* Launch /bin/init as the first userspace process, then block until it
+       exits. init demonstrates the process model (fork + execve /bin/hello +
+       wait4). The boot task only wakes to notice init is gone. */
+    task_t *init = task_create("init", init_launch, nullptr);
+    while (init->state != TASK_DEAD && init->state != TASK_ZOMBIE)
+        ksleep_ms(20);
+    kprintf("[kernel] init exited\n");
 }
 
 static void check_bootinfo(const BootInfo *bi) {
@@ -163,196 +91,6 @@ static void selftest_block(block_device_t *bd) {
 
     kprintf("[selftest] block %s: 1x%u-byte sector round-trip OK\n",
             bd->dev.name, bd->block_size);
-}
-
-/* Deterministic byte pattern keyed by absolute file offset, for large-file
-   round-trip checks. */
-static uint8_t fs_pat(uint64_t off) { return (uint8_t)(off * 2654435761u + 0xABu); }
-
-/* End-to-end filesystem exercise: format, create a dir + files (sized to reach
-   single-, double-, and triple-indirect blocks, including a >4 GiB sparse
-   file), read them back, list the dir, unlink, then prove persistence across a
-   clean remount and recovery across a forced-dirty fsck. Runs on the boot stack
-   with virtio polling (no scheduler yet), like selftest_block above. */
-static void selftest_fs(block_device_t *dev) {
-    const char *msg = "Hello, VibeFS!\n";
-    uint32_t mlen = (uint32_t)kstrlen(msg);
-    uint32_t spb  = FS_BLOCK_SIZE / dev->block_size;
-    int r, fd, got;
-
-    r = fs_mount(dev);
-    if (r != FS_OK) panic("fs: mount failed (%d)", r);
-
-    /* On a reboot the volume already holds /dir from a previous run — that is
-       itself proof of cross-reboot persistence, so EEXIST is fine here. */
-    r = fs_mkdir("/dir");
-    if (r != FS_OK && r != FS_EEXIST) panic("fs: mkdir /dir failed (%d)", r);
-
-    /* small file round-trip (TRUNC so a re-run starts clean) */
-    fd = fs_open("/dir/hello.txt", FS_O_CREATE | FS_O_TRUNC);
-    if (fd < 0) panic("fs: open hello.txt failed (%d)", fd);
-    if (fs_write(fd, msg, mlen) != (int)mlen) panic("fs: short write");
-    fs_close(fd);
-
-    char small[32];
-    fd = fs_open("/dir/hello.txt", 0);
-    if (fd < 0) panic("fs: reopen hello.txt failed (%d)", fd);
-    got = fs_read(fd, small, sizeof small);
-    fs_close(fd);
-    if (got != (int)mlen || kmemcmp(small, msg, mlen) != 0)
-        panic("fs: hello.txt round-trip mismatch (got %d)", got);
-
-    /* large file: 64 KiB = 16 blocks > 13 direct, so single-indirect kicks in */
-    const uint32_t BIG = 64 * 1024;
-    uint8_t *wbuf = (uint8_t *)kmalloc(BIG);
-    uint8_t *rbuf = (uint8_t *)kmalloc(BIG);
-    if (!wbuf || !rbuf) panic("fs: selftest out of memory");
-    for (uint32_t i = 0; i < BIG; i++) wbuf[i] = (uint8_t)(i * 31u + 7u);
-
-    fd = fs_open("/dir/big.bin", FS_O_CREATE | FS_O_TRUNC);
-    if (fd < 0) panic("fs: open big.bin failed (%d)", fd);
-    if (fs_write(fd, wbuf, BIG) != (int)BIG) panic("fs: big.bin short write");
-    fs_close(fd);
-
-    fd = fs_open("/dir/big.bin", 0);
-    kmemset(rbuf, 0, BIG);
-    got = fs_read(fd, rbuf, BIG);
-    fs_close(fd);
-    if (got != (int)BIG || kmemcmp(wbuf, rbuf, BIG) != 0)
-        panic("fs: big.bin round-trip mismatch (got %d)", got);
-    kprintf("[selftest] fs: 64 KiB indirect-block file round-trip OK\n");
-
-    /* 5 MiB file: 1280 blocks > 1037 (13 direct + 1024 single-indirect), so
-       this crosses into double-indirect. Written/verified in 64 KiB chunks to
-       avoid a multi-MiB compare buffer. */
-    const uint64_t HUGE = 5ull * 1024 * 1024;
-    fd = fs_open("/dir/huge.bin", FS_O_CREATE | FS_O_TRUNC);
-    if (fd < 0) panic("fs: open huge.bin failed (%d)", fd);
-    for (uint64_t pos = 0; pos < HUGE; pos += BIG) {
-        uint32_t chunk = (uint32_t)(HUGE - pos < BIG ? HUGE - pos : BIG);
-        for (uint32_t i = 0; i < chunk; i++) wbuf[i] = fs_pat(pos + i);
-        if (fs_write(fd, wbuf, chunk) != (int)chunk)
-            panic("fs: huge.bin short write @%lu", (unsigned long)pos);
-    }
-    fs_close(fd);
-    fd = fs_open("/dir/huge.bin", 0);
-    for (uint64_t pos = 0; pos < HUGE; pos += BIG) {
-        uint32_t chunk = (uint32_t)(HUGE - pos < BIG ? HUGE - pos : BIG);
-        kmemset(rbuf, 0, chunk);
-        if (fs_read(fd, rbuf, chunk) != (int)chunk)
-            panic("fs: huge.bin short read @%lu", (unsigned long)pos);
-        for (uint32_t i = 0; i < chunk; i++)
-            if (rbuf[i] != fs_pat(pos + i))
-                panic("fs: huge.bin mismatch @%lu", (unsigned long)(pos + i));
-    }
-    fs_close(fd);
-    kprintf("[selftest] fs: 5 MiB double-indirect file round-trip OK\n");
-
-    /* Past 4 GiB: seek to a 5 GiB offset (file block ~1.31M, in triple-indirect
-       territory) and write a marker. Proves 64-bit offsets/size + the
-       triple-indirect path. The file is sparse, so only a handful of blocks are
-       physically allocated on the 8 GiB volume. */
-    const uint64_t FAR = 5ull * 1024 * 1024 * 1024;     /* 5 GiB */
-    const char *mark   = "past-4GiB!";
-    uint32_t klen      = (uint32_t)kstrlen(mark);
-    fd = fs_open("/dir/sparse.bin", FS_O_CREATE | FS_O_TRUNC);
-    if (fd < 0) panic("fs: open sparse.bin failed (%d)", fd);
-    if (fs_seek(fd, FAR) != FS_OK) panic("fs: seek to 5 GiB failed");
-    if (fs_write(fd, mark, klen) != (int)klen) panic("fs: sparse.bin write failed");
-    fs_close(fd);
-
-    fd = fs_open("/dir/sparse.bin", 0);
-    kmemset(rbuf, 0xFF, 16);
-    if (fs_read(fd, rbuf, 16) != 16) panic("fs: sparse hole short read");
-    for (int i = 0; i < 16; i++) if (rbuf[i] != 0) panic("fs: sparse hole not zero");
-    if (fs_seek(fd, FAR) != FS_OK) panic("fs: re-seek to 5 GiB failed");
-    kmemset(rbuf, 0, 32);
-    got = fs_read(fd, rbuf, klen);
-    fs_close(fd);
-    if (got != (int)klen || kmemcmp(rbuf, mark, klen) != 0)
-        panic("fs: 5 GiB marker round-trip mismatch (got %d)", got);
-    kprintf("[selftest] fs: 5 GiB-offset triple-indirect write/read OK (file > 4 GiB)\n");
-
-    /* directory listing */
-    fs_dirent_t ents[8];
-    int ne = fs_readdir("/dir", ents, 8);
-    kprintf("[selftest] fs: /dir lists %d entries:", ne);
-    for (int i = 0; i < ne; i++)
-        kprintf(" %s%s", ents[i].name, ents[i].type == FT_DIR ? "/" : "");
-    kprintf("\n");
-
-    /* unlink round-trip */
-    r = fs_create("/dir/tmp");
-    if (r != FS_OK && r != FS_EEXIST)    panic("fs: create tmp failed (%d)", r);
-    if (fs_unlink("/dir/tmp") != FS_OK)  panic("fs: unlink tmp failed");
-    if (fs_open("/dir/tmp", 0) != FS_ENOENT) panic("fs: tmp survived unlink");
-
-    /* clean unmount + remount: data persists, no fsck */
-    if (fs_unmount() != FS_OK) panic("fs: unmount failed");
-    if (fs_mount(dev) != FS_OK) panic("fs: remount failed");
-    fd = fs_open("/dir/hello.txt", 0);
-    if (fd < 0) panic("fs: hello.txt gone after clean remount (%d)", fd);
-    kmemset(small, 0, sizeof small);
-    got = fs_read(fd, small, sizeof small);
-    fs_close(fd);
-    if (got != (int)mlen || kmemcmp(small, msg, mlen) != 0)
-        panic("fs: persistence check failed");
-    kprintf("[selftest] fs: clean remount persisted /dir/hello.txt\n");
-
-    /* forced-dirty fsck: set the dirty flag and scribble the data bitmap to
-       all-free on disk, then remount. fsck must rebuild it from the inodes
-       (the source of truth) and leave the data intact. */
-    block_read(dev, 0, spb, rbuf);
-    uint32_t db_blk = ((superblock_t *)rbuf)->data_bitmap_blk;
-    ((superblock_t *)rbuf)->dirty = 1;
-    block_write(dev, 0, spb, rbuf);              /* mark unclean */
-    kmemset(rbuf, 0, FS_BLOCK_SIZE);
-    block_write(dev, (uint64_t)db_blk * spb, spb, rbuf);   /* wipe first data-bitmap block */
-
-    if (fs_mount(dev) != FS_OK) panic("fs: dirty remount failed");
-    fd = fs_open("/dir/big.bin", 0);
-    if (fd < 0) panic("fs: big.bin gone after fsck (%d)", fd);
-    kmemset(rbuf, 0, BIG);
-    got = fs_read(fd, rbuf, BIG);
-    fs_close(fd);
-    /* Recompute big.bin's pattern: wbuf was reused by the 5 MiB test above. */
-    if (got != (int)BIG) panic("fs: big.bin short read after fsck (got %d)", got);
-    for (uint32_t i = 0; i < BIG; i++)
-        if (rbuf[i] != (uint8_t)(i * 31u + 7u))
-            panic("fs: big.bin corrupted by fsck @%u", i);
-
-    /* The double- and triple-indirect files must survive the bitmap rebuild too
-       (fsck walks all three indirect levels to re-mark their blocks). */
-    fd = fs_open("/dir/huge.bin", 0);
-    if (fd < 0) panic("fs: huge.bin gone after fsck (%d)", fd);
-    for (uint64_t pos = 0; pos < HUGE; pos += BIG) {
-        uint32_t chunk = (uint32_t)(HUGE - pos < BIG ? HUGE - pos : BIG);
-        kmemset(rbuf, 0, chunk);
-        if (fs_read(fd, rbuf, chunk) != (int)chunk) panic("fs: huge.bin short read post-fsck");
-        for (uint32_t i = 0; i < chunk; i++)
-            if (rbuf[i] != fs_pat(pos + i)) panic("fs: huge.bin corrupted by fsck @%lu",
-                                                  (unsigned long)(pos + i));
-    }
-    fs_close(fd);
-    fd = fs_open("/dir/sparse.bin", 0);
-    if (fd < 0) panic("fs: sparse.bin gone after fsck (%d)", fd);
-    if (fs_seek(fd, FAR) != FS_OK) panic("fs: post-fsck seek to 5 GiB failed");
-    kmemset(rbuf, 0, 32);
-    got = fs_read(fd, rbuf, klen);
-    fs_close(fd);
-    if (got != (int)klen || kmemcmp(rbuf, mark, klen) != 0)
-        panic("fs: sparse.bin corrupted by fsck (got %d)", got);
-
-    /* allocation still works (rebuilt bitmap has no phantom free blocks) */
-    fd = fs_open("/dir/after_fsck.txt", FS_O_CREATE);
-    if (fd < 0 || fs_write(fd, msg, mlen) != (int)mlen)
-        panic("fs: write after fsck failed");
-    fs_close(fd);
-    kprintf("[selftest] fs: fsck rebuilt the wiped bitmap, multi-level data intact\n");
-
-    fs_unmount();
-    kfree(wbuf);
-    kfree(rbuf);
 }
 
 static void selftest_paging(void) {
@@ -487,16 +225,18 @@ extern "C" void kmain(BootInfo *bi) {
 
     /* Real storage: virtio-blk over PCI. Only present when QEMU is
        launched with -device virtio-blk-pci. virtio_blk_init wires up its
-       INTx handler, but with IF=0 the self-test below still completes via
-       the polling fallback (no scheduler yet to block on). */
+       INTx handler. */
     block_device_t *vblk = virtio_blk_init();
-    if (vblk) selftest_block(vblk);
-    g_demo_vblk = vblk;
 
-    /* Filesystem end-to-end test on real storage when present (so writes are
-       visible in the host vdisk.img), else on the ramdisk. Runs here, before
-       irq_enable, so virtio uses its polling path like selftest_block. */
-    selftest_fs(vblk ? vblk : rd);
+    /* Mount the root volume (virtio-blk if present, else the ramdisk) and keep
+       it mounted for the lifetime of the system — userspace programs are loaded
+       from it (/bin/init). Runs before irq_enable, so virtio uses its polling
+       path. The volume is expected to be a populated VibeFS image (built by
+       build.sh via diskutil-cli); mkfs runs only if it is unformatted. */
+    block_device_t *root_dev = vblk ? vblk : rd;
+    int mr = fs_mount(root_dev);
+    if (mr != FS_OK) panic("fs: failed to mount root volume (%d)", mr);
+    kprintf("[fs] root volume '%s' mounted\n", root_dev->dev.name);
 
     /* Now take interrupts. From here virtio completions arrive via IRQ
        and the timer drives preemption + sleeper wakeups. */

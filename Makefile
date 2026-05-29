@@ -117,10 +117,7 @@ KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/
 
 KERNEL_C_OBJS = $(KERNEL_C_SRCS:kernel/src/%.c=kernel/build/%.o)
 KERNEL_S_OBJS = $(KERNEL_S_SRCS:kernel/src/%.S=kernel/build/%.o)
-# *_blob.o embed userspace program ELFs; built via objcopy (see below).
-USER_BLOB_OBJ  = kernel/build/user_blob.o
-HELLO_BLOB_OBJ = kernel/build/hello_blob.o
-KERNEL_OBJS    = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS) $(USER_BLOB_OBJ) $(HELLO_BLOB_OBJ)
+KERNEL_OBJS   = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS)
 
 KERNEL_ELF = kernel/build/kernel.elf
 
@@ -136,8 +133,8 @@ USER_LDFLAGS = -nostdlib -static -no-pie -T user/user.ld
 USER_INIT  = user/build/init.elf
 USER_HELLO = user/build/hello.elf
 
-.PHONY: all clean run image kernel
-all: $(EFI) $(KERNEL_ELF)
+.PHONY: all clean run image kernel user
+all: $(EFI) $(KERNEL_ELF) user
 
 # --- Bootloader rules ---
 
@@ -172,7 +169,12 @@ kernel: $(KERNEL_ELF)
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 	$(LD) $(KERNEL_LDFLAGS) $(KERNEL_OBJS) -o $@
 
-# --- Userspace init + blob embedding ---
+# --- Userspace programs ---
+# Built as standalone ELFs and installed onto the VibeFS data disk by the host
+# tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
+# so nothing is embedded in the kernel image.
+
+user: $(USER_INIT) $(USER_HELLO)
 
 user/build:
 	mkdir -p user/build
@@ -192,27 +194,9 @@ $(USER_INIT): user/build/crt0.o user/build/init.o user/user.ld
 $(USER_HELLO): user/build/crt0.o user/build/hello.o user/user.ld
 	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/hello.o -o $@
 
-# Wrap each user ELF as an object the kernel links in, exposing
-# <name>_elf_start / <name>_elf_end around its bytes.
-$(USER_BLOB_OBJ): $(USER_INIT) | kernel/build
-	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
-	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
-	  --redefine-sym _binary_user_build_init_elf_start=init_elf_start \
-	  --redefine-sym _binary_user_build_init_elf_end=init_elf_end \
-	  --redefine-sym _binary_user_build_init_elf_size=init_elf_size \
-	  $< $@
-
-$(HELLO_BLOB_OBJ): $(USER_HELLO) | kernel/build
-	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
-	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
-	  --redefine-sym _binary_user_build_hello_elf_start=hello_elf_start \
-	  --redefine-sym _binary_user_build_hello_elf_end=hello_elf_end \
-	  --redefine-sym _binary_user_build_hello_elf_size=hello_elf_size \
-	  $< $@
-
 # --- Disk image ---
 
-image: $(IMG)
+image: user $(IMG)
 
 $(IMG): $(EFI) $(KERNEL_ELF)
 	@mkdir -p $(ESP)/EFI/BOOT $(ESP)/vibeos
@@ -228,10 +212,11 @@ $(IMG): $(EFI) $(KERNEL_ELF)
 
 VDISK = boot/build/vdisk.img
 
-# Sparse 8 GiB virtio disk: large enough to host files past the old 4 MiB /
-# 128 MiB ceilings (and, structurally, multi-GiB files). Sparse, so it costs
-# almost nothing on the host until blocks are actually written.
-VDISK_BYTES = 8589934592      # 8 GiB
+# Sparse 2 GiB virtio disk for the VibeFS volume. Sparse, so it costs almost
+# nothing on the host until blocks are actually written. The fs self-test's
+# 5 GiB-offset file is sparse (a handful of low-numbered physical blocks), so
+# it still fits comfortably.
+VDISK_BYTES = 2147483648      # 2 GiB
 $(VDISK): | boot/build
 	truncate -s $(VDISK_BYTES) $@
 
@@ -244,4 +229,4 @@ run: $(IMG) $(VDISK)
 	  -net none -serial stdio
 
 clean:
-	rm -rf boot/build kernel/build
+	rm -rf boot/build kernel/build user/build

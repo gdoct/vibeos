@@ -5,7 +5,7 @@ namespace DiskUtil.Core.Filesystems.VibeFs.v1_0;
 
 public sealed class VibeFsVolume : IDisposable
 {
-    private const uint FsMagic = 0x4D594653;
+    private const uint FsMagic = 0x53464256;   // 'VBFS' little-endian (matches kernel FS_MAGIC)
     private const uint FsVersion = 2;
     private const uint FsBlockSize = 4096;
     private const int FsNameMax = 60;

@@ -15,12 +15,6 @@ static long sys_write(int fd, const void *buf, unsigned long n) {
     return ret;
 }
 
-__attribute__((noreturn))
-static void sys_exit(int code) {
-    __asm__ volatile("syscall" :: "a"(60L), "D"((long)code) : "rcx", "r11", "memory");
-    __builtin_unreachable();
-}
-
 static unsigned long slen(const char *s) { unsigned long n = 0; while (s[n]) n++; return n; }
 static void puts1(const char *s) { sys_write(1, s, slen(s)); }
 

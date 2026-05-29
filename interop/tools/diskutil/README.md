@@ -34,7 +34,7 @@ dotnet run --project src/DiskUtil.Web
 Run the web UI with a specific default image path:
 
 ```bash
-dotnet run --project src/DiskUtil.Web -- --image /home/guido/myos/vdisk.img
+dotnet run --project src/DiskUtil.Web -- --image /home/guido/vibeos/vdisk.img
 ```
 
 You can also set the default in config or environment:
@@ -57,9 +57,12 @@ dotnet build src/DiskTool.CLI
 CLI examples:
 
 ```bash
-./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/myos/vdisk.img --import ./local.txt /docs/local.txt
-./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/myos/vdisk.img --export /docs/local.txt ./local-out.txt
-./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/myos/vdisk.img --ls /docs
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --create-volume 128M /home/guido/vibeos/vdisk.img
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/vibeos/vdisk.img --format 4096
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/vibeos/vdisk.img --mkdir /docs
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/vibeos/vdisk.img --import ./local.txt /docs/local.txt
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/vibeos/vdisk.img --export /docs/local.txt ./local-out.txt
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/vibeos/vdisk.img --ls /docs
 ```
 
 ## Implemented structure

@@ -46,18 +46,14 @@ void syscall_init(void);
    knows where the image ends. */
 void user_heap_init(uint64_t start, uint64_t max);
 
-/* Load a static ET_EXEC x86_64 ELF held in memory into address space `vm`
-   (low half, user pages) and build the System V initial stack with a single
-   argv entry (`argv0`). `vm` must be the active address space (CR3) so the
-   loader can populate it through the user VAs. On success returns 0 and fills
-   the entry point and initial user rsp; negative on a bad/unsupported image. */
-int user_load(struct vmspace *vm, const void *image, uint64_t size,
-              const char *argv0, uint64_t *entry_out, uint64_t *rsp_out);
-
-/* Look up an embedded program image by path (Milestone B stopgap until the
-   filesystem holds /bin; ROADMAP §3 B.3 replaces this with an FS read).
-   Returns the image pointer and sets *size, or NULL if unknown. */
-const void *prog_lookup(const char *path, uint64_t *size);
+/* Read a static ET_EXEC x86_64 ELF from the mounted filesystem at `path` and
+   load it into address space `vm` (low half, user pages), building the System V
+   initial stack with argv[0] = path. `vm` must be the active address space
+   (CR3) so the loader can populate it through the user VAs. On success returns
+   0 and fills the entry point and initial user rsp; negative on FS error or a
+   bad/unsupported image. */
+int user_load_path(struct vmspace *vm, const char *path,
+                   uint64_t *entry_out, uint64_t *rsp_out);
 
 __attribute__((noreturn))
 void enter_user(uint64_t entry, uint64_t user_rsp);

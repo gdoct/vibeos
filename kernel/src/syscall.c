@@ -125,16 +125,12 @@ static void copy_user_str(char *dst, const char *src, unsigned n) {
     dst[i] = '\0';
 }
 
-/* Replace the current process image with the program named by `upath`
-   (resolved against the embedded program table for now). Builds a fresh
-   address space, and on success never returns — it enters the new image. */
+/* Replace the current process image with the program at `upath`, read from the
+   mounted filesystem. Builds a fresh address space; on success never returns —
+   it enters the new image. On failure the old image is kept intact. */
 static int64_t sys_execve(const char *upath) {
     char path[64];
     copy_user_str(path, upath, sizeof path);    /* old address space still active */
-
-    uint64_t size;
-    const void *img = prog_lookup(path, &size);
-    if (!img) return -2;                        /* -ENOENT */
 
     task_t *t = task_current();
     vmspace_t *oldvm = t->vm;
@@ -143,11 +139,11 @@ static int64_t sys_execve(const char *upath) {
 
     task_set_vmspace(newvm);                    /* CR3 = newvm for the load */
     uint64_t entry, rsp;
-    int r = user_load(newvm, img, size, path, &entry, &rsp);
-    if (r < 0) {                                /* bad image: keep old one */
+    int r = user_load_path(newvm, path, &entry, &rsp);
+    if (r < 0) {                                /* not found / bad image: keep old */
         task_set_vmspace(oldvm);
         vmspace_destroy(newvm);
-        return -8;                              /* -ENOEXEC */
+        return r;
     }
     vmspace_destroy(oldvm);                     /* committed; old AS now idle */
     kprintf("[syscall] exec '%s' -> entry=%lx\n", path, (unsigned long)entry);

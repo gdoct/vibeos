@@ -1,6 +1,8 @@
 #include "kernel.h"
 #include "pmm.h"
 #include "paging.h"
+#include "kmalloc.h"
+#include "fs.h"
 #include "usermode.h"
 #include "elf.h"
 
@@ -41,8 +43,8 @@ static void map_user(vmspace_t *vm, uint64_t va, uint64_t len) {
     }
 }
 
-int user_load(vmspace_t *vm, const void *image, uint64_t size,
-              const char *argv0, uint64_t *entry_out, uint64_t *rsp_out) {
+static int user_load(vmspace_t *vm, const void *image, uint64_t size,
+                     const char *argv0, uint64_t *entry_out, uint64_t *rsp_out) {
     if (size < sizeof(Elf64_Ehdr)) return -1;
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
     if (eh->e_ident[0] != ELFMAG0 || eh->e_ident[1] != ELFMAG1 ||
@@ -100,4 +102,31 @@ int user_load(vmspace_t *vm, const void *image, uint64_t size,
     *entry_out = eh->e_entry;
     *rsp_out   = sp;
     return 0;
+}
+
+/* Programs are loaded from the filesystem. They are tiny ELF binaries; this
+   cap is generous headroom (a real loader would mmap the file). */
+#define USER_MAX_IMAGE (256u * 1024)
+
+int user_load_path(vmspace_t *vm, const char *path,
+                   uint64_t *entry_out, uint64_t *rsp_out) {
+    int fd = fs_open(path, 0);
+    if (fd < 0) return fd;                       /* FS errno (e.g. -ENOENT) */
+
+    uint8_t *image = (uint8_t *)kmalloc(USER_MAX_IMAGE);
+    if (!image) { fs_close(fd); return -12; }    /* -ENOMEM */
+
+    uint32_t total = 0;
+    for (;;) {
+        int n = fs_read(fd, image + total, USER_MAX_IMAGE - total);
+        if (n < 0) { kfree(image); fs_close(fd); return n; }
+        if (n == 0) break;                       /* EOF */
+        total += (uint32_t)n;
+        if (total >= USER_MAX_IMAGE) { kfree(image); fs_close(fd); return -7; } /* -E2BIG */
+    }
+    fs_close(fd);
+
+    int r = user_load(vm, image, total, path, entry_out, rsp_out);
+    kfree(image);
+    return r;
 }
