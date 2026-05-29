@@ -2,6 +2,7 @@
 #include "pmm.h"
 #include "irq.h"
 #include "paging.h"
+#include "kmalloc.h"
 
 /*
  * 4-level (PML4) paging — higher-half kernel (ROADMAP §3, Phase 0).
@@ -68,9 +69,13 @@ static uint64_t *descend(uint64_t *tbl, uint64_t idx, int create, uint64_t extra
     return table(tbl[idx] & PTE_ADDR);
 }
 
-void vmap(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
+/* Map/unmap/query against an explicit PML4 (physical). The public vmap/
+   vunmap/paging_query operate on the kernel master tables; the vmspace_*
+   helpers below reuse these against a process's own PML4. */
+static void map_at(uint64_t pml4_phys, uint64_t va, uint64_t pa,
+                   size_t pages, uint64_t flags) {
     uint64_t inter = flags & PTE_U;   /* user pages need U on every level */
-    uint64_t *pml4 = table(g_pml4_phys);
+    uint64_t *pml4 = table(pml4_phys);
     for (size_t i = 0; i < pages; i++, va += PAGE_SIZE, pa += PAGE_SIZE) {
         uint64_t *pdpt = descend(pml4, PML4_IDX(va), 1, inter);
         uint64_t *pd   = descend(pdpt, PDPT_IDX(va), 1, inter);
@@ -80,8 +85,8 @@ void vmap(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
     }
 }
 
-void vunmap(uint64_t va, size_t pages) {
-    uint64_t *pml4 = table(g_pml4_phys);
+static void unmap_at(uint64_t pml4_phys, uint64_t va, size_t pages) {
+    uint64_t *pml4 = table(pml4_phys);
     for (size_t i = 0; i < pages; i++, va += PAGE_SIZE) {
         uint64_t *pdpt = descend(pml4, PML4_IDX(va), 0, 0);
         if (!pdpt) continue;
@@ -94,8 +99,8 @@ void vunmap(uint64_t va, size_t pages) {
     }
 }
 
-int paging_query(uint64_t va, uint64_t *pa_out) {
-    uint64_t *pml4 = table(g_pml4_phys);
+static int query_at(uint64_t pml4_phys, uint64_t va, uint64_t *pa_out) {
+    uint64_t *pml4 = table(pml4_phys);
     if (!(pml4[PML4_IDX(va)] & PTE_P)) return 0;
     uint64_t *pdpt = table(pml4[PML4_IDX(va)] & PTE_ADDR);
     if (!(pdpt[PDPT_IDX(va)] & PTE_P)) return 0;
@@ -115,6 +120,14 @@ int paging_query(uint64_t va, uint64_t *pa_out) {
     if (!(pt[PT_IDX(va)] & PTE_P)) return 0;
     if (pa_out) *pa_out = (pt[PT_IDX(va)] & PTE_ADDR) + (va & PAGE_MASK);
     return 1;
+}
+
+void vmap(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
+    map_at(g_pml4_phys, va, pa, pages, flags);
+}
+void vunmap(uint64_t va, size_t pages) { unmap_at(g_pml4_phys, va, pages); }
+int  paging_query(uint64_t va, uint64_t *pa_out) {
+    return query_at(g_pml4_phys, va, pa_out);
 }
 
 void paging_init(const BootInfo *bi) {
@@ -154,6 +167,14 @@ void paging_init(const BootInfo *bi) {
 
     pml4[PML4_IDX(PHYS_OFFSET)]  = pdpt_dm | PTE_P | PTE_W;
     pml4[PML4_IDX(KERNEL_VBASE)] = pdpt_kv | PTE_P | PTE_W;
+
+    /* Pre-create the kernel-stack region's top-level PDPT so every per-process
+       address space can share it by copying this one PML4 entry. Kernel stacks
+       allocated later (kstack_alloc) populate the shared subtree and stay
+       visible in all address spaces — essential, since a process traps into
+       the kernel onto its own kernel stack while its CR3 is active. */
+    pml4[PML4_IDX(KSTACK_REGION)] = alloc_table() | PTE_P | PTE_W;
+
     /* PML4[0] and the rest of the low half are intentionally left unmapped
        — that is the address space userspace will own. */
 
@@ -193,4 +214,91 @@ uint64_t kstack_alloc(size_t pages, uint64_t *base_out) {
 
     if (base_out) *base_out = base;
     return top;
+}
+
+/* ==== Per-process address spaces (ROADMAP §3 Milestone B) ================= */
+
+uint64_t paging_kernel_pml4(void) { return g_pml4_phys; }
+
+/* A fresh address space: a new PML4 whose upper (kernel) half is shared with
+   the master tables by copying the top-level entries, and whose lower half is
+   empty for this process's own user mappings. */
+vmspace_t *vmspace_create(void) {
+    vmspace_t *vm = (vmspace_t *)kmalloc(sizeof(vmspace_t));
+    if (!vm) return nullptr;
+    uint64_t p = alloc_table();                 /* zeroed PML4 */
+    uint64_t *npml4 = table(p);
+    uint64_t *kpml4 = table(g_pml4_phys);
+    for (int i = 256; i < ENTRIES; i++) npml4[i] = kpml4[i];   /* share kernel half */
+    vm->pml4_phys = p;
+    return vm;
+}
+
+void vmspace_switch(vmspace_t *vm) {
+    uint64_t cr3 = vm ? vm->pml4_phys : g_pml4_phys;
+    __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+}
+
+void vmspace_map(vmspace_t *vm, uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
+    map_at(vm->pml4_phys, va, pa, pages, flags);
+}
+
+int vmspace_query(vmspace_t *vm, uint64_t va, uint64_t *pa_out) {
+    return query_at(vm->pml4_phys, va, pa_out);
+}
+
+/* Eager fork: deep-copy the parent's user half (4 KiB leaves only — user
+   mappings are never large pages) into a brand-new address space. */
+vmspace_t *vmspace_fork(vmspace_t *parent) {
+    vmspace_t *child = vmspace_create();
+    if (!child) return nullptr;
+    uint64_t *ppml4 = table(parent->pml4_phys);
+    for (uint64_t i = 0; i < 256; i++) {
+        if (!(ppml4[i] & PTE_P)) continue;
+        uint64_t *ppdpt = table(ppml4[i] & PTE_ADDR);
+        for (uint64_t j = 0; j < ENTRIES; j++) {
+            if (!(ppdpt[j] & PTE_P) || (ppdpt[j] & PTE_PS)) continue;
+            uint64_t *ppd = table(ppdpt[j] & PTE_ADDR);
+            for (uint64_t k = 0; k < ENTRIES; k++) {
+                if (!(ppd[k] & PTE_P) || (ppd[k] & PTE_PS)) continue;
+                uint64_t *ppt = table(ppd[k] & PTE_ADDR);
+                for (uint64_t l = 0; l < ENTRIES; l++) {
+                    uint64_t pte = ppt[l];
+                    if (!(pte & PTE_P)) continue;
+                    uint64_t va  = (i << 39) | (j << 30) | (k << 21) | (l << 12);
+                    uint64_t dst = pmm_alloc_page();
+                    if (!dst) panic("vmspace_fork: out of memory");
+                    kmemcpy(phys_to_virt(dst), phys_to_virt(pte & PTE_ADDR), PAGE_SIZE);
+                    map_at(child->pml4_phys, va, dst, 1, (pte & (PTE_W | PTE_U)) | PTE_P);
+                }
+            }
+        }
+    }
+    return child;
+}
+
+/* Free the user half (data pages + low-half page tables) and the PML4 itself.
+   The kernel upper half is shared, so it is left untouched. The caller must
+   not be running on this address space. */
+void vmspace_destroy(vmspace_t *vm) {
+    uint64_t *pml4 = table(vm->pml4_phys);
+    for (uint64_t i = 0; i < 256; i++) {
+        if (!(pml4[i] & PTE_P)) continue;
+        uint64_t pdpt_pa = pml4[i] & PTE_ADDR; uint64_t *pdpt = table(pdpt_pa);
+        for (uint64_t j = 0; j < ENTRIES; j++) {
+            if (!(pdpt[j] & PTE_P) || (pdpt[j] & PTE_PS)) continue;
+            uint64_t pd_pa = pdpt[j] & PTE_ADDR; uint64_t *pd = table(pd_pa);
+            for (uint64_t k = 0; k < ENTRIES; k++) {
+                if (!(pd[k] & PTE_P) || (pd[k] & PTE_PS)) continue;
+                uint64_t pt_pa = pd[k] & PTE_ADDR; uint64_t *pt = table(pt_pa);
+                for (uint64_t l = 0; l < ENTRIES; l++)
+                    if (pt[l] & PTE_P) pmm_free_page(pt[l] & PTE_ADDR);
+                pmm_free_page(pt_pa);
+            }
+            pmm_free_page(pd_pa);
+        }
+        pmm_free_page(pdpt_pa);
+    }
+    pmm_free_page(vm->pml4_phys);
+    kfree(vm);
 }

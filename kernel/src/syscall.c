@@ -24,15 +24,7 @@ extern "C" uint64_t g_kernel_rsp = 0;
 extern "C" uint64_t g_user_rsp   = 0;
 
 extern "C" void syscall_entry(void);
-
-/* Matches the push order in syscall.S (lowest address first). */
-typedef struct {
-    uint64_t rax;                          /* syscall number */
-    uint64_t rdi, rsi, rdx, r10, r8, r9;   /* args 1..6 */
-    uint64_t rcx;                          /* user return rip  */
-    uint64_t r11;                          /* user rflags      */
-    uint64_t user_rsp;
-} syscall_frame_t;
+/* syscall_frame_t lives in usermode.h now (fork clones it too). */
 
 /* ---- MSRs ---- */
 
@@ -69,29 +61,39 @@ void syscall_init(void) {
             (void *)(uintptr_t)syscall_entry);
 }
 
-/* ---- minimal brk heap (one process, Milestone A) ---- */
-
-static uint64_t g_brk_start = 0;
-static uint64_t g_brk_cur   = 0;
-static uint64_t g_brk_max   = 0;
+/* ---- per-process brk heap ---- */
 
 void user_heap_init(uint64_t start, uint64_t max) {
-    g_brk_start = g_brk_cur = start;
-    g_brk_max   = max;
+    task_t *t = task_current();
+    t->brk_start = t->brk_cur = start;
+    t->brk_max   = max;
 }
 
 static uint64_t sys_brk(uint64_t newbrk) {
-    if (newbrk == 0 || newbrk < g_brk_start || newbrk > g_brk_max)
-        return g_brk_cur;                       /* query / out of range */
-    uint64_t old_pg = PAGE_ALIGN_UP(g_brk_cur);
+    task_t *t = task_current();
+    if (newbrk == 0 || newbrk < t->brk_start || newbrk > t->brk_max)
+        return t->brk_cur;                      /* query / out of range */
+    uint64_t old_pg = PAGE_ALIGN_UP(t->brk_cur);
     uint64_t new_pg = PAGE_ALIGN_UP(newbrk);
     for (uint64_t va = old_pg; va < new_pg; va += PAGE_SIZE) {
         uint64_t pa = pmm_alloc_page();
-        if (!pa) return g_brk_cur;              /* leave break unchanged */
-        vmap(va, pa, 1, PTE_P | PTE_W | PTE_U);
+        if (!pa) return t->brk_cur;             /* leave break unchanged */
+        vmspace_map(t->vm, va, pa, 1, PTE_P | PTE_W | PTE_U);
     }
-    g_brk_cur = newbrk;
-    return g_brk_cur;
+    t->brk_cur = newbrk;
+    return t->brk_cur;
+}
+
+/* ---- fork ---- */
+
+static int64_t sys_fork(syscall_frame_t *f) {
+    task_t *parent = task_current();
+    if (!parent->vm) return -38;                /* kernel thread can't fork */
+    vmspace_t *cvm = vmspace_fork(parent->vm);
+    if (!cvm) return -12;                        /* -ENOMEM */
+    task_t *child = task_fork("user", cvm, f);
+    if (!child) { vmspace_destroy(cvm); return -11; }  /* -EAGAIN */
+    return child->id;                            /* parent gets child's pid */
 }
 
 /* ---- syscalls ---- */
@@ -111,10 +113,54 @@ static int64_t sys_read(int fd, void *buf, uint64_t n) {
 
 __attribute__((noreturn))
 static void sys_exit(int code) {
-    task_t *t = task_current();
-    kprintf("[syscall] task %d \"%s\" exit(%d)\n", t->id, t->name, code);
-    task_exit();                                /* does not return */
+    task_exit_user(code);                       /* zombie + wake parent; no return */
     __builtin_unreachable();
+}
+
+/* Copy a NUL-terminated user string into a kernel buffer (must run while the
+   caller's address space is still active). No fault handling yet. */
+static void copy_user_str(char *dst, const char *src, unsigned n) {
+    unsigned i = 0;
+    for (; i + 1 < n && src[i]; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+/* Replace the current process image with the program named by `upath`
+   (resolved against the embedded program table for now). Builds a fresh
+   address space, and on success never returns — it enters the new image. */
+static int64_t sys_execve(const char *upath) {
+    char path[64];
+    copy_user_str(path, upath, sizeof path);    /* old address space still active */
+
+    uint64_t size;
+    const void *img = prog_lookup(path, &size);
+    if (!img) return -2;                        /* -ENOENT */
+
+    task_t *t = task_current();
+    vmspace_t *oldvm = t->vm;
+    vmspace_t *newvm = vmspace_create();
+    if (!newvm) return -12;                     /* -ENOMEM */
+
+    task_set_vmspace(newvm);                    /* CR3 = newvm for the load */
+    uint64_t entry, rsp;
+    int r = user_load(newvm, img, size, path, &entry, &rsp);
+    if (r < 0) {                                /* bad image: keep old one */
+        task_set_vmspace(oldvm);
+        vmspace_destroy(newvm);
+        return -8;                              /* -ENOEXEC */
+    }
+    vmspace_destroy(oldvm);                     /* committed; old AS now idle */
+    kprintf("[syscall] exec '%s' -> entry=%lx\n", path, (unsigned long)entry);
+    enter_user(entry, rsp);                     /* does not return */
+}
+
+static int64_t sys_wait4(int pid, int *ustatus, int options, void *rusage) {
+    (void)pid; (void)options; (void)rusage;     /* wait for any child for now */
+    int code = 0;
+    int got = task_wait(&code);
+    if (got < 0) return got;                    /* -ECHILD */
+    if (ustatus) *ustatus = (code & 0xff) << 8; /* WEXITSTATUS-compatible */
+    return got;
 }
 
 extern "C" uint64_t syscall_dispatch(syscall_frame_t *f) {
@@ -123,6 +169,10 @@ extern "C" uint64_t syscall_dispatch(syscall_frame_t *f) {
     case 1:   return (uint64_t)sys_write((int)f->rdi, (const void *)f->rsi, f->rdx);
     case 12:  return sys_brk(f->rdi);
     case 39:  return (uint64_t)task_current()->id;             /* getpid */
+    case 57:  return (uint64_t)sys_fork(f);                    /* fork */
+    case 59:  return (uint64_t)sys_execve((const char *)f->rdi);  /* execve */
+    case 61:  return (uint64_t)sys_wait4((int)f->rdi, (int *)f->rsi,
+                                         (int)f->rdx, (void *)f->r10);  /* wait4 */
     case 60:                                                   /* exit */
     case 231: sys_exit((int)f->rdi);                           /* exit_group */
     default:

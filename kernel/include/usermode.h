@@ -7,6 +7,23 @@
 extern "C" {
 #endif
 
+struct vmspace;   /* kernel/include/paging.h */
+
+/* The user register state captured by syscall_entry (usermode.S), laid out to
+   match its push order. Defined here so both the syscall dispatcher and fork
+   (which clones it onto the child's kernel stack) can see it. */
+typedef struct syscall_frame {
+    uint64_t rax;                          /* syscall number / return value */
+    uint64_t rdi, rsi, rdx, r10, r8, r9;   /* args 1..6 */
+    uint64_t rcx;                          /* user return rip */
+    uint64_t r11;                          /* user rflags */
+    uint64_t user_rsp;
+} syscall_frame_t;
+
+/* Tail that a freshly-forked child's kernel stack returns into: pops a
+   syscall_frame_t and sysrets to ring 3 with the child's rax = 0 (usermode.S). */
+void fork_child_return(void);
+
 /*
  * Ring-3 support (ROADMAP §3, Phase 1).
  *
@@ -29,11 +46,18 @@ void syscall_init(void);
    knows where the image ends. */
 void user_heap_init(uint64_t start, uint64_t max);
 
-/* Load a static ET_EXEC x86_64 ELF held in memory into the current address
-   space (low half, user pages) and build the System V initial stack. On
-   success returns 0 and fills the entry point and the initial user rsp.
-   Negative on a malformed/unsupported image. */
-int user_load(const void *image, uint64_t size, uint64_t *entry_out, uint64_t *rsp_out);
+/* Load a static ET_EXEC x86_64 ELF held in memory into address space `vm`
+   (low half, user pages) and build the System V initial stack with a single
+   argv entry (`argv0`). `vm` must be the active address space (CR3) so the
+   loader can populate it through the user VAs. On success returns 0 and fills
+   the entry point and initial user rsp; negative on a bad/unsupported image. */
+int user_load(struct vmspace *vm, const void *image, uint64_t size,
+              const char *argv0, uint64_t *entry_out, uint64_t *rsp_out);
+
+/* Look up an embedded program image by path (Milestone B stopgap until the
+   filesystem holds /bin; ROADMAP §3 B.3 replaces this with an FS read).
+   Returns the image pointer and sets *size, or NULL if unknown. */
+const void *prog_lookup(const char *path, uint64_t *size);
 
 __attribute__((noreturn))
 void enter_user(uint64_t entry, uint64_t user_rsp);

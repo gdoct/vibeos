@@ -15,8 +15,22 @@ typedef enum {
     TASK_READY   = 1,
     TASK_RUNNING = 2,
     TASK_BLOCKED = 3,   /* off the run queue until something wakes it */
-    TASK_DEAD    = 4,
+    TASK_DEAD    = 4,   /* finished and reaped — slot reusable */
+    TASK_ZOMBIE  = 5,   /* exited, awaiting parent wait4() to collect status */
 } task_state_t;
+
+struct vmspace;          /* kernel/include/paging.h */
+struct syscall_frame;    /* kernel/include/usermode.h */
+
+/*
+ * A wait queue is just a FIFO of blocked tasks. wait_queue_sleep blocks
+ * the caller on it; wake_one / wake_all move queued tasks back to READY.
+ * Defined before task_t so a task can embed one (its child-exit queue).
+ */
+typedef struct wait_queue {
+    struct task *head;
+    struct task *tail;
+} wait_queue_t;
 
 typedef struct task {
     /* saved_rsp MUST be at offset 0 — context_switch.S touches it via
@@ -34,16 +48,16 @@ typedef struct task {
        timer sleeper list. Only meaningful when state == TASK_BLOCKED. */
     struct task  *wq_next;
     uint64_t      wake_tick;    /* absolute tick deadline for ksleep_ms */
-} task_t;
 
-/*
- * A wait queue is just a FIFO of blocked tasks. wait_queue_sleep blocks
- * the caller on it; wake_one / wake_all move queued tasks back to READY.
- */
-typedef struct wait_queue {
-    task_t *head;
-    task_t *tail;
-} wait_queue_t;
+    /* User-process fields (NULL/0 for kernel threads). The scheduler loads
+       `vm`'s CR3 on switch; brk_* track the heap; parent/exit_code/child_wq
+       feed wait4 (a parent sleeps on child_wq until a child becomes ZOMBIE). */
+    struct vmspace *vm;
+    uint64_t      brk_start, brk_cur, brk_max;
+    struct task  *parent;
+    int           exit_code;
+    wait_queue_t  child_wq;
+} task_t;
 
 /* Convert the currently-running kmain context into task slot 0. Must
    be called before any task_create / task_yield. */
@@ -53,8 +67,27 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg);
 task_t *task_current(void);
 void    task_yield(void);
 
+/* Create a child of the current task for fork(): a new task in address space
+   `vm` whose kernel stack is crafted to return to ring 3 (rax = 0) with the
+   parent's saved user state in `frame`. Inherits the parent's brk window. */
+task_t *task_fork(const char *name, struct vmspace *vm,
+                  const struct syscall_frame *frame);
+
+/* Attach a user address space to the current task and switch CR3 to it. */
+void    task_set_vmspace(struct vmspace *vm);
+
 __attribute__((noreturn))
 void    task_exit(void);
+
+/* User-process exit: records the code and, if a parent exists, becomes a
+   ZOMBIE and wakes the parent's wait; otherwise reaps immediately. */
+__attribute__((noreturn))
+void    task_exit_user(int code);
+
+/* Reap one ZOMBIE child of the current task, freeing its address space and
+   slot and returning its pid (with *status set to the exit code). Blocks if
+   children exist but none has exited yet; returns -ECHILD if there are none. */
+int     task_wait(int *status);
 
 /* Called from the timer IRQ. No-op until sched_init has run. */
 void    sched_tick(void);

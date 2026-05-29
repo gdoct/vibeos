@@ -117,9 +117,10 @@ KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/
 
 KERNEL_C_OBJS = $(KERNEL_C_SRCS:kernel/src/%.c=kernel/build/%.o)
 KERNEL_S_OBJS = $(KERNEL_S_SRCS:kernel/src/%.S=kernel/build/%.o)
-# user_blob.o embeds the userspace init ELF; built via objcopy (see below).
-USER_BLOB_OBJ = kernel/build/user_blob.o
-KERNEL_OBJS   = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS) $(USER_BLOB_OBJ)
+# *_blob.o embed userspace program ELFs; built via objcopy (see below).
+USER_BLOB_OBJ  = kernel/build/user_blob.o
+HELLO_BLOB_OBJ = kernel/build/hello_blob.o
+KERNEL_OBJS    = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS) $(USER_BLOB_OBJ) $(HELLO_BLOB_OBJ)
 
 KERNEL_ELF = kernel/build/kernel.elf
 
@@ -132,7 +133,8 @@ USER_CFLAGS = \
   -O2 -Wall -Wextra -Wno-unused-parameter -std=c++17
 USER_LDFLAGS = -nostdlib -static -no-pie -T user/user.ld
 
-USER_INIT = user/build/init.elf
+USER_INIT  = user/build/init.elf
+USER_HELLO = user/build/hello.elf
 
 .PHONY: all clean run image kernel
 all: $(EFI) $(KERNEL_ELF)
@@ -181,17 +183,31 @@ user/build/crt0.o: user/crt0.S | user/build
 user/build/init.o: user/init.c | user/build
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+user/build/hello.o: user/hello.c | user/build
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
 $(USER_INIT): user/build/crt0.o user/build/init.o user/user.ld
 	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/init.o -o $@
 
-# Wrap the init ELF as an object the kernel links in, exposing
-# init_elf_start / init_elf_end around its bytes.
+$(USER_HELLO): user/build/crt0.o user/build/hello.o user/user.ld
+	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/hello.o -o $@
+
+# Wrap each user ELF as an object the kernel links in, exposing
+# <name>_elf_start / <name>_elf_end around its bytes.
 $(USER_BLOB_OBJ): $(USER_INIT) | kernel/build
 	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
 	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
 	  --redefine-sym _binary_user_build_init_elf_start=init_elf_start \
 	  --redefine-sym _binary_user_build_init_elf_end=init_elf_end \
 	  --redefine-sym _binary_user_build_init_elf_size=init_elf_size \
+	  $< $@
+
+$(HELLO_BLOB_OBJ): $(USER_HELLO) | kernel/build
+	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  --redefine-sym _binary_user_build_hello_elf_start=hello_elf_start \
+	  --redefine-sym _binary_user_build_hello_elf_end=hello_elf_end \
+	  --redefine-sym _binary_user_build_hello_elf_size=hello_elf_size \
 	  $< $@
 
 # --- Disk image ---

@@ -59,15 +59,44 @@ static void io_worker(void *arg) {
    filesystem via the host populate tool. */
 extern "C" const uint8_t init_elf_start[];
 extern "C" const uint8_t init_elf_end[];
+extern "C" const uint8_t hello_elf_start[];
+extern "C" const uint8_t hello_elf_end[];
+
+/* Embedded program table — the stand-in for /bin until the FS holds it
+   (ROADMAP §3 B.3). execve resolves names through prog_lookup. */
+struct embedded_prog { const char *path; const uint8_t *start; const uint8_t *end; };
+static const embedded_prog g_progs[] = {
+    { "/bin/init",  init_elf_start,  init_elf_end  },
+    { "/bin/hello", hello_elf_start, hello_elf_end },
+};
+
+static int streq(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+const void *prog_lookup(const char *path, uint64_t *size) {
+    for (unsigned i = 0; i < sizeof(g_progs) / sizeof(g_progs[0]); i++)
+        if (streq(path, g_progs[i].path)) {
+            *size = (uint64_t)(g_progs[i].end - g_progs[i].start);
+            return g_progs[i].start;
+        }
+    return nullptr;
+}
 
 /* Load /init into the (now free) low half and drop to ring 3. Runs as a task,
    so it owns a kernel stack for syscalls/IRQs; on exit() the task dies and the
    scheduler moves on. */
 static void init_launch(void *arg) {
     (void)arg;
+    /* init gets its own address space (low half private, kernel half shared). */
+    vmspace_t *vm = vmspace_create();
+    if (!vm) panic("init: vmspace_create failed");
+    task_set_vmspace(vm);             /* attach + make active for the load below */
+
     uint64_t size = (uint64_t)(init_elf_end - init_elf_start);
     uint64_t entry, rsp;
-    int r = user_load(init_elf_start, size, &entry, &rsp);
+    int r = user_load(vm, init_elf_start, size, "/bin/init", &entry, &rsp);
     if (r != 0) panic("init: user_load failed (%d)", r);
     kprintf("[init] loaded init (%lu bytes), entry=%lx rsp=%lx -> ring 3\n",
             (unsigned long)size, (unsigned long)entry, (unsigned long)rsp);

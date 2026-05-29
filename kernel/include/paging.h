@@ -52,6 +52,22 @@ int  paging_query(uint64_t va, uint64_t *pa_out);
    Panics if `va` is unmapped. */
 uint64_t kva_to_phys(const volatile void *va);
 
+/* ---- Per-process address spaces (ROADMAP §3 Milestone B). ----
+ * A vmspace owns a PML4 whose upper (kernel) half is shared with the master
+ * tables; the lower half holds the process's private user mappings. */
+typedef struct vmspace {
+    uint64_t pml4_phys;
+} vmspace_t;
+
+uint64_t   paging_kernel_pml4(void);                 /* master PML4 (phys) */
+vmspace_t *vmspace_create(void);                     /* kernel half shared */
+void       vmspace_switch(vmspace_t *vm);            /* load CR3 (NULL = master) */
+void       vmspace_map(vmspace_t *vm, uint64_t va, uint64_t pa,
+                       size_t pages, uint64_t flags);
+int        vmspace_query(vmspace_t *vm, uint64_t va, uint64_t *pa_out);
+vmspace_t *vmspace_fork(vmspace_t *parent);          /* eager deep copy */
+void       vmspace_destroy(vmspace_t *vm);           /* not while active */
+
 /* Allocate a kernel stack of `pages` 4 KiB pages in the KSTACK_REGION
    window, with an unmapped guard page just below it. Returns the stack
    TOP virtual address; *base_out gets the lowest stack address. */

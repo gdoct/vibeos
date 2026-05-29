@@ -48,6 +48,27 @@ syscall_entry:
     sysretq                         /* CS/SS from STAR (RPL 3), rax = result */
     .size   syscall_entry, . - syscall_entry
 
+    /* fork_child_return: a forked child's kernel stack is crafted (task_fork)
+       so context_switch `ret`s here with rsp pointing at a syscall_frame_t.
+       Same tail as syscall_entry, but rax comes from the frame (= 0) so the
+       child sees fork() return 0. */
+    .globl  fork_child_return
+    .type   fork_child_return, @function
+fork_child_return:
+    movq    0(%rsp), %rax           /* frame.rax (= 0 for the child) */
+    addq    $8, %rsp
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %r10
+    popq    %r8
+    popq    %r9
+    popq    %rcx                    /* user rip */
+    popq    %r11                    /* user rflags */
+    popq    %rsp                    /* user rsp */
+    sysretq
+    .size   fork_child_return, . - fork_child_return
+
     /* void enter_user(uint64_t entry /rdi/, uint64_t user_rsp /rsi/); noreturn.
        Drops to ring 3 via a hand-built iretq frame. */
     .globl  enter_user

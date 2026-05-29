@@ -27,21 +27,22 @@
 #define USER_STACK_PAGES  8                       /* 32 KiB */
 #define USER_HEAP_MAX     (16ULL * 1024 * 1024)   /* brk window */
 
-/* Map [va, va+len) as user pages in the current address space, allocating any
-   pages not already present (segments may share a page). */
-static void map_user(uint64_t va, uint64_t len) {
+/* Map [va, va+len) as user pages in `vm`, allocating any pages not already
+   present (segments may share a page). */
+static void map_user(vmspace_t *vm, uint64_t va, uint64_t len) {
     uint64_t a = PAGE_ALIGN_DOWN(va);
     uint64_t e = PAGE_ALIGN_UP(va + len);
     for (; a < e; a += PAGE_SIZE) {
         uint64_t dummy;
-        if (paging_query(a, &dummy)) continue;    /* already mapped */
+        if (vmspace_query(vm, a, &dummy)) continue;   /* already mapped */
         uint64_t pa = pmm_alloc_page();
         if (!pa) panic("user_load: out of memory mapping %lx", (unsigned long)a);
-        vmap(a, pa, 1, PTE_P | PTE_W | PTE_U);
+        vmspace_map(vm, a, pa, 1, PTE_P | PTE_W | PTE_U);
     }
 }
 
-int user_load(const void *image, uint64_t size, uint64_t *entry_out, uint64_t *rsp_out) {
+int user_load(vmspace_t *vm, const void *image, uint64_t size,
+              const char *argv0, uint64_t *entry_out, uint64_t *rsp_out) {
     if (size < sizeof(Elf64_Ehdr)) return -1;
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
     if (eh->e_ident[0] != ELFMAG0 || eh->e_ident[1] != ELFMAG1 ||
@@ -61,7 +62,7 @@ int user_load(const void *image, uint64_t size, uint64_t *entry_out, uint64_t *r
         if (ph[i].p_offset + ph[i].p_filesz > size) return -7;
         if (ph[i].p_vaddr >= PHYS_OFFSET) return -8;   /* must be low/user half */
 
-        map_user(ph[i].p_vaddr, ph[i].p_memsz);
+        map_user(vm, ph[i].p_vaddr, ph[i].p_memsz);
         /* Pages come zeroed from the PMM, so the .bss tail (memsz > filesz)
            is already clear; just copy the file-backed bytes. */
         kmemcpy((void *)(uintptr_t)ph[i].p_vaddr,
@@ -73,12 +74,13 @@ int user_load(const void *image, uint64_t size, uint64_t *entry_out, uint64_t *r
 
     /* Stack. */
     uint64_t stk_lo = USER_STACK_TOP - (uint64_t)USER_STACK_PAGES * PAGE_SIZE;
-    map_user(stk_lo, USER_STACK_TOP - stk_lo);
+    map_user(vm, stk_lo, USER_STACK_TOP - stk_lo);
 
-    /* "init\0" string at the very top, then the aligned argc/argv/envp/auxv
-       vector. Six 8-byte slots keep rsp 16-byte aligned at entry. */
-    uint64_t sp = USER_STACK_TOP - 16;
-    kmemcpy((void *)(uintptr_t)sp, "init", 5);
+    /* argv0 string at the very top (16-aligned slot), then the aligned
+       argc/argv/envp/auxv vector. Six 8-byte slots keep rsp 16-byte aligned. */
+    uint64_t al = (uint64_t)kstrlen(argv0) + 1;
+    uint64_t sp = USER_STACK_TOP - ((al + 15) & ~15ULL);
+    kmemcpy((void *)(uintptr_t)sp, argv0, al);
     uint64_t arg0 = sp;
 
     sp -= 6 * 8;

@@ -463,9 +463,29 @@ highest-leverage insurance against a viral SMP refactor.
   without taking down the kernel; a timer tick preempts a spinning user
   loop (proves TSS `rsp0` + the `iretq` resume path).
 
-#### Milestone B — real processes & isolation 🔜 next
+#### Milestone B — real processes & isolation
 
-**Phase 4 — per-process address spaces.**
+**✅ Phase 4 shipped (per-process address spaces + fork/execve/wait4).**
+Each process owns a `vmspace_t` (its own PML4); the kernel upper half
+(direct map, kstacks at the pre-created `PML4[320]`, kernel image) is
+shared by copying the top-level entries by value, and `switch_to` swaps
+CR3 (skipping the reload when unchanged). `fork` is an **eager** deep
+copy of the user half ([vmspace_fork](kernel/src/paging.c)) plus a child
+kernel stack crafted to resume in ring 3 with rax=0
+([task_fork](kernel/src/task.c) + [fork_child_return](kernel/src/usermode.S));
+`execve` loads a new image into a fresh address space and tears down the
+old one; `wait4` reaps a `TASK_ZOMBIE` child and collects its exit code.
+Verified on QEMU: init forks (pid 5→6), the child `execve`s `/bin/hello`,
+and the parent `wait4`s `exit status=42`; a value written by a forked
+child is **not** seen by the parent (address-space isolation). Syscalls
+follow Linux x86_64 numbering (`fork`=57, `execve`=59, `exit`=60,
+`wait4`=61). Files: [kernel/src/paging.c](kernel/src/paging.c) (vmspace),
+[kernel/src/task.c](kernel/src/task.c), [kernel/src/syscall.c](kernel/src/syscall.c),
+[user/](user/). *Deferred:* COW fork (currently eager), kernel-stack
+reclamation on reap (leaked), and copy_to/from_user validation (user
+pointers are dereferenced directly). **Phase 5(B) is next.**
+
+**Phase 4 — per-process address spaces (design record).**
 - A `vmspace_t` owns a PML4; the kernel high-half entries (direct map,
   kstacks, kernel image) are **shared by copying the top-level PML4
   entries by value** while each process gets its own low-half subtree.
