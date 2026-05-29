@@ -47,6 +47,21 @@ Run tests:
 dotnet test DiskUtil.sln
 ```
 
+Build and run the CLI:
+
+```bash
+dotnet build src/DiskTool.CLI
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --help
+```
+
+CLI examples:
+
+```bash
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/myos/vdisk.img --import ./local.txt /docs/local.txt
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/myos/vdisk.img --export /docs/local.txt ./local-out.txt
+./src/DiskTool.CLI/bin/Debug/net8.0/disktool-cli --diskfile /home/guido/myos/vdisk.img --ls /docs
+```
+
 ## Implemented structure
 Filesystem logic in `DiskUtil.Core` should be versioned to preserve compatibility as formats evolve.
 
