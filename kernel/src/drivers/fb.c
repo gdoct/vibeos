@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "pmm.h"
+#include "paging.h"   /* framebuffer MMIO is reached via the direct map */
 #include "fb.h"
 #include "device.h"
 
@@ -68,7 +69,7 @@ static void fb_draw_text(fb_device_t *fb, uint32_t x, uint32_t y,
 fb_device_t *fb_init(const FramebufferInfo *info) {
     g_fb.dev.name = "fb0";
     g_fb.dev.cls  = DEV_FRAMEBUFFER;
-    g_fb.base     = (uint8_t *)(uintptr_t)info->base;
+    g_fb.base     = (uint8_t *)phys_to_virt(info->base);
     g_fb.width    = info->width;
     g_fb.height   = info->height;
     g_fb.pitch    = info->pitch;

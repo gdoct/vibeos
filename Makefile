@@ -2,7 +2,7 @@
 #
 # Produces:
 #   boot/build/BOOTX64.EFI   — UEFI bootloader (PE32+)
-#   kernel/build/kernel.elf  — ET_EXEC kernel, linked at 1 MiB phys
+#   kernel/build/kernel.elf  — ET_EXEC kernel, higher-half (-2 GiB), loaded at 1 MiB phys
 #   boot/build/myos.img      — FAT disk image, bootable in QEMU+OVMF
 #
 # Toolchain: g++ + GNU ld. Bootloader uses i386pep emulation for PE32+;
@@ -66,6 +66,7 @@ KERNEL_CFLAGS = \
   -fno-stack-protector \
   -fno-pic \
   -fno-pie \
+  -mcmodel=kernel \
   -mno-red-zone \
   -mno-sse \
   -mno-mmx \
@@ -103,19 +104,35 @@ KERNEL_C_SRCS = \
   kernel/src/irq.c \
   kernel/src/apic.c \
   kernel/src/task.c \
+  kernel/src/tss.c \
+  kernel/src/syscall.c \
+  kernel/src/elf64.c \
   kernel/src/drivers/fb.c \
   kernel/src/drivers/font.c \
   kernel/src/drivers/ramdisk.c \
   kernel/src/drivers/pci.c \
   kernel/src/drivers/virtio_blk.c \
   kernel/src/drivers/timer.c
-KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S
+KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S kernel/src/usermode.S
 
 KERNEL_C_OBJS = $(KERNEL_C_SRCS:kernel/src/%.c=kernel/build/%.o)
 KERNEL_S_OBJS = $(KERNEL_S_SRCS:kernel/src/%.S=kernel/build/%.o)
-KERNEL_OBJS   = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS)
+# user_blob.o embeds the userspace init ELF; built via objcopy (see below).
+USER_BLOB_OBJ = kernel/build/user_blob.o
+KERNEL_OBJS   = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS) $(USER_BLOB_OBJ)
 
 KERNEL_ELF = kernel/build/kernel.elf
+
+# --- Userspace (ROADMAP §3) ---
+
+USER_CFLAGS = \
+  -m64 -ffreestanding -fno-pic -fno-pie \
+  -mno-red-zone -mno-sse -mno-mmx \
+  -nostdlib -fno-exceptions -fno-rtti -fno-stack-protector \
+  -O2 -Wall -Wextra -Wno-unused-parameter -std=c++17
+USER_LDFLAGS = -nostdlib -static -no-pie -T user/user.ld
+
+USER_INIT = user/build/init.elf
 
 .PHONY: all clean run image kernel
 all: $(EFI) $(KERNEL_ELF)
@@ -152,6 +169,30 @@ kernel: $(KERNEL_ELF)
 
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 	$(LD) $(KERNEL_LDFLAGS) $(KERNEL_OBJS) -o $@
+
+# --- Userspace init + blob embedding ---
+
+user/build:
+	mkdir -p user/build
+
+user/build/crt0.o: user/crt0.S | user/build
+	$(CC) -m64 -c $< -o $@
+
+user/build/init.o: user/init.c | user/build
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_INIT): user/build/crt0.o user/build/init.o user/user.ld
+	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/init.o -o $@
+
+# Wrap the init ELF as an object the kernel links in, exposing
+# init_elf_start / init_elf_end around its bytes.
+$(USER_BLOB_OBJ): $(USER_INIT) | kernel/build
+	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
+	  --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+	  --redefine-sym _binary_user_build_init_elf_start=init_elf_start \
+	  --redefine-sym _binary_user_build_init_elf_end=init_elf_end \
+	  --redefine-sym _binary_user_build_init_elf_size=init_elf_size \
+	  $< $@
 
 # --- Disk image ---
 

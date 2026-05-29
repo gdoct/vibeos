@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "pmm.h"
 #include "irq.h"
+#include "paging.h"   /* phys_to_virt: pages are reached via the direct map */
 
 /* EFI memory type we treat as free. The full UEFI spec lists a few more
    that become free after ExitBootServices, but ConventionalMemory alone
@@ -20,7 +21,7 @@ static uint64_t pmm_freelist = 0;   /* 0 = empty (phys 0 is never in arena) */
 static uint64_t pmm_freed    = 0;   /* count of pages currently on freelist */
 
 void pmm_init(const BootInfo *bi) {
-    const uint8_t *p   = (const uint8_t *)(uintptr_t)bi->mmap.buffer;
+    const uint8_t *p   = (const uint8_t *)phys_to_virt(bi->mmap.buffer);
     const uint8_t *end = p + bi->mmap.size;
     uint64_t dsz       = bi->mmap.desc_size;
 
@@ -65,10 +66,10 @@ uint64_t pmm_alloc_pages(size_t pages) {
        can't promise, so they always come from the bump arena. */
     if (pages == 1 && pmm_freelist) {
         uint64_t addr = pmm_freelist;
-        pmm_freelist = *(uint64_t *)(uintptr_t)addr;
+        pmm_freelist = *(uint64_t *)phys_to_virt(addr);   /* next-free link */
         pmm_freed--;
         irq_restore(f);
-        kmemset((void *)(uintptr_t)addr, 0, PAGE_SIZE);
+        kmemset(phys_to_virt(addr), 0, PAGE_SIZE);
         return addr;
     }
 
@@ -77,7 +78,7 @@ uint64_t pmm_alloc_pages(size_t pages) {
     uint64_t addr = pmm_cursor;
     pmm_cursor += bytes;
     irq_restore(f);
-    kmemset((void *)(uintptr_t)addr, 0, (size_t)bytes);
+    kmemset(phys_to_virt(addr), 0, (size_t)bytes);
     return addr;
 }
 
@@ -88,7 +89,7 @@ void pmm_free_page(uint64_t phys) {
     if (phys & PAGE_MASK) panic("pmm_free_page: %lx not page-aligned",
                                 (unsigned long)phys);
     uint64_t f = irq_save();
-    *(uint64_t *)(uintptr_t)phys = pmm_freelist;
+    *(uint64_t *)phys_to_virt(phys) = pmm_freelist;   /* store next-free link */
     pmm_freelist = phys;
     pmm_freed++;
     irq_restore(f);

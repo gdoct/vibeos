@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "pmm.h"
 #include "irq.h"
+#include "paging.h"   /* PMM hands out physical addrs; reach them via direct map */
 #include "kmalloc.h"
 
 /*
@@ -58,7 +59,7 @@ static int refill(int c) {
     if (!page) return -1;
     uint32_t chunk = k_class_size[c];
     for (uint32_t off = 0; off + chunk <= PAGE_SIZE; off += chunk) {
-        free_node_t *n = (free_node_t *)(uintptr_t)(page + off);
+        free_node_t *n = (free_node_t *)phys_to_virt(page + off);
         n->next = k_slabs[c];
         k_slabs[c] = n;
     }
@@ -86,7 +87,7 @@ void *kmalloc(size_t size) {
     } else {
         uint64_t base = pmm_alloc_pages((size_t)pages_for(size));
         if (base) {
-            alloc_hdr_t *h = (alloc_hdr_t *)(uintptr_t)base;
+            alloc_hdr_t *h = (alloc_hdr_t *)phys_to_virt(base);
             h->magic     = ALLOC_MAGIC;
             h->class_idx = CLASS_LARGE;
             h->req_size  = size;
@@ -112,7 +113,7 @@ void kfree(void *ptr) {
     k_in_use -= h->req_size;
 
     if (h->class_idx == CLASS_LARGE) {
-        uint64_t base  = (uint64_t)(uintptr_t)h;
+        uint64_t base  = virt_to_phys(h);   /* PMM wants the physical address */
         uint64_t pages = pages_for(h->req_size);
         for (uint64_t i = 0; i < pages; i++)
             pmm_free_page(base + i * PAGE_SIZE);

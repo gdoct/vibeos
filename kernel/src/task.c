@@ -3,6 +3,7 @@
 #include "irq.h"
 #include "paging.h"
 #include "task.h"
+#include "usermode.h"
 
 /*
  * Cooperative + timer-preemptive round-robin scheduler.
@@ -125,6 +126,14 @@ static void switch_to(int from, int to) {
     if (prev->state == TASK_RUNNING) prev->state = TASK_READY;
     next->state = TASK_RUNNING;
     g_current   = to;
+    /* Track the running task's kernel stack for ring-3 entry: the TSS rsp0
+       (used when an IRQ/exception hits in ring 3) and the syscall stub's
+       stack both follow it. Harmless for kernel-only tasks. The boot/idle
+       slots have no allocated stack (stack_top == 0); skip those. */
+    if (next->stack_top) {
+        tss_set_rsp0(next->stack_top);
+        g_kernel_rsp = next->stack_top;
+    }
     context_switch(&prev->saved_rsp, next->saved_rsp);
 }
 

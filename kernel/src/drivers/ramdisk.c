@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "pmm.h"
+#include "paging.h"   /* PMM storage is reached via the direct map */
 #include "block.h"
 
 /*
@@ -39,7 +40,7 @@ extern "C" block_device_t *ramdisk_init(uint64_t num_blocks) {
     uint64_t phys = pmm_alloc_pages(pages);
     if (!phys) panic("ramdisk: out of memory (%lu pages)", (unsigned long)pages);
 
-    g_rd.storage          = (uint8_t *)(uintptr_t)phys;
+    g_rd.storage          = (uint8_t *)phys_to_virt(phys);
     g_rd.bd.dev.name      = "ram0";
     g_rd.bd.dev.cls       = DEV_BLOCK;
     g_rd.bd.block_size    = RAMDISK_BLOCK_SIZE;

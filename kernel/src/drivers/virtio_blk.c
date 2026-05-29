@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "io.h"
 #include "pmm.h"
+#include "paging.h"   /* phys_to_virt for CPU access, kva_to_phys for DMA */
 #include "pci.h"
 #include "block.h"
 #include "virtio.h"
@@ -118,7 +119,7 @@ static void virtq_setup(virtio_blk_t *v) {
     uint64_t phys = pmm_alloc_pages(total / PAGE_SIZE);
     if (!phys) panic("virtio-blk: out of memory for virtqueue");
 
-    uint8_t *base = (uint8_t *)(uintptr_t)phys;
+    uint8_t *base = (uint8_t *)phys_to_virt(phys);   /* CPU view of the rings */
     v->desc       = (virtq_desc_t *)base;
     v->avail      = (uint16_t *)(base + desc_bytes);          /* &flags */
     v->avail_idx  = v->avail + 1;
@@ -143,21 +144,27 @@ static int submit(virtio_blk_t *v, uint32_t type, uint64_t lba,
     v->hdr.sector   = lba;
     v->status       = 0xFF;     /* sentinel; device overwrites */
 
+    /* Descriptor addresses are what the device DMAs against, so they must be
+       physical. Kernel pointers are now direct-map / high-half VAs (v->hdr
+       lives in .bss, the kernel-high window), never identity — translate via
+       the page tables. Each buffer here fits in one page, so it is
+       physically contiguous. */
+
     /* desc[0]: header (read-only for device) */
-    v->desc[0].addr  = (uint64_t)(uintptr_t)&v->hdr;
+    v->desc[0].addr  = kva_to_phys(&v->hdr);
     v->desc[0].len   = sizeof(v->hdr);
     v->desc[0].flags = VIRTQ_DESC_F_NEXT;
     v->desc[0].next  = 1;
 
     /* desc[1]: data buffer */
-    v->desc[1].addr  = (uint64_t)(uintptr_t)buf;
+    v->desc[1].addr  = kva_to_phys(buf);
     v->desc[1].len   = data_bytes;
     v->desc[1].flags = VIRTQ_DESC_F_NEXT
                      | (dev_writes_data ? VIRTQ_DESC_F_WRITE : 0);
     v->desc[1].next  = 2;
 
     /* desc[2]: status byte (device-write) */
-    v->desc[2].addr  = (uint64_t)(uintptr_t)&v->status;
+    v->desc[2].addr  = kva_to_phys(&v->status);
     v->desc[2].len   = 1;
     v->desc[2].flags = VIRTQ_DESC_F_WRITE;
     v->desc[2].next  = 0;

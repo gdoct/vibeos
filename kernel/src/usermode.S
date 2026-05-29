@@ -1,0 +1,71 @@
+/*
+ * SYSCALL/SYSRET entry + the ring-3 launch path (ROADMAP §3, Phase 1).
+ */
+
+    .set USER_CS_RPL3, 0x23
+    .set USER_DS_RPL3, 0x1B
+
+    .section .text
+    .globl  syscall_entry
+    .type   syscall_entry, @function
+syscall_entry:
+    /* Entered from `syscall`: still on the USER stack, IF cleared by SFMASK.
+       rcx = user return RIP, r11 = user RFLAGS. Syscall number in rax, args
+       in rdi,rsi,rdx,r10,r8,r9 (Linux x86_64 ABI). SYSCALL does NOT switch
+       stacks, so we do it: stash the user rsp and load the kernel stack.
+       UP uses a global; SMP §1 replaces this with swapgs + KERNEL_GS_BASE. */
+    movq    %rsp, g_user_rsp(%rip)
+    movq    g_kernel_rsp(%rip), %rsp
+
+    /* Build a syscall_frame_t on the kernel stack (see syscall.c). Pushes go
+       high->low, so the last push (rax) is the struct's first field. */
+    pushq   g_user_rsp(%rip)        /* .user_rsp */
+    pushq   %r11                    /* .r11  (user rflags) */
+    pushq   %rcx                    /* .rcx  (user rip)    */
+    pushq   %r9                     /* .r9   (arg6) */
+    pushq   %r8                     /* .r8   (arg5) */
+    pushq   %r10                    /* .r10  (arg4) */
+    pushq   %rdx                    /* .rdx  (arg3) */
+    pushq   %rsi                    /* .rsi  (arg2) */
+    pushq   %rdi                    /* .rdi  (arg1) */
+    pushq   %rax                    /* .rax  (nr)  -> lowest address */
+
+    movq    %rsp, %rdi              /* arg0 = syscall_frame_t* */
+    call    syscall_dispatch        /* result in rax */
+
+    /* Restore. The ABI says a syscall preserves every register except rax
+       (return), rcx and r11 (clobbered by the instruction itself). */
+    addq    $8, %rsp                /* drop .rax slot; keep result in rax */
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %r10
+    popq    %r8
+    popq    %r9
+    popq    %rcx                    /* user rip   -> sysret target */
+    popq    %r11                    /* user rflags */
+    popq    %rsp                    /* back to the user stack */
+    sysretq                         /* CS/SS from STAR (RPL 3), rax = result */
+    .size   syscall_entry, . - syscall_entry
+
+    /* void enter_user(uint64_t entry /rdi/, uint64_t user_rsp /rsi/); noreturn.
+       Drops to ring 3 via a hand-built iretq frame. */
+    .globl  enter_user
+    .type   enter_user, @function
+enter_user:
+    cli                             /* assemble the frame without an IRQ in it */
+    movw    $USER_DS_RPL3, %ax
+    movw    %ax, %ds
+    movw    %ax, %es
+    movw    %ax, %fs
+    movw    %ax, %gs
+
+    pushq   $USER_DS_RPL3           /* SS */
+    pushq   %rsi                    /* RSP */
+    pushq   $0x202                  /* RFLAGS: IF=1 (bit9) + reserved bit1 */
+    pushq   $USER_CS_RPL3           /* CS */
+    pushq   %rdi                    /* RIP */
+    iretq
+    .size   enter_user, . - enter_user
+
+    .section .note.GNU-stack, "", @progbits

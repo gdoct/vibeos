@@ -11,6 +11,7 @@
 #include "paging.h"
 #include "apic.h"
 #include "fs.h"
+#include "usermode.h"
 #include "../../boot/include/bootinfo.h"
 
 extern "C" block_device_t *ramdisk_init(uint64_t num_blocks);
@@ -53,6 +54,26 @@ static void io_worker(void *arg) {
     g_alive_workers--;
 }
 
+/* The userspace init program, embedded as a blob (user_blob.o / user/init.c).
+   ROADMAP §3 Milestone A loads it from memory; Milestone B reads it from the
+   filesystem via the host populate tool. */
+extern "C" const uint8_t init_elf_start[];
+extern "C" const uint8_t init_elf_end[];
+
+/* Load /init into the (now free) low half and drop to ring 3. Runs as a task,
+   so it owns a kernel stack for syscalls/IRQs; on exit() the task dies and the
+   scheduler moves on. */
+static void init_launch(void *arg) {
+    (void)arg;
+    uint64_t size = (uint64_t)(init_elf_end - init_elf_start);
+    uint64_t entry, rsp;
+    int r = user_load(init_elf_start, size, &entry, &rsp);
+    if (r != 0) panic("init: user_load failed (%d)", r);
+    kprintf("[init] loaded init (%lu bytes), entry=%lx rsp=%lx -> ring 3\n",
+            (unsigned long)size, (unsigned long)entry, (unsigned long)rsp);
+    enter_user(entry, rsp);
+}
+
 void scheduler_demo(void) {
     sched_init();
     g_alive_workers = 2;
@@ -62,6 +83,7 @@ void scheduler_demo(void) {
         g_alive_workers++;
         task_create("io", io_worker, nullptr);
     }
+    task_create("init", init_launch, nullptr);   /* userspace init in ring 3 */
     /* Boot task blocks itself between checks too, instead of spinning. */
     while (g_alive_workers > 0) ksleep_ms(20);
     kprintf("[demo] all workers exited at tick %lu\n",
@@ -305,13 +327,20 @@ static void selftest_fs(block_device_t *dev) {
 }
 
 static void selftest_paging(void) {
-    /* Direct map: the same physical bytes must be visible through both the
-       identity address and PHYS_OFFSET + phys. Read the kernel's first
-       words both ways and compare. */
-    volatile uint32_t *ident  = (volatile uint32_t *)0x100000;
-    volatile uint32_t *direct = (volatile uint32_t *)phys_to_virt(0x100000);
-    if (*ident != *direct)
-        panic("paging: direct map mismatch %x != %x", *ident, *direct);
+    /* Direct map: the same physical bytes must be visible through the
+       kernel's real (high-half) address and through PHYS_OFFSET + phys.
+       There is no identity map anymore — the low half belongs to userspace. */
+    uint64_t self_pa = kva_to_phys((const void *)&selftest_paging);
+    volatile uint32_t *high   = (volatile uint32_t *)&selftest_paging;
+    volatile uint32_t *direct = (volatile uint32_t *)phys_to_virt(self_pa);
+    if (*high != *direct)
+        panic("paging: direct map mismatch %x != %x", *high, *direct);
+
+    /* The low half must be unmapped — it belongs to userspace now. Querying
+       (not dereferencing) keeps this safe. */
+    uint64_t lo;
+    if (paging_query(0x100000, &lo))
+        panic("paging: low half still mapped (%lx) — identity not dropped", lo);
 
     /* vmap round-trip: map a scratch page at a scratch VA, write through
        it, observe the write through the identity alias, then unmap. */
@@ -323,7 +352,7 @@ static void selftest_paging(void) {
         panic("paging: query after vmap gave %lx, want %lx",
               (unsigned long)got, (unsigned long)pa);
     *(volatile uint32_t *)va = 0xC0FFEE42;
-    if (*(volatile uint32_t *)(uintptr_t)pa != 0xC0FFEE42)
+    if (*(volatile uint32_t *)phys_to_virt(pa) != 0xC0FFEE42)
         panic("paging: write via vmap not visible at phys");
     vunmap(va, 1);
     if (paging_query(va, &got))
@@ -377,11 +406,18 @@ static void selftest_heap(void) {
 }
 
 extern "C" void kmain(BootInfo *bi) {
+    /* The bootloader hands us a low physical BootInfo*. Reach it through the
+       direct map so it stays valid after paging_init drops the low identity
+       (the bootstrap tables in start.S already provide the direct map). */
+    bi = (BootInfo *)phys_to_virt((uint64_t)(uintptr_t)bi);
+
     serial_init();
     kprintf("\n[kernel] MyOS booting (BootInfo @ %p)\n", bi);
 
     gdt_init();
     idt_init();
+    tss_init();        /* ring-3 -> ring-0 stack switch (TSS.rsp0) */
+    syscall_init();    /* SYSCALL/SYSRET entry */
 
     check_bootinfo(bi);
     kprintf("[kernel] kernel image: %lx..%lx (%lu KiB)\n",

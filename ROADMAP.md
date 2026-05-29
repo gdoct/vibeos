@@ -304,6 +304,24 @@ real application workflows that survive reboot.
 
 ### 3. Userspace
 
+**✅ Phase 0 + Milestone A shipped.** The kernel is relinked to the higher
+half (`-2 GiB`, low half free), and a static ELF `init` runs in ring 3:
+`gdt`/TSS + SYSCALL/SYSRET, a user ELF loader with a System V initial
+stack, and a syscall table (`write`/`read`/`exit`/`exit_group`/`getpid`/
+`brk`, Linux x86_64 numbers). Verified end-to-end on QEMU: `init` prints
+via `write`, `getpid` returns its pid, `argv[0]` confirms the stack
+layout, `exit(0)` reaps the task; a timer tick preempts a CPU-bound ring-3
+loop (other tasks keep running); and a bad user pointer takes a clean
+`#PF` (CR2 + `cs=0x23` ring-3 frame) instead of corrupting the kernel.
+Files: [kernel/src/usermode.S](kernel/src/usermode.S),
+[kernel/src/syscall.c](kernel/src/syscall.c),
+[kernel/src/tss.c](kernel/src/tss.c),
+[kernel/src/elf64.c](kernel/src/elf64.c), [user/](user/), and the
+higher-half relink in [kernel/src/start.S](kernel/src/start.S) +
+[kernel/linker.ld](kernel/linker.ld). **Milestone B (below) is next:**
+per-process address spaces, `fork`/`execve`, the host MyFS populate tool,
+and console input. The detailed spec is kept below as the build record.
+
 **Why now.** Everything until here has been kernel-only. Userspace
 makes the kernel an actual *operating system* rather than a
 single-binary monolith. It's also the gate in front of everything
@@ -328,6 +346,38 @@ The work then splits into two milestones: **A** proves ring 3 + syscalls
 + ELF loading end-to-end with a single process in shared tables; **B**
 adds real per-process isolation and the host-side tooling. Finish A
 end-to-end before starting B.
+
+**Sequencing: §3 before §1 (SMP).** The expensive part of SMP is the
+locking pass — every shared mutable structure needs a real lock, and
+today the only mutual-exclusion primitive is `irq_save`/`irq_restore`
+(fine on UP, useless across cores). That pass is coming regardless of
+order, and most of its surface (scheduler, PMM, kmalloc, FS, virtio)
+already exists — userspace adds only a bounded amount to it and closes
+no one-way doors. Doing userspace first also yields the real
+multi-process workloads that tell us *where* SMP contention actually is,
+so the locking design isn't speculative. The few genuine coupling points
+are small and flagged in place: the syscall-entry stack switch
+(`swapgs` + `KERNEL_GS_BASE`), a per-CPU TSS, and per-CPU `current`.
+
+**Critical-section convention (de-risks the future SMP retrofit).**
+Build the lock *seams* now, during userspace work, even though UP needs
+no real locking. Introduce a `spinlock_t` whose UP body is just
+`irq_save`/`irq_restore` (no actual spin), and convert every existing
+and new critical section to use it:
+
+```c
+typedef struct { uint64_t flags; } spinlock_t;   /* UP: holds irq_save() result */
+static inline void spin_lock(spinlock_t *l)   { l->flags = irq_save(); }
+static inline void spin_unlock(spinlock_t *l) { irq_restore(l->flags); }
+```
+
+Every new userspace structure (`vmspace_t`, the fd table, the process
+table) gets a `spinlock_t` from day one; the existing bare
+`irq_save`/`irq_restore` sites (scheduler, PMM, kmalloc, FS, virtio)
+migrate to it opportunistically. This marks every site that will need a
+real lock, so §1 becomes "make the lock body real" rather than "audit
+the whole tree to find the critical sections." Cheap now, and the single
+highest-leverage insurance against a viral SMP refactor.
 
 #### Phase 0 — higher-half relink (free the low half)
 
@@ -356,7 +406,7 @@ end-to-end before starting B.
   from `0xFFFFFFFF8...`, with `PML4[0]` unmapped (a deref of a low
   address now faults cleanly).
 
-#### Milestone A — one user process, visible end-to-end
+#### Milestone A — one user process, visible end-to-end ✅ shipped
 
 **Phase 1 — CPU plumbing for ring 3.**
 - [kernel/src/gdt.S](kernel/src/gdt.S): add user-data, user-code (DPL 3,
@@ -413,7 +463,7 @@ end-to-end before starting B.
   without taking down the kernel; a timer tick preempts a spinning user
   loop (proves TSS `rsp0` + the `iretq` resume path).
 
-#### Milestone B — real processes & isolation
+#### Milestone B — real processes & isolation 🔜 next
 
 **Phase 4 — per-process address spaces.**
 - A `vmspace_t` owns a PML4; the kernel high-half entries (direct map,

@@ -7,9 +7,14 @@
 extern "C" {
 #endif
 
-/* Kernel segment selectors set up by gdt_init(). */
+/* Segment selectors set up by gdt_init(). The user selectors carry RPL 3.
+   Their GDT order (udata before ucode) is fixed by what SYSRET expects:
+   it loads SS from STAR.SYSRET_base+8 and CS from +16 (see syscall_init). */
 #define KERNEL_CS  0x08
 #define KERNEL_DS  0x10
+#define USER_DS    (0x18 | 3)   /* GDT[3], RPL 3 */
+#define USER_CS    (0x20 | 3)   /* GDT[4], RPL 3 */
+#define TSS_SEL    0x28         /* GDT[5..6] (16-byte system descriptor) */
 
 void gdt_init(void);   /* installs our own GDT, reloads segments */
 void idt_init(void);   /* installs IDT with exception handlers for vectors 0-31 */

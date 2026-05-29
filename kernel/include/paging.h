@@ -23,6 +23,7 @@ extern "C" {
  */
 #define PHYS_OFFSET     0xFFFF800000000000ULL
 #define KSTACK_REGION   0xFFFFA00000000000ULL
+#define KERNEL_VBASE    0xFFFFFFFF80000000ULL   /* -2 GiB; kernel image VA base */
 
 /* Page-table entry flags. */
 #define PTE_P    (1ULL << 0)    /* present */
@@ -44,6 +45,12 @@ void vunmap(uint64_t va, size_t pages);
 /* Resolve a virtual address through the active tables. Returns 1 and sets
    *pa_out if mapped (4 KiB or 2 MiB), 0 if not present. */
 int  paging_query(uint64_t va, uint64_t *pa_out);
+
+/* Translate a (mapped) kernel virtual address to its physical address.
+   For places that need a physical address — e.g. virtio DMA descriptors —
+   now that kernel pointers are direct-map / high-half VAs, never identity.
+   Panics if `va` is unmapped. */
+uint64_t kva_to_phys(const volatile void *va);
 
 /* Allocate a kernel stack of `pages` 4 KiB pages in the KSTACK_REGION
    window, with an unmapped guard page just below it. Returns the stack
