@@ -140,10 +140,14 @@ and rationale:
 1. **§4 Linux ABI** is now #1 — it's the point of everything built so far
    (run a static `busybox`, `binutils`, eventually a compiler), it's the
    biggest single unlock, and nothing else blocks it.
-2. **SMP completeness** (user-on-APs, per-CPU run queues) is demoted — the
+2. **§5 Networking** is the other big new capability. Its kernel half (NIC +
+   TCP/IP) is independent of §4 and can be built anytime; the satisfying
+   payoff — running ported network apps — reuses §4's fd table, so it's
+   placed after §4.
+3. **SMP completeness** (user-on-APs, per-CPU run queues) is demoted — the
    kernel is already multi-core for kernel work; these are performance/
    completeness, not capability gates, and §4 runs fine single-threaded.
-3. **Robustness backlog** is last — real bugs and polish, but each has a
+4. **Robustness backlog** is last — real bugs and polish, but each has a
    workaround and none gates the headline goal.
 
 ### §4 — Linux ABI: run real static binaries (musl → busybox → binutils)
@@ -189,6 +193,34 @@ syscalls each.
 **Rough size:** rung 1 ≈ one focused session (TLS + mmap + auxv are the
 load-bearing parts), rung 2 another (fd table + FS syscalls + struct layouts),
 binutils a few more on top — but past rung 1 it's *widening*, not architecture.
+
+### §5 — Networking (NIC + TCP/IP + sockets)
+
+**Layering reality:** only the top layer is helped by §4. The NIC driver and
+the protocol stack are kernel work regardless of the ABI — but both are
+"port/reuse existing code," not write-from-scratch.
+
+- **NIC — virtio-net (kernel).** Same shape as the virtio-blk driver already
+  in tree (virtqueues, IRQ completion, scatter-gather DMA) — just rx/tx queues
+  instead of one request queue. §4-independent; the easiest layer given what's
+  built. QEMU: `-netdev user,id=n0 -device virtio-net-pci,netdev=n0` (user-mode
+  net, no root) or a tap for raw frames.
+- **Stack — port lwIP into the kernel.** BSD-licensed, built for embedding,
+  needs **no libc and no Linux ABI**. Start in `NO_SYS` mode (single-threaded:
+  the kernel drives lwIP's timers and polls it), so the only port glue is a
+  `netif` (tx → enqueue to virtio-net; rx ← feed frames from the rx IRQ) and
+  `sys_now()`. Don't hand-write TCP. §4-independent.
+- **Sockets — a BSD socket layer behind Linux syscalls.** `socket`/`bind`/
+  `connect`/`accept`/`send`/`recv`/`sendto`/`recvfrom`/`setsockopt`/`poll`,
+  backed by lwIP, with sockets as entries in the **per-process fd table**
+  (the same table built for §4 rung 2 — hence the ordering).
+- **Apps — the §4 payoff.** Once sockets ride the fd table and Linux syscalls,
+  ported static-musl binaries (`busybox wget`/`nc`, `curl`) run unmodified.
+
+**Milestones:** (1) virtio-net up, frames in/out; (2) ARP + ICMP echo — the
+host can `ping` the guest; (3) TCP — a kernel/echo or HTTP-GET test; (4)
+socket syscalls + a ported `wget`. Steps 1–3 are doable before §4; step 4
+needs §4 (musl + fd table + `poll`).
 
 ### SMP completeness
 
