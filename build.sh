@@ -51,6 +51,8 @@ rm -f "$VDISK"
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/sigtest.elf /bin/sigtest
 [ -f user/build/nettest.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/nettest.elf /bin/nettest
+[ -f user/build/wget.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/wget.elf /bin/wget
 
 # Dynamic linking (ROADMAP §4): ship the musl dynamic linker as
 # /lib/ld-musl-x86_64.so.1 (the host's musl libc.so doubles as the loader) and a

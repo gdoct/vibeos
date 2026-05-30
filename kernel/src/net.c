@@ -439,6 +439,7 @@ typedef struct tcp_pcb {
     struct tcp_pcb *listener;                 /* parent, for SYN_RCVD children */
     struct tcp_pcb *acceptq[TCP_ACCEPTQ];     /* established, awaiting accept() */
     int          aq_head, aq_tail;
+    int          app_closed;                  /* app called close(); free once CLOSED */
     wait_queue_t wq;                          /* any state change wakes waiters */
 } tcp_pcb_t;
 
@@ -601,6 +602,7 @@ static void tcp_close(tcp_pcb_t *t) {
        sched_lock), so emitting while holding it would self-deadlock. */
     int send_fin = 0;
     sched_lock();
+    t->app_closed = 1;
     if (t->used && (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT)) {
         t->state = (t->state == T_CLOSE_WAIT) ? T_LAST_ACK : T_FIN_WAIT_1;
         send_fin = 1;
@@ -718,10 +720,14 @@ static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
     if ((flags & TCP_ACK) && t->snd_una == t->snd_nxt) {
         if (t->state == T_FIN_WAIT_1)     t->state = t->peer_fin ? T_CLOSED : T_FIN_WAIT_2;
         else if (t->state == T_CLOSING)   t->state = T_CLOSED;
-        else if (t->state == T_LAST_ACK)  { t->state = T_CLOSED; t->used = 0; }
+        else if (t->state == T_LAST_ACK)  t->state = T_CLOSED;
     }
 
     wait_queue_wake_all_locked(&t->wq);
+    /* Reclaim a fully-closed connection once the app is also done with it (skip
+       TIME_WAIT — loopback/SLIRP won't deliver stale segments). Otherwise CLOSED
+       pcbs would leak and eventually exhaust the pool, silently dropping SYNs. */
+    if (t->state == T_CLOSED && t->app_closed) t->used = 0;
     sched_unlock();
 }
 
@@ -946,6 +952,39 @@ static void net_pinger(void *arg) {
     }
 }
 
+/* Tiny in-guest HTTP/1.0 server on port 80, so a userspace HTTP client (our
+   ported wget) has something to fetch over loopback. Answers any request with a
+   fixed page and closes. */
+static void net_http_server(void *arg) {
+    (void)arg;
+    static const char body[] =
+        "Hello from VibeOS!\n"
+        "This page was fetched over our own virtio-net + TCP/IP stack.\n";
+    tcp_pcb_t *l = tcp_listen(80);
+    if (!l) return;
+    for (;;) {
+        tcp_pcb_t *c = tcp_accept(l);
+        if (!c) continue;
+        uint8_t req[512];
+        tcp_read(c, req, sizeof req);          /* consume the request line/headers */
+        char resp[512];
+        int blen = (int)sizeof(body) - 1;
+        int hlen = 0;
+        const char *hfmt =
+            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
+        for (const char *q = hfmt; *q; q++) resp[hlen++] = *q;
+        /* itoa(blen) */
+        char num[8]; int ni = 0, v = blen; if (!v) num[ni++] = '0';
+        while (v) { num[ni++] = (char)('0' + v % 10); v /= 10; }
+        while (ni) resp[hlen++] = num[--ni];
+        const char *tail = "\r\nConnection: close\r\n\r\n";
+        for (const char *q = tail; *q; q++) resp[hlen++] = *q;
+        kmemcpy(resp + hlen, body, blen);
+        tcp_write(c, (const uint8_t *)resp, hlen + blen);
+        tcp_close(c);                          /* HTTP/1.0: close right after the response */
+    }
+}
+
 /* In-guest TCP echo server for the loopback self-test. */
 static void net_tcp_server(void *arg) {
     (void)arg;
@@ -977,6 +1016,7 @@ void net_init(void) {
     if (!virtio_net_init()) { kprintf("[net] no NIC; networking disabled\n"); return; }
     task_create("netd", net_worker, nullptr);
     task_create("net-tcpd", net_tcp_server, nullptr);
+    task_create("net-httpd", net_http_server, nullptr);
     task_create("net-ping", net_pinger, nullptr);
     kprintf("[net] up: 10.0.2.15/24 gw 10.0.2.2\n");
 }
