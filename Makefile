@@ -111,6 +111,7 @@ KERNEL_C_SRCS = \
 	kernel/src/tty.c \
 	kernel/src/elf64.c \
 	kernel/src/random.c \
+	kernel/src/csprng.c \
 	kernel/src/file.c \
 	kernel/src/pipe.c \
 	kernel/src/net.c \
@@ -120,6 +121,7 @@ KERNEL_C_SRCS = \
 	kernel/src/drivers/ramdisk.c \
 	kernel/src/drivers/pci.c \
 	kernel/src/drivers/virtio_blk.c \
+	kernel/src/drivers/virtio_rng.c \
 	kernel/src/drivers/timer.c
 KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S kernel/src/usermode.S kernel/src/ap_boot.S
 
@@ -322,6 +324,7 @@ run: $(IMG) $(VDISK)
 	  -drive if=none,id=vd0,format=raw,file=$(VDISK) \
 	  -device virtio-blk-pci,drive=vd0 \
 	  -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+	  -device virtio-rng-pci \
 	  -serial stdio
 
 clean:

@@ -13,12 +13,14 @@
 #include "smp.h"
 #include "fs.h"
 #include "net.h"
+#include "csprng.h"
 #include "usermode.h"
 #include "percpu.h"
 #include "../../boot/include/bootinfo.h"
 
 extern "C" block_device_t *ramdisk_init(uint64_t num_blocks);
 extern "C" block_device_t *virtio_blk_init(void);
+extern "C" int virtio_rng_seed(void);
 
 /* Load /bin/init from the mounted root filesystem and drop to ring 3. Runs as
    a task, so it owns a kernel stack for syscalls/IRQs; on exit() it dies and
@@ -213,6 +215,7 @@ extern "C" void kmain(BootInfo *bi) {
     pmm_init(bi);
     paging_init(bi);
     page_refcount_init();   /* COW/usercopy page-refcount table (ROADMAP §1.1) */
+    csprng_init();          /* ChaCha20 DRBG: TCP ISNs etc. (ROADMAP §2) */
     selftest_paging();
     selftest_heap();
 
@@ -241,6 +244,10 @@ extern "C" void kmain(BootInfo *bi) {
        launched with -device virtio-blk-pci. virtio_blk_init wires up its
        INTx handler. */
     block_device_t *vblk = virtio_blk_init();
+
+    /* Fold hardware entropy from virtio-rng into the CSPRNG, if present
+       (-device virtio-rng-pci). Polled; no IRQ. Best-effort (ROADMAP §2). */
+    virtio_rng_seed();
 
     /* Mount the root volume (virtio-blk if present, else the ramdisk) and keep
        it mounted for the lifetime of the system — userspace programs are loaded

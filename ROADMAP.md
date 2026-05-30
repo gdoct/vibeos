@@ -60,9 +60,14 @@ Detail lives in the code and git history; this file is the map, not the manual.
   `brk`, `nanosleep`, signals, sockets; **file I/O over a per-process fd table** —
   `open`/`openat`/`close`/`lseek`/`stat`/`fstat`/`getdents64`/`getcwd`/`fcntl`/
   `dup`/`dup2` ([file.c](kernel/src/file.c)); **`pipe`/`pipe2`**
-  ([pipe.c](kernel/src/pipe.c)); `fork`/`execve`/`wait4`/`exit`. Non-crypto
-  kernel RNG ([random.c](kernel/src/random.c), RDRAND + xorshift fallback)
-  seeds `AT_RANDOM`.
+  ([pipe.c](kernel/src/pipe.c)); `fork`/`execve`/`wait4`/`exit`.
+- **Randomness** — a **ChaCha20 DRBG** ([csprng.c](kernel/src/csprng.c)) seeded
+  from RDRAND, RDTSC timing jitter, and **virtio-rng** hardware entropy
+  ([virtio_rng.c](kernel/src/drivers/virtio_rng.c)), with per-request rekey for
+  forward secrecy. It backs RFC 6528 TCP ISNs (per-4-tuple keyed hash + a
+  monotonic term) and `AT_RANDOM` (musl's stack canary). A non-crypto
+  xorshift/RDRAND RNG ([random.c](kernel/src/random.c)) remains for plumbing
+  variety.
 - **Shell + tooling** — `/bin/init` → `/bin/sh` over serial; host `disktool-cli`
   ([interop/tools/diskutil](interop/tools/diskutil/)) builds/populates VibeFS
   images; `./build.sh` + `make run` (`-smp 4`, virtio-blk + virtio-net).
@@ -82,25 +87,21 @@ validation, kstack reclamation, guarded stacks), (2) user tasks on all cores
 (per-CPU TSS/GS/`swapgs`, IPIs/TLB shootdown), (3) signals, (4) dynamic linking
 (`ET_DYN` + `ld-musl`, file-backed `mmap`), and (5) networking (virtio-net +
 ARP/IP/ICMP/UDP/TCP + BSD sockets + ported `wget`) — are **all shipped** and
-serial-verified, as is **(6) WAN-grade TCP** (send buffer, RTO/RTT, congestion
-control, reassembly, delayed/dup ACKs, TIME-WAIT). See "What works today". What
-remains, ordered:
+serial-verified, as are **(6) WAN-grade TCP** (send buffer, RTO/RTT, congestion
+control, reassembly, delayed/dup ACKs, TIME-WAIT) and **(7) a ChaCha20 CSPRNG**
+(RDRAND + jitter + virtio-rng entropy, RFC 6528 TCP ISNs, `AT_RANDOM`). See
+"What works today". What remains, ordered:
 
-**1. Proper CSPRNG.** ChaCha20 DRBG (or Fortuna) over real entropy — RDRAND,
-timing jitter, virtio-rng — replacing `krandom` for TCP ISNs / TLS. (`krandom`
-stays fine for boot entropy / `AT_RANDOM`.) TCP ISNs are currently a fixed
-counter; predictable.
-
-**2. Per-CPU run queues + work-stealing.** Today one global run queue under the
+**1. Per-CPU run queues + work-stealing.** Today one global run queue under the
 `sched_lock` baton serves every core (an idle CPU pulls any ready task — implicit
 work-stealing, but the single lock is the scalability ceiling). Split into
 per-CPU queues with explicit stealing once contention matters.
 
-**3. Userspace quality-of-life.** `chdir`/cwd, symlinks, `FD_CLOEXEC`; a tiny
+**2. Userspace quality-of-life.** `chdir`/cwd, symlinks, `FD_CLOEXEC`; a tiny
 `/proc` (pid dirs + `stat`) and `/dev` (`null`/`zero`/`tty`/`random`); a real
 (small) init that respawns the shell; a package format (tar + VibeFS metadata).
 
-**4. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
+**3. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
 `gcc`/`clang` build for VibeOS directly instead of repurposing host musl.
 
 **Also widening the ABI toward busybox/binutils** as opportunity allows (more

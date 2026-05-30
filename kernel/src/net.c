@@ -2,6 +2,7 @@
 #include "task.h"
 #include "timer.h"
 #include "net.h"
+#include "csprng.h"
 
 /*
  * Compact IPv4 stack (ROADMAP §5): Ethernet demux, ARP, IPv4, ICMP — enough to
@@ -491,7 +492,6 @@ typedef struct tcp_pcb {
 } tcp_pcb_t;
 
 static tcp_pcb_t g_tcp[TCP_PCB_N];
-static uint32_t  g_iss = 0x10000;
 static volatile int g_tcp_timer_pending;       /* ticker -> worker: run tcp_timer() */
 static volatile int g_tcp_work;                /* app -> worker: pcbs need_output */
 
@@ -725,7 +725,7 @@ static tcp_pcb_t *tcp_connect(uint32_t dip, uint16_t dport) {
     t->local_ip = is_loopback(dip) ? dip : LOCAL_IP;
     t->local_port = g_ephemeral++;
     t->remote_ip = dip; t->remote_port = dport;
-    t->iss = g_iss; g_iss += 0x10000;
+    t->iss = csprng_tcp_isn(t->local_ip, t->local_port, t->remote_ip, t->remote_port);
     t->snd_una = t->snd_nxt = t->iss;
     t->snd_buf_seq = t->iss + 1;                /* first data byte lands here */
     t->snd_wnd = TCP_MSS;                        /* until the SYN-ACK tells us more */
@@ -979,7 +979,7 @@ static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
                 c->state = T_SYN_RCVD;
                 c->local_ip = lst->local_ip; c->local_port = dport;
                 c->remote_ip = src; c->remote_port = sport;
-                c->iss = g_iss; g_iss += 0x10000;
+                c->iss = csprng_tcp_isn(c->local_ip, c->local_port, c->remote_ip, c->remote_port);
                 c->snd_una = c->snd_nxt = c->iss;
                 c->snd_buf_seq = c->iss + 1;
                 c->rcv_nxt = seq + 1;            /* +1 for the SYN */

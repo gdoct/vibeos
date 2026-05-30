@@ -7,6 +7,7 @@
 #include "usermode.h"
 #include "elf.h"
 #include "random.h"
+#include "csprng.h"
 
 /*
  * Userspace ELF loader (ROADMAP §3 Phase 2; §4 dynamic linking).
@@ -184,10 +185,12 @@ static void build_initial_stack(const loaded_t *exe, uint64_t interp_base,
     sp -= execfn_len; kmemcpy((void *)(uintptr_t)sp, execfn, execfn_len);
     uint64_t execfn_va = sp;
 
-    /* 16 bytes of entropy for AT_RANDOM (musl's stack canary). */
+    /* 16 bytes of entropy for AT_RANDOM (musl's stack canary). Drawn from the
+       seeded ChaCha20 CSPRNG (ROADMAP §2) so canaries actually vary per boot —
+       the legacy krandom path was never seeded. */
     sp -= 16;
     uint64_t rnd_va = sp;
-    krandom_bytes((void *)(uintptr_t)sp, 16);
+    csprng_bytes((void *)(uintptr_t)sp, 16);
 
     sp &= ~0xFULL;   /* end of the string/aux-data area */
 
