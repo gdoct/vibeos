@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define MAX_TASKS  8
+#define MAX_TASKS  16       /* grown for the net worker/server/daemon tasks (§5) */
 #define VFS_MAX_FD 32       /* per-process file descriptors (0/1/2 = console) */
 
 typedef enum {

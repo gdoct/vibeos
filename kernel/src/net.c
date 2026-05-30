@@ -52,6 +52,22 @@ typedef struct {
     uint16_t src_port, dst_port, len, csum;
 } __attribute__((packed)) udp_hdr_t;
 
+typedef struct {
+    uint16_t src_port, dst_port;
+    uint32_t seq, ack;
+    uint8_t  data_off;       /* high nibble: header words */
+    uint8_t  flags;          /* FIN/SYN/RST/PSH/ACK */
+    uint16_t window, csum, urg;
+} __attribute__((packed)) tcp_hdr_t;
+
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
+
+static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len);
+
 #define ARP_REQUEST 1
 #define ARP_REPLY   2
 #define ICMP_ECHO_REQUEST 8
@@ -64,6 +80,24 @@ typedef struct { uint8_t data[ETH_FRAME_MAX]; uint16_t len; } rxslot_t;
 static rxslot_t     g_rxq[RXQ_N];
 static uint32_t     g_rxq_head, g_rxq_tail;     /* head==tail: empty */
 static wait_queue_t g_rxq_wq;
+
+/* Loopback frames generated *by the worker* (e.g. a TCP ACK while tcp_input
+   holds sched_lock) are deferred to this worker-private queue and drained after
+   the current frame, so the stack never re-enters the sched_lock-protected rx
+   path while already holding it. Only the worker touches it -> no lock. */
+#define LOQ_N 32
+static rxslot_t  g_loq[LOQ_N];
+static uint32_t  g_loq_head, g_loq_tail;
+static task_t   *g_net_worker = nullptr;
+
+static void loq_enqueue(const uint8_t *frame, uint32_t len) {
+    uint32_t next = (g_loq_head + 1) % LOQ_N;
+    if (next == g_loq_tail) return;             /* drop on overflow */
+    if (len > ETH_FRAME_MAX) len = ETH_FRAME_MAX;
+    kmemcpy(g_loq[g_loq_head].data, frame, len);
+    g_loq[g_loq_head].len = (uint16_t)len;
+    g_loq_head = next;
+}
 
 void net_rx(const uint8_t *frame, uint32_t len) {
     if (len > ETH_FRAME_MAX) len = ETH_FRAME_MAX;
@@ -191,7 +225,10 @@ static int ip_send(uint32_t dst, uint8_t proto, const void *payload, uint32_t pl
         kmemset(eh->dst, 0, 6); kmemset(eh->src, 0, 6);
         eh->type = htons_(ETHERTYPE_IP);
         kmemcpy(frame + ETH_HDR_LEN, pkt, total);
-        net_rx(frame, ETH_HDR_LEN + total);
+        if (task_current() == g_net_worker)     /* inside worker: defer, don't relock */
+            loq_enqueue(frame, ETH_HDR_LEN + total);
+        else
+            net_rx(frame, ETH_HDR_LEN + total); /* task context: hand to the worker */
         return 0;
     }
 
@@ -350,7 +387,7 @@ static void ip_input(const uint8_t *p, uint32_t len) {
     uint32_t plen = total - ihl;
     if (ip->proto == IPPROTO_ICMP)     icmp_input(src, payload, plen);
     else if (ip->proto == IPPROTO_UDP) udp_input(src, payload, plen);
-    /* TCP demux added in the next rung. */
+    else if (ip->proto == IPPROTO_TCP) tcp_input(src, payload, plen);
 }
 
 static void arp_input(const uint8_t *p, uint32_t len) {
@@ -368,6 +405,324 @@ static void arp_input(const uint8_t *p, uint32_t len) {
         arp_send(ARP_REPLY, a->sha, spa);        /* "I am LOCAL_IP" */
 }
 
+/* ---- TCP ----
+ *
+ * A compact state machine: 3-way handshake (active + passive open), in-order
+ * data transfer with cumulative ACKs and a receive-window byte ring, and FIN
+ * close. Because the only transport we exercise is loopback (and a low-loss
+ * SLIRP link), there is no retransmission queue, RTT estimation, or out-of-order
+ * reassembly — segments are assumed to arrive in order. A real WAN TCP would add
+ * those; this is enough to prove the protocol and back the socket layer. */
+
+typedef enum {
+    T_CLOSED, T_LISTEN, T_SYN_SENT, T_SYN_RCVD, T_ESTABLISHED,
+    T_FIN_WAIT_1, T_FIN_WAIT_2, T_CLOSE_WAIT, T_CLOSING, T_LAST_ACK, T_TIME_WAIT
+} tcp_state_t;
+
+#define TCP_PCB_N   32
+#define TCP_RXBUF   8192
+#define TCP_MSS     1460
+#define TCP_ACCEPTQ 8
+
+typedef struct tcp_pcb {
+    int          used;
+    tcp_state_t  state;
+    uint16_t     local_port, remote_port;
+    uint32_t     local_ip, remote_ip;
+    uint32_t     snd_una, snd_nxt, iss;
+    uint32_t     rcv_nxt;
+    uint16_t     snd_wnd;
+    uint8_t      rxbuf[TCP_RXBUF];
+    uint32_t     rxhead, rxtail;              /* byte ring (head=producer) */
+    int          peer_fin;                    /* received a FIN (EOF) */
+    int          reset;                       /* connection reset */
+    struct tcp_pcb *listener;                 /* parent, for SYN_RCVD children */
+    struct tcp_pcb *acceptq[TCP_ACCEPTQ];     /* established, awaiting accept() */
+    int          aq_head, aq_tail;
+    wait_queue_t wq;                          /* any state change wakes waiters */
+} tcp_pcb_t;
+
+static tcp_pcb_t g_tcp[TCP_PCB_N];
+static uint32_t  g_iss = 0x10000;
+
+static inline int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
+static inline int seq_gt(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
+
+static uint16_t l4_checksum(uint8_t proto, uint32_t src, uint32_t dst,
+                            const uint8_t *seg, uint32_t len) {
+    uint32_t sum = 0;
+    sum += (src >> 16) & 0xFFFF; sum += src & 0xFFFF;
+    sum += (dst >> 16) & 0xFFFF; sum += dst & 0xFFFF;
+    sum += proto; sum += len;
+    for (uint32_t i = 0; i + 1 < len; i += 2) sum += (seg[i] << 8) | seg[i + 1];
+    if (len & 1) sum += seg[len - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+static uint32_t tcp_rx_used(tcp_pcb_t *t) { return (t->rxhead - t->rxtail) % TCP_RXBUF; }
+static uint32_t tcp_rx_free(tcp_pcb_t *t) { return TCP_RXBUF - 1 - tcp_rx_used(t); }
+
+static tcp_pcb_t *tcp_alloc(void) {
+    for (int i = 0; i < TCP_PCB_N; i++) {
+        if (g_tcp[i].used) continue;
+        kmemset(&g_tcp[i], 0, sizeof g_tcp[i]);
+        g_tcp[i].used = 1;
+        return &g_tcp[i];
+    }
+    return nullptr;
+}
+
+/* Emit a segment from `t` carrying `flags` and `len` payload bytes. */
+static void tcp_xmit(tcp_pcb_t *t, uint8_t flags, const uint8_t *data, uint32_t len) {
+    uint8_t seg[sizeof(tcp_hdr_t) + TCP_MSS];
+    if (len > TCP_MSS) len = TCP_MSS;
+    tcp_hdr_t *th = (tcp_hdr_t *)seg;
+    th->src_port = htons_(t->local_port);
+    th->dst_port = htons_(t->remote_port);
+    th->seq = htonl_(t->snd_nxt);
+    th->ack = htonl_(t->rcv_nxt);
+    th->data_off = (sizeof(tcp_hdr_t) / 4) << 4;
+    th->flags = flags;
+    uint32_t freew = tcp_rx_free(t);
+    th->window = htons_((uint16_t)(freew > 0xFFFF ? 0xFFFF : freew));
+    th->csum = 0; th->urg = 0;
+    if (len) kmemcpy(seg + sizeof(tcp_hdr_t), data, len);
+    uint32_t tot = sizeof(tcp_hdr_t) + len;
+    uint32_t sip = is_loopback(t->remote_ip) ? t->remote_ip : LOCAL_IP;
+    th->csum = htons_(l4_checksum(IPPROTO_TCP, sip, t->remote_ip, seg, tot));
+    ip_send(t->remote_ip, IPPROTO_TCP, seg, tot);
+    if (flags & (TCP_SYN | TCP_FIN)) t->snd_nxt += 1;   /* SYN/FIN take a seq */
+    t->snd_nxt += len;
+}
+
+/* Send a bare RST in response to a segment with no matching connection. */
+static void tcp_send_rst(uint32_t dst, uint16_t dport, uint16_t sport, uint32_t ack) {
+    tcp_hdr_t th;
+    kmemset(&th, 0, sizeof th);
+    th.src_port = htons_(dport); th.dst_port = htons_(sport);
+    th.seq = htonl_(0); th.ack = htonl_(ack);
+    th.data_off = (sizeof(tcp_hdr_t) / 4) << 4;
+    th.flags = TCP_RST | TCP_ACK;
+    uint32_t sip = is_loopback(dst) ? dst : LOCAL_IP;
+    th.csum = htons_(l4_checksum(IPPROTO_TCP, sip, dst, (uint8_t *)&th, sizeof th));
+    ip_send(dst, IPPROTO_TCP, &th, sizeof th);
+}
+
+/* ---- kernel-side TCP API (wrapped by socket syscalls in the next rung) ---- */
+
+static tcp_pcb_t *tcp_listen(uint16_t port) {
+    tcp_pcb_t *t = tcp_alloc();
+    if (!t) return nullptr;
+    t->state = T_LISTEN;
+    t->local_port = port;
+    t->local_ip = LOCAL_IP;
+    return t;
+}
+
+static tcp_pcb_t *tcp_accept(tcp_pcb_t *l) {
+    sched_lock();
+    while (l->used && l->aq_head == l->aq_tail)
+        wait_queue_sleep_locked(&l->wq);
+    tcp_pcb_t *c = nullptr;
+    if (l->aq_head != l->aq_tail) {
+        c = l->acceptq[l->aq_tail];
+        l->aq_tail = (l->aq_tail + 1) % TCP_ACCEPTQ;
+    }
+    sched_unlock();
+    return c;
+}
+
+static tcp_pcb_t *tcp_connect(uint32_t dip, uint16_t dport) {
+    tcp_pcb_t *t = tcp_alloc();
+    if (!t) return nullptr;
+    t->state = T_SYN_SENT;
+    t->local_ip = is_loopback(dip) ? dip : LOCAL_IP;
+    t->local_port = g_ephemeral++;
+    t->remote_ip = dip; t->remote_port = dport;
+    t->iss = g_iss; g_iss += 0x10000;
+    t->snd_una = t->snd_nxt = t->iss;
+    t->snd_wnd = 0xFFFF;
+    tcp_xmit(t, TCP_SYN, nullptr, 0);          /* SYN; snd_nxt -> iss+1 */
+    sched_lock();
+    while (t->used && t->state == T_SYN_SENT && !t->reset)
+        wait_queue_sleep_locked(&t->wq);
+    int ok = t->used && t->state == T_ESTABLISHED;
+    sched_unlock();
+    if (!ok) { t->used = 0; return nullptr; }
+    return t;
+}
+
+static int tcp_write(tcp_pcb_t *t, const uint8_t *data, uint32_t len) {
+    uint32_t sent = 0;
+    while (sent < len) {
+        sched_lock();
+        while (t->used && !t->reset &&
+               (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT)) {
+            uint32_t inflight = t->snd_nxt - t->snd_una;
+            uint32_t wnd = t->snd_wnd > inflight ? t->snd_wnd - inflight : 0;
+            if (wnd > 0) { sched_unlock(); goto cansend; }
+            wait_queue_sleep_locked(&t->wq);     /* wait for the window to open */
+        }
+        sched_unlock();
+        return sent ? (int)sent : -1;            /* connection no longer writable */
+    cansend:;
+        uint32_t inflight = t->snd_nxt - t->snd_una;
+        uint32_t wnd = t->snd_wnd > inflight ? t->snd_wnd - inflight : TCP_MSS;
+        uint32_t chunk = len - sent;
+        if (chunk > TCP_MSS) chunk = TCP_MSS;
+        if (chunk > wnd) chunk = wnd;
+        tcp_xmit(t, TCP_PSH | TCP_ACK, data + sent, chunk);
+        sent += chunk;
+    }
+    return (int)sent;
+}
+
+/* Blocking read of up to `len` bytes; returns 0 at EOF (peer FIN, buffer drained). */
+static int tcp_read(tcp_pcb_t *t, uint8_t *buf, uint32_t len) {
+    sched_lock();
+    while (t->used && tcp_rx_used(t) == 0 && !t->peer_fin && !t->reset)
+        wait_queue_sleep_locked(&t->wq);
+    if (!t->used || t->reset) { sched_unlock(); return -1; }
+    uint32_t avail = tcp_rx_used(t);
+    uint32_t n = avail < len ? avail : len;
+    for (uint32_t i = 0; i < n; i++) {
+        buf[i] = t->rxbuf[t->rxtail];
+        t->rxtail = (t->rxtail + 1) % TCP_RXBUF;
+    }
+    int eof = (n == 0 && t->peer_fin);
+    sched_unlock();
+    return eof ? 0 : (int)n;
+}
+
+static void tcp_close(tcp_pcb_t *t) {
+    sched_lock();
+    if (t->used && (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT)) {
+        int passive = (t->state == T_CLOSE_WAIT);
+        tcp_xmit(t, TCP_FIN | TCP_ACK, nullptr, 0);
+        t->state = passive ? T_LAST_ACK : T_FIN_WAIT_1;
+        sched_unlock();
+        return;
+    }
+    /* Not established (LISTEN, or already closing): drop it. */
+    t->used = 0;
+    sched_unlock();
+}
+
+/* ---- TCP receive path (worker context) ---- */
+
+static void tcp_deliver_data(tcp_pcb_t *t, uint32_t seq, const uint8_t *data, uint32_t plen) {
+    if (plen == 0 || seq != t->rcv_nxt) return;   /* in-order only */
+    uint32_t freew = tcp_rx_free(t);
+    uint32_t n = plen < freew ? plen : freew;
+    for (uint32_t i = 0; i < n; i++) {
+        t->rxbuf[t->rxhead] = data[i];
+        t->rxhead = (t->rxhead + 1) % TCP_RXBUF;
+    }
+    t->rcv_nxt += n;
+}
+
+static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
+    if (len < sizeof(tcp_hdr_t)) return;
+    const tcp_hdr_t *th = (const tcp_hdr_t *)p;
+    uint16_t sport = ntohs_(th->src_port), dport = ntohs_(th->dst_port);
+    uint32_t seq = ntohl_(th->seq), ack = ntohl_(th->ack);
+    uint8_t  flags = th->flags;
+    uint16_t win = ntohs_(th->window);
+    uint32_t doff = (th->data_off >> 4) * 4;
+    if (doff < sizeof(tcp_hdr_t) || doff > len) return;
+    const uint8_t *data = p + doff;
+    uint32_t plen = len - doff;
+
+    sched_lock();
+
+    /* Find an exact connection match, else a LISTEN on the port. */
+    tcp_pcb_t *t = nullptr, *lst = nullptr;
+    for (int i = 0; i < TCP_PCB_N; i++) {
+        tcp_pcb_t *c = &g_tcp[i];
+        if (!c->used) continue;
+        if (c->state != T_LISTEN && c->local_port == dport &&
+            c->remote_port == sport && c->remote_ip == src) { t = c; break; }
+        if (c->state == T_LISTEN && c->local_port == dport) lst = c;
+    }
+
+    if (!t) {
+        if (lst && (flags & TCP_SYN) && !(flags & TCP_ACK)) {
+            tcp_pcb_t *c = tcp_alloc();
+            if (c) {
+                c->state = T_SYN_RCVD;
+                c->local_ip = lst->local_ip; c->local_port = dport;
+                c->remote_ip = src; c->remote_port = sport;
+                c->iss = g_iss; g_iss += 0x10000;
+                c->snd_una = c->snd_nxt = c->iss;
+                c->rcv_nxt = seq + 1;             /* +1 for the SYN */
+                c->snd_wnd = win; c->listener = lst;
+                tcp_xmit(c, TCP_SYN | TCP_ACK, nullptr, 0);
+            }
+        } else if (!(flags & TCP_RST)) {
+            tcp_send_rst(src, dport, sport, seq + plen + ((flags & TCP_SYN) ? 1 : 0));
+        }
+        sched_unlock();
+        return;
+    }
+
+    if (flags & TCP_RST) { t->reset = 1; t->state = T_CLOSED; wait_queue_wake_all_locked(&t->wq); sched_unlock(); return; }
+
+    if (flags & TCP_ACK) {
+        if (seq_gt(ack, t->snd_una)) t->snd_una = ack;
+        t->snd_wnd = win;
+    }
+
+    switch (t->state) {
+    case T_SYN_SENT:
+        if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
+            t->rcv_nxt = seq + 1;
+            t->state = T_ESTABLISHED;
+            tcp_xmit(t, TCP_ACK, nullptr, 0);
+        }
+        break;
+    case T_SYN_RCVD:
+        if (flags & TCP_ACK) {
+            t->state = T_ESTABLISHED;
+            tcp_pcb_t *l = t->listener;           /* hand to accept() */
+            if (l) {
+                int next = (l->aq_head + 1) % TCP_ACCEPTQ;
+                if (next != l->aq_tail) { l->acceptq[l->aq_head] = t; l->aq_head = next; }
+                wait_queue_wake_all_locked(&l->wq);
+            }
+        }
+        break;
+    default: break;
+    }
+
+    if (t->state == T_ESTABLISHED || t->state == T_FIN_WAIT_1 || t->state == T_FIN_WAIT_2) {
+        if (plen && seq == t->rcv_nxt) {
+            tcp_deliver_data(t, seq, data, plen);
+            tcp_xmit(t, TCP_ACK, nullptr, 0);
+        }
+    }
+
+    /* FIN handling (only when it is the next in-order byte). */
+    if ((flags & TCP_FIN) && seq + plen == t->rcv_nxt) {
+        t->rcv_nxt += 1;
+        t->peer_fin = 1;
+        tcp_xmit(t, TCP_ACK, nullptr, 0);
+        if (t->state == T_ESTABLISHED)      t->state = T_CLOSE_WAIT;
+        else if (t->state == T_FIN_WAIT_1)  t->state = T_CLOSING;
+        else if (t->state == T_FIN_WAIT_2)  t->state = T_CLOSED;
+    }
+
+    /* Our FIN being ACKed. */
+    if ((flags & TCP_ACK) && t->snd_una == t->snd_nxt) {
+        if (t->state == T_FIN_WAIT_1)     t->state = t->peer_fin ? T_CLOSED : T_FIN_WAIT_2;
+        else if (t->state == T_CLOSING)   t->state = T_CLOSED;
+        else if (t->state == T_LAST_ACK)  { t->state = T_CLOSED; t->used = 0; }
+    }
+
+    wait_queue_wake_all_locked(&t->wq);
+    sched_unlock();
+}
+
 static void net_input(const uint8_t *frame, uint32_t len) {
     if (len < ETH_HDR_LEN) return;
     const eth_hdr_t *eh = (const eth_hdr_t *)frame;
@@ -382,6 +737,7 @@ static void net_input(const uint8_t *frame, uint32_t len) {
 
 static void net_worker(void *arg) {
     (void)arg;
+    g_net_worker = task_current();
     for (;;) {
         sched_lock();
         while (g_rxq_head == g_rxq_tail)
@@ -393,6 +749,15 @@ static void net_worker(void *arg) {
         g_rxq_tail = (g_rxq_tail + 1) % RXQ_N;
         sched_unlock();
         net_input(local, n);
+
+        /* Drain loopback frames this frame generated (and any they generate). */
+        while (g_loq_head != g_loq_tail) {
+            static uint8_t lb[ETH_FRAME_MAX];
+            uint16_t ln = g_loq[g_loq_tail].len;
+            kmemcpy(lb, g_loq[g_loq_tail].data, ln);
+            g_loq_tail = (g_loq_tail + 1) % LOQ_N;
+            net_input(lb, ln);
+        }
     }
 }
 
@@ -441,6 +806,42 @@ static void net_pinger(void *arg) {
         kprintf("[net] udp client got %d bytes: \"%s\"\n", m, buf);
     }
     udp_close(srv); udp_close(cli);
+
+    /* TCP over loopback: connect to the in-guest echo server, exchange, close. */
+    tcp_pcb_t *c = tcp_connect(LOCAL_IP, 8080);
+    if (c) {
+        tcp_write(c, (const uint8_t *)"hello-tcp", 9);
+        uint8_t buf[256];
+        int n = tcp_read(c, buf, sizeof buf);
+        buf[n > 0 ? n : 0] = '\0';
+        kprintf("[net] tcp client connected, got %d bytes: \"%s\"\n", n, buf);
+        tcp_close(c);
+    } else {
+        kprintf("[net] tcp connect to :8080 failed\n");
+    }
+}
+
+/* In-guest TCP echo server for the loopback self-test. */
+static void net_tcp_server(void *arg) {
+    (void)arg;
+    tcp_pcb_t *l = tcp_listen(8080);
+    if (!l) return;
+    for (;;) {
+        tcp_pcb_t *c = tcp_accept(l);
+        if (!c) continue;
+        uint8_t req[256];
+        int n = tcp_read(c, req, sizeof req);
+        if (n > 0) {
+            uint8_t rep[280];
+            const char *pfx = "echo: ";
+            int k = 0; while (pfx[k]) { rep[k] = (uint8_t)pfx[k]; k++; }
+            kmemcpy(rep + k, req, n);
+            tcp_write(c, rep, k + n);
+        }
+        uint8_t drain[64];
+        while (tcp_read(c, drain, sizeof drain) > 0) { }   /* read to EOF */
+        tcp_close(c);
+    }
 }
 
 void net_attach(net_device_t *dev) { g_dev = dev; g_up = 1; }
@@ -450,6 +851,7 @@ uint32_t net_local_ip(void) { return LOCAL_IP; }
 void net_init(void) {
     if (!virtio_net_init()) { kprintf("[net] no NIC; networking disabled\n"); return; }
     task_create("netd", net_worker, nullptr);
+    task_create("net-tcpd", net_tcp_server, nullptr);
     task_create("net-ping", net_pinger, nullptr);
     kprintf("[net] up: 10.0.2.15/24 gw 10.0.2.2\n");
 }
