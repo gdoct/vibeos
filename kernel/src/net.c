@@ -48,6 +48,10 @@ typedef struct {
     uint16_t csum, id, seq;
 } __attribute__((packed)) icmp_hdr_t;
 
+typedef struct {
+    uint16_t src_port, dst_port, len, csum;
+} __attribute__((packed)) udp_hdr_t;
+
 #define ARP_REQUEST 1
 #define ARP_REPLY   2
 #define ICMP_ECHO_REQUEST 8
@@ -161,11 +165,14 @@ static uint16_t ip_checksum(const void *data, uint32_t len) {
 
 /* Send an IPv4 packet (payload already in network order). For a destination off
    our subnet, route via the gateway. */
-static int ip_send(uint32_t dst, uint8_t proto, const void *payload, uint32_t plen) {
-    uint32_t nexthop = ((dst & NETMASK) == (LOCAL_IP & NETMASK)) ? dst : GATEWAY_IP;
-    uint8_t mac[6];
-    if (!arp_resolve(nexthop, mac)) return -1;
+/* True for our own address and 127.0.0.0/8 — these are looped back into the
+   stack instead of hitting the wire, so in-guest clients/servers can talk over
+   the full protocol path with no external network. */
+static int is_loopback(uint32_t ip) {
+    return ip == LOCAL_IP || (ip >> 24) == 127;
+}
 
+static int ip_send(uint32_t dst, uint8_t proto, const void *payload, uint32_t plen) {
     uint8_t pkt[ETH_FRAME_MAX - ETH_HDR_LEN];
     ip_hdr_t *ip = (ip_hdr_t *)pkt;
     uint32_t total = sizeof(ip_hdr_t) + plen;
@@ -174,9 +181,23 @@ static int ip_send(uint32_t dst, uint8_t proto, const void *payload, uint32_t pl
     ip->total_len = htons_((uint16_t)total);
     ip->id = htons_(0); ip->frag = htons_(0x4000);    /* don't fragment */
     ip->ttl = 64; ip->proto = proto; ip->csum = 0;
-    ip->src = htonl_(LOCAL_IP); ip->dst = htonl_(dst);
+    ip->src = htonl_(is_loopback(dst) ? dst : LOCAL_IP); ip->dst = htonl_(dst);
     ip->csum = htons_(ip_checksum(ip, sizeof(ip_hdr_t)));
     kmemcpy(pkt + sizeof(ip_hdr_t), payload, plen);
+
+    if (is_loopback(dst)) {                            /* loop back through the stack */
+        uint8_t frame[ETH_FRAME_MAX];
+        eth_hdr_t *eh = (eth_hdr_t *)frame;
+        kmemset(eh->dst, 0, 6); kmemset(eh->src, 0, 6);
+        eh->type = htons_(ETHERTYPE_IP);
+        kmemcpy(frame + ETH_HDR_LEN, pkt, total);
+        net_rx(frame, ETH_HDR_LEN + total);
+        return 0;
+    }
+
+    uint32_t nexthop = ((dst & NETMASK) == (LOCAL_IP & NETMASK)) ? dst : GATEWAY_IP;
+    uint8_t mac[6];
+    if (!arp_resolve(nexthop, mac)) return -1;
     eth_send(mac, ETHERTYPE_IP, pkt, total);
     return 0;
 }
@@ -206,6 +227,114 @@ static void icmp_input(uint32_t src, const uint8_t *p, uint32_t len) {
     }
 }
 
+/* ---- UDP ---- */
+
+#define UDP_PCB_N   16
+#define UDP_RXN     8
+#define UDP_MAXDATA 1472
+typedef struct {
+    uint32_t src_ip; uint16_t src_port; uint16_t len;
+    uint8_t  data[UDP_MAXDATA];
+} udp_dgram_t;
+typedef struct {
+    int          used;
+    uint16_t     local_port;
+    udp_dgram_t  q[UDP_RXN];
+    uint32_t     qhead, qtail;
+    wait_queue_t wq;
+} udp_pcb_t;
+static udp_pcb_t g_udp[UDP_PCB_N];
+static uint16_t  g_ephemeral = 49152;
+
+static uint16_t udp_checksum(uint32_t src, uint32_t dst, const uint8_t *udp, uint32_t len) {
+    uint32_t sum = 0;
+    sum += (src >> 16) & 0xFFFF; sum += src & 0xFFFF;
+    sum += (dst >> 16) & 0xFFFF; sum += dst & 0xFFFF;
+    sum += IPPROTO_UDP; sum += len;
+    for (uint32_t i = 0; i + 1 < len; i += 2) sum += (udp[i] << 8) | udp[i + 1];
+    if (len & 1) sum += udp[len - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    uint16_t c = (uint16_t)~sum;
+    return c ? c : 0xFFFF;       /* 0 means "no checksum"; send all-ones instead */
+}
+
+static udp_pcb_t *udp_bind(uint16_t port) {
+    if (port != 0) {
+        for (int i = 0; i < UDP_PCB_N; i++)
+            if (g_udp[i].used && g_udp[i].local_port == port) return nullptr;  /* in use */
+    }
+    for (int i = 0; i < UDP_PCB_N; i++) {
+        if (g_udp[i].used) continue;
+        kmemset(&g_udp[i], 0, sizeof g_udp[i]);
+        g_udp[i].used = 1;
+        g_udp[i].local_port = port ? port : g_ephemeral++;
+        return &g_udp[i];
+    }
+    return nullptr;
+}
+
+static void udp_close(udp_pcb_t *p) { if (p) p->used = 0; }
+
+static int udp_sendto(udp_pcb_t *p, uint32_t dip, uint16_t dport,
+                      const void *data, uint32_t len) {
+    if (len > UDP_MAXDATA) return -1;
+    uint8_t seg[sizeof(udp_hdr_t) + UDP_MAXDATA];
+    udp_hdr_t *uh = (udp_hdr_t *)seg;
+    uint32_t tot = sizeof(udp_hdr_t) + len;
+    uh->src_port = htons_(p->local_port);
+    uh->dst_port = htons_(dport);
+    uh->len = htons_((uint16_t)tot);
+    uh->csum = 0;
+    kmemcpy(seg + sizeof(udp_hdr_t), data, len);
+    uint32_t sip = is_loopback(dip) ? dip : LOCAL_IP;
+    uh->csum = htons_(udp_checksum(sip, dip, seg, tot));
+    return ip_send(dip, IPPROTO_UDP, seg, tot);
+}
+
+/* Blocking receive of one datagram. Returns payload length, fills src ip/port. */
+static int udp_recvfrom(udp_pcb_t *p, void *buf, uint32_t maxlen,
+                        uint32_t *src_ip, uint16_t *src_port) {
+    sched_lock();
+    while (p->used && p->qhead == p->qtail)
+        wait_queue_sleep_locked(&p->wq);
+    if (!p->used) { sched_unlock(); return -1; }
+    udp_dgram_t *d = &p->q[p->qtail];
+    uint32_t n = d->len; if (n > maxlen) n = maxlen;
+    kmemcpy(buf, d->data, n);
+    if (src_ip)   *src_ip = d->src_ip;
+    if (src_port) *src_port = d->src_port;
+    p->qtail = (p->qtail + 1) % UDP_RXN;
+    sched_unlock();
+    return (int)n;
+}
+
+static void udp_input(uint32_t src, const uint8_t *p, uint32_t len) {
+    if (len < sizeof(udp_hdr_t)) return;
+    const udp_hdr_t *uh = (const udp_hdr_t *)p;
+    uint16_t dport = ntohs_(uh->dst_port);
+    uint16_t sport = ntohs_(uh->src_port);
+    uint32_t dlen = ntohs_(uh->len);
+    if (dlen < sizeof(udp_hdr_t) || dlen > len) dlen = len;
+    uint32_t plen = dlen - sizeof(udp_hdr_t);
+
+    sched_lock();
+    for (int i = 0; i < UDP_PCB_N; i++) {
+        udp_pcb_t *pcb = &g_udp[i];
+        if (!pcb->used || pcb->local_port != dport) continue;
+        uint32_t next = (pcb->qhead + 1) % UDP_RXN;
+        if (next != pcb->qtail) {                     /* drop if full */
+            udp_dgram_t *d = &pcb->q[pcb->qhead];
+            d->src_ip = src; d->src_port = sport;
+            d->len = (uint16_t)(plen > UDP_MAXDATA ? UDP_MAXDATA : plen);
+            kmemcpy(d->data, p + sizeof(udp_hdr_t), d->len);
+            pcb->qhead = next;
+            wait_queue_wake_all_locked(&pcb->wq);
+        }
+        break;
+    }
+    sched_unlock();
+}
+
 static void ip_input(const uint8_t *p, uint32_t len) {
     if (len < sizeof(ip_hdr_t)) return;
     const ip_hdr_t *ip = (const ip_hdr_t *)p;
@@ -213,14 +342,15 @@ static void ip_input(const uint8_t *p, uint32_t len) {
     uint32_t ihl = (ip->ver_ihl & 0xF) * 4;
     if (ihl < sizeof(ip_hdr_t) || ihl > len) return;
     uint32_t dst = ntohl_(ip->dst);
-    if (dst != LOCAL_IP && dst != 0xFFFFFFFFu) return;   /* not for us */
+    if (dst != LOCAL_IP && dst != 0xFFFFFFFFu && !is_loopback(dst)) return;   /* not for us */
     uint32_t src = ntohl_(ip->src);
     uint16_t total = ntohs_(ip->total_len);
     if (total > len) total = (uint16_t)len;
     const uint8_t *payload = p + ihl;
     uint32_t plen = total - ihl;
-    if (ip->proto == IPPROTO_ICMP) icmp_input(src, payload, plen);
-    /* UDP/TCP demux added in later rungs. */
+    if (ip->proto == IPPROTO_ICMP)     icmp_input(src, payload, plen);
+    else if (ip->proto == IPPROTO_UDP) udp_input(src, payload, plen);
+    /* TCP demux added in the next rung. */
 }
 
 static void arp_input(const uint8_t *p, uint32_t len) {
@@ -296,6 +426,21 @@ static void net_pinger(void *arg) {
         else     kprintf("[net] ping 10.0.2.2: timeout (seq %d)\n", i + 1);
         ksleep_ms(200);
     }
+
+    /* UDP over loopback: client -> server request, server -> client reply. */
+    udp_pcb_t *srv = udp_bind(7777);
+    udp_pcb_t *cli = udp_bind(0);
+    if (srv && cli) {
+        char buf[64]; uint32_t sip; uint16_t sport;
+        udp_sendto(cli, LOCAL_IP, 7777, "ping-udp", 8);
+        int n = udp_recvfrom(srv, buf, sizeof buf, &sip, &sport);
+        kprintf("[net] udp server got %d bytes from :%u\n", n, sport);
+        udp_sendto(srv, sip, sport, "pong-udp", 8);
+        int m = udp_recvfrom(cli, buf, sizeof buf, &sip, &sport);
+        buf[m > 0 ? m : 0] = '\0';
+        kprintf("[net] udp client got %d bytes: \"%s\"\n", m, buf);
+    }
+    udp_close(srv); udp_close(cli);
 }
 
 void net_attach(net_device_t *dev) { g_dev = dev; g_up = 1; }
