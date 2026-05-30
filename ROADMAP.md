@@ -107,6 +107,13 @@ per-CPU queues with explicit stealing once contention matters.
 clean image per build); root-cause before relying on crash persistence. Other
 backlog: ACPI poweroff; FS journaling/`rename`/permissions.
 
+## Additional features in scope, high level
+** a /config directory with a simple format (yaml) for build and runtime configuration.
+** kernel services for reading, parsing, and reloading these config files
+** A more fully-featured init system with a simple service definition format, dependency management, and logging.
+** Simple windowing system for the framebuffer (in /gui )
+** USB (EHCI/XHCI) + input drivers (keyboard/mouse) for a graphical UI.
+** Audio subsystem + virtio-sound.
 ---
 
 ## How it boots
