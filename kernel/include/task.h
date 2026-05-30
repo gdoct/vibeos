@@ -119,6 +119,16 @@ void    wait_queue_sleep(wait_queue_t *wq);
 void    wait_queue_wake_one(wait_queue_t *wq);
 void    wait_queue_wake_all(wait_queue_t *wq);
 
+/* The scheduler lock, and wait-queue ops that assume it is already held. A
+   device whose completion IRQ can fire on another CPU must check its condition
+   and sleep under sched_lock (and wake under it) so the check/sleep/wake are
+   serialized — see virtio_blk and tty (ROADMAP §2). */
+void    sched_lock(void);
+void    sched_unlock(void);
+void    wait_queue_sleep_locked(wait_queue_t *wq);
+void    wait_queue_wake_one_locked(wait_queue_t *wq);
+void    wait_queue_wake_all_locked(wait_queue_t *wq);
+
 #ifdef __cplusplus
 }
 #endif

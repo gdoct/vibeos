@@ -317,6 +317,16 @@ static void icr_send(uint8_t dest, uint32_t low) {
 void apic_send_init(uint8_t dest)              { icr_send(dest, 0x00004500u); }
 void apic_send_sipi(uint8_t dest, uint8_t vec) { icr_send(dest, 0x00004600u | vec); }
 
+/* Fixed-delivery, edge-triggered IPI to one CPU. */
+void apic_send_ipi(uint8_t dest, uint8_t vector) { icr_send(dest, (uint32_t)vector); }
+
+/* Fixed IPI to all CPUs except the sender (destination shorthand 0b11). */
+void apic_send_ipi_others(uint8_t vector) {
+    lapic_write(LAPIC_ICR_HI, 0);
+    lapic_write(LAPIC_ICR_LO, (3u << 18) | (uint32_t)vector);
+    while (lapic_read(LAPIC_ICR_LO) & ICR_DELIVERY_PENDING) __asm__ volatile("pause");
+}
+
 /* Software-enable the calling CPU's local APIC (an AP does this for itself;
    the BSP already did it in apic_init). */
 void apic_enable_local(void) {

@@ -5,6 +5,8 @@
 #include "timer.h"
 #include "idt.h"
 #include "task.h"
+#include "percpu.h"
+#include "usermode.h"
 #include "smp.h"
 
 /*
@@ -23,10 +25,53 @@ extern "C" uint8_t ap_tramp_cr3[], ap_tramp_stack[], ap_tramp_entry[];
 extern "C" uint8_t boot_pml4[];          /* start.S bootstrap PML4 (phys == its VMA) */
 extern "C" void gdt_init(void);
 
+extern "C" void tlb_shootdown_isr(void);
+
 static struct cpu g_cpus[SMP_MAX_CPUS];
 static volatile int g_online = 1;        /* BSP is online from the start */
 
 int smp_cpu_count(void) { return g_online; }
+
+/* ---- TLB shootdown (ROADMAP §2) ----
+ *
+ * Reload-CR3-on-context-switch already flushes a migrating (single-threaded)
+ * address space's stale entries, and we use no global pages or PCIDs, so the
+ * unmap hot paths don't currently need a shootdown. This is the cross-CPU
+ * primitive for when they will (shared/threaded address spaces) — and the same
+ * IPI machinery that §3 uses to poke a task running on another core. The sender
+ * must have interrupts enabled while it waits for acks, so callers invoke it
+ * from ordinary kernel context, never from inside a syscall (IF=0) or under
+ * sched_lock. */
+static volatile int g_tlb_acks = 0;
+
+static inline void flush_local_tlb(void) {
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+}
+
+extern "C" void tlb_shootdown_handler(void) {
+    flush_local_tlb();
+    __atomic_fetch_add(&g_tlb_acks, 1, __ATOMIC_ACQ_REL);
+    lapic_eoi();
+}
+
+void tlb_shootdown_all(void) {
+    flush_local_tlb();                       /* always flush the caller's own TLB */
+    int others = g_online - 1;
+    if (others <= 0 || !apic_enabled()) return;
+    __atomic_store_n(&g_tlb_acks, 0, __ATOMIC_RELEASE);
+    apic_send_ipi_others(APIC_TLB_VECTOR);
+    while (__atomic_load_n(&g_tlb_acks, __ATOMIC_ACQUIRE) < others)
+        __asm__ volatile("pause");
+}
+
+/* Boot-time check that the IPI path works: every other online CPU should ack a
+   broadcast shootdown. Runs on the BSP with interrupts enabled (after smp_init,
+   before the scheduler loop), where the APs are idling in scheduler(). */
+void smp_ipi_selftest(void) {
+    if (g_online <= 1) return;
+    tlb_shootdown_all();
+    kprintf("[smp] TLB-shootdown IPI: %d CPU(s) acked\n", g_online - 1);
+}
 
 /* Index of the calling CPU (0 = BSP). Before the LAPIC is up only the BSP
    runs, so return 0; afterwards map the local APIC id to its slot. */
@@ -66,10 +111,14 @@ extern "C" void ap_entry(void) {
     idt_load();              /* shared IDT */
     apic_enable_local();     /* this CPU's LAPIC */
 
-    apic_start_local_timer();    /* this CPU's preemption tick */
-
     uint32_t aid = apic_local_id();
     int ci = cpu_index_for_apic(aid);
+    percpu_init(ci >= 0 ? ci : 0);  /* this CPU's TSS + GS base (after gdt_init) */
+    syscall_init();              /* EFER.SCE + STAR/LSTAR/SFMASK on this CPU, so
+                                    user tasks can `syscall` here too (ROADMAP §2) */
+
+    apic_start_local_timer();    /* this CPU's preemption tick */
+
     kprintf("[smp] CPU %d (apic %u) online\n", ci, aid);
     if (ci >= 0) __atomic_store_n(&g_cpus[ci].online, 1, __ATOMIC_RELEASE);
 
@@ -81,6 +130,10 @@ void smp_init(void) {
     uint8_t bsp = apic_bsp_id();
     kprintf("[smp] MADT reports %d CPU(s); BSP apic=%u\n", n, bsp);
     if (n > SMP_MAX_CPUS) n = SMP_MAX_CPUS;
+
+    /* Wire the TLB-shootdown IPI into the shared IDT before the APs join (they
+       idt_load the same table). */
+    idt_set_vector(APIC_TLB_VECTOR, (void *)tlb_shootdown_isr);
 
     g_cpus[0].index = 0; g_cpus[0].apic_id = bsp; g_cpus[0].online = 1;
     if (n <= 1) return;

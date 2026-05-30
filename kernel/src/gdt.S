@@ -33,8 +33,17 @@ gdt_start:
     .quad 0x00AFFA000000FFFF        /* 0x20 user CS (DPL 3, L=1) */
     .globl  gdt_tss
 gdt_tss:
-    .quad 0x0000000000000000        /* 0x28 TSS low  (filled by tss_init) */
-    .quad 0x0000000000000000        /* 0x30 TSS high */
+    /* One 16-byte TSS descriptor per CPU (filled in by percpu_init). CPU i uses
+       selector 0x28 + i*0x10 so every core can ltr its own TSS from the shared
+       GDT — this is what lets user tasks run on all cores (ROADMAP §2). */
+    .quad 0, 0                       /* 0x28 CPU 0 */
+    .quad 0, 0                       /* 0x38 CPU 1 */
+    .quad 0, 0                       /* 0x48 CPU 2 */
+    .quad 0, 0                       /* 0x58 CPU 3 */
+    .quad 0, 0                       /* 0x68 CPU 4 */
+    .quad 0, 0                       /* 0x78 CPU 5 */
+    .quad 0, 0                       /* 0x88 CPU 6 */
+    .quad 0, 0                       /* 0x98 CPU 7 */
 gdt_end:
 
     .balign 8

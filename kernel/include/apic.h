@@ -37,10 +37,16 @@ void     apic_send_sipi(uint8_t dest_apic_id, uint8_t vector);
 void     apic_enable_local(void);     /* AP software-enables its own LAPIC */
 void     apic_start_local_timer(void);/* start this CPU's periodic LAPIC timer */
 
+/* Fixed-delivery IPIs (ROADMAP §2): one to a specific APIC id, or a broadcast to
+   every CPU except the sender (ICR "all excluding self" shorthand). */
+void     apic_send_ipi(uint8_t dest_apic_id, uint8_t vector);
+void     apic_send_ipi_others(uint8_t vector);
+
 /* Vector the LAPIC timer and routed PCI INTx land on (both dispatched
    through irq_common, so they reuse irq_register: irq 0 and irq 11). */
 #define APIC_TIMER_VECTOR   0x20
 #define APIC_PCI_VECTOR     0x2B
+#define APIC_TLB_VECTOR     0xFD   /* TLB-shootdown IPI (ROADMAP §2) */
 #define APIC_SPURIOUS_VECTOR 0xFF
 
 #ifdef __cplusplus

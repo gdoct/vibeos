@@ -30,21 +30,15 @@ typedef struct syscall_frame {
 void fork_child_return(void);
 
 /*
- * Ring-3 support (ROADMAP §3, Phase 1).
+ * Ring-3 support (ROADMAP §3, Phase 1; per-CPU since §2).
  *
- * tss_init    — install the TSS descriptor into the GDT and ltr it. Must run
- *               after gdt_init. The TSS exists so that an interrupt taken in
- *               ring 3 switches to a known kernel stack (TSS.rsp0).
- * tss_set_rsp0 — point rsp0 at the kernel stack the CPU should use on the next
- *               ring 3 -> ring 0 transition. The scheduler calls this on every
- *               switch so it tracks the running task's kernel stack.
+ * The per-CPU TSS (rsp0) and GS base live in percpu.c now — see percpu_init /
+ * percpu_set_kernel_stack. This header keeps the syscall + ring-3 launch API.
+ *
  * syscall_init — enable SYSCALL/SYSRET and program STAR/LSTAR/SFMASK.
  * enter_user   — drop to ring 3 at `entry` with stack `user_rsp` (does not
- *               return). Also latches the kernel stack used for syscalls.
+ *               return). swapgs's so the next syscall finds the kernel GS base.
  */
-void tss_init(void);
-void tss_set_rsp0(uint64_t rsp0);
-
 void syscall_init(void);
 
 /* Reserve the user heap window for brk(). Called by the ELF loader once it
@@ -63,11 +57,6 @@ int user_load_path(struct vmspace *vm, const char *path,
 
 __attribute__((noreturn))
 void enter_user(uint64_t entry, uint64_t user_rsp);
-
-/* Kernel stack the syscall entry stub switches to (top, grows down). Kept in
-   sync with tss.rsp0 by the scheduler; on a UP kernel a global is enough
-   (SMP §1 will move this to per-CPU GS, see syscall.S). */
-extern uint64_t g_kernel_rsp;
 
 #ifdef __cplusplus
 }

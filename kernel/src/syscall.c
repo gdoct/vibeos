@@ -9,6 +9,7 @@
 #include "timer.h"
 #include "tty.h"
 #include "usermode.h"
+#include "smp.h"
 
 /*
  * System calls (ROADMAP §3 + §4 Linux ABI).
@@ -28,10 +29,9 @@
  *   - fds 0/1/2 are hardwired to the console (a real fd table is §4 rung 2).
  */
 
-/* Stack the syscall stub switches to, and its scratch for the user rsp.
-   g_kernel_rsp is declared in usermode.h; both are touched from usermode.S. */
-extern "C" uint64_t g_kernel_rsp = 0;
-extern "C" uint64_t g_user_rsp   = 0;
+/* The kernel stack the syscall stub switches to and its user-rsp scratch now
+   live in the per-CPU block (percpu.h), reached via %gs after swapgs in
+   usermode.S — so user tasks run on any core (ROADMAP §2). */
 
 extern "C" void syscall_entry(void);
 
@@ -793,6 +793,15 @@ extern "C" uint64_t syscall_dispatch(syscall_frame_t *f) {
                                          (int)f->rdx, (void *)f->r10);  /* wait4 */
     case 158: return (uint64_t)sys_arch_prctl((int)f->rdi, f->rsi);  /* arch_prctl */
     case 218: return (uint64_t)task_current()->id;             /* set_tid_address -> tid */
+    case 309: {                                                /* getcpu */
+        unsigned cpu = (unsigned)smp_cpu_index();
+        unsigned node = 0;
+        if (f->rdi && copy_to_user(cur_vm(), f->rdi, &cpu, sizeof cpu) < 0)
+            return (uint64_t)(int64_t)-EFAULT_;
+        if (f->rsi && copy_to_user(cur_vm(), f->rsi, &node, sizeof node) < 0)
+            return (uint64_t)(int64_t)-EFAULT_;
+        return 0;
+    }
     case 60:                                                   /* exit */
     case 231: sys_exit((int)f->rdi);                           /* exit_group */
     default:

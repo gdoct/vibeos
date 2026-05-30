@@ -81,12 +81,20 @@ isr_common:
     pushq   %r14
     pushq   %r15
 
+    /* If the trap came from ring 3, swapgs to this CPU's kernel GS base so the
+       kernel runs with GS == percpu (ROADMAP §2). Saved CS sits at 18*8 above
+       the last-pushed reg (r15). */
+    testb   $3, 144(%rsp)
+    jz      1f
+    swapgs
+1:
     cld
     movq    %rsp, %rdi          /* arg0: regs * */
     call    exception_handler
 
-    /* Unreachable in practice — exception_handler halts. Symmetric
-       restore for paranoia / future use. */
+    /* exception_handler returns for a repaired COW fault (retry via iretq); it
+       does not return for a fatal kernel fault (panic) or a killed user task
+       (reschedules). */
     popq    %r15
     popq    %r14
     popq    %r13
@@ -102,6 +110,10 @@ isr_common:
     popq    %rcx
     popq    %rbx
     popq    %rax
+    testb   $3, 24(%rsp)        /* saved CS (vector+errcode+rip below it) */
+    jz      1f
+    swapgs                      /* returning to ring 3: restore user GS */
+1:
     addq    $16, %rsp           /* pop vector + error code */
     iretq
     .size   isr_common, . - isr_common
@@ -154,6 +166,10 @@ irq_common:
     pushq   %r14
     pushq   %r15
 
+    testb   $3, 144(%rsp)   /* from ring 3? -> kernel GS base */
+    jz      1f
+    swapgs
+1:
     cld
     movq    %rsp, %rdi
     call    irq_dispatch
@@ -173,6 +189,10 @@ irq_common:
     popq    %rcx
     popq    %rbx
     popq    %rax
+    testb   $3, 24(%rsp)    /* returning to ring 3? -> restore user GS */
+    jz      1f
+    swapgs
+1:
     addq    $16, %rsp       /* pop vector + fake errcode */
     iretq
     .size   irq_common, . - irq_common
@@ -184,6 +204,35 @@ irq_common:
 isr_spurious:
     iretq
     .size   isr_spurious, . - isr_spurious
+
+    /* TLB-shootdown IPI (vector APIC_TLB_VECTOR). The C handler only reloads CR3,
+       acks, and EOIs — it touches no %gs state — so no swapgs even if this
+       interrupts ring 3. Save the caller-clobbered regs the C ABI may trash. */
+    .globl  tlb_shootdown_isr
+    .type   tlb_shootdown_isr, @function
+tlb_shootdown_isr:
+    pushq   %rax
+    pushq   %rcx
+    pushq   %rdx
+    pushq   %rsi
+    pushq   %rdi
+    pushq   %r8
+    pushq   %r9
+    pushq   %r10
+    pushq   %r11
+    cld
+    call    tlb_shootdown_handler
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rax
+    iretq
+    .size   tlb_shootdown_isr, . - tlb_shootdown_isr
 
     /* Table of stub entry points, used by idt_init() in C. */
     .section .rodata

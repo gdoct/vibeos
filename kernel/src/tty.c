@@ -32,14 +32,19 @@ static void cooked_push(char c) {
     }
 }
 
-/* Commit the in-progress line (with a trailing newline) and wake readers. */
+/* Commit the in-progress line (with a trailing newline) and wake readers. The
+   cooked ring + wake are done under sched_lock so a reader on another CPU sees
+   the bytes and the wake atomically w.r.t. its own check (ROADMAP §2). tty_poll
+   only runs on the BSP, so g_line itself needs no lock. */
 static void commit_line(void) {
     serial_putc('\r');
     serial_putc('\n');
+    sched_lock();
     for (uint32_t i = 0; i < g_line_len; i++) cooked_push(g_line[i]);
     cooked_push('\n');
+    wait_queue_wake_all_locked(&g_tty_wq);
+    sched_unlock();
     g_line_len = 0;
-    wait_queue_wake_all(&g_tty_wq);
 }
 
 static void input_char(char c) {
@@ -78,9 +83,12 @@ void tty_poll(void) {
 
 int tty_read(char *buf, uint32_t n) {
     if (n == 0) return 0;
-    uint64_t f = irq_save();
+    /* Check emptiness and sleep under sched_lock, paired with commit_line's
+       push+wake, so a commit on the BSP can't be missed by a reader on another
+       core (ROADMAP §2). */
+    sched_lock();
     while (g_head == g_tail)             /* block until a line is committed */
-        wait_queue_sleep(&g_tty_wq);     /* returns with IF still off */
+        wait_queue_sleep_locked(&g_tty_wq);
     uint32_t i = 0;
     while (i < n && g_head != g_tail) {
         char c = g_cooked[g_tail];
@@ -88,6 +96,6 @@ int tty_read(char *buf, uint32_t n) {
         buf[i++] = c;
         if (c == '\n') break;            /* canonical: one line per read */
     }
-    irq_restore(f);
+    sched_unlock();
     return (int)i;
 }

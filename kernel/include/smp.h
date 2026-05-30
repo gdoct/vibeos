@@ -34,6 +34,14 @@ int  smp_cpu_index(void);
 /* Per-CPU LAPIC timer start for an AP (reuses the BSP's calibrated rate). */
 void ap_entry(void);
 
+/* Flush the TLB on every CPU (this one plus an IPI to the rest, waiting for
+   acks). Call from ordinary kernel context with interrupts enabled — never from
+   a syscall (IF=0) or under sched_lock, or the ack-wait can deadlock. */
+void tlb_shootdown_all(void);
+
+/* Boot-time IPI sanity check (BSP, interrupts enabled). */
+void smp_ipi_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif

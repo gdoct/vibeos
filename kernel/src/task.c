@@ -5,6 +5,7 @@
 #include "task.h"
 #include "file.h"
 #include "usermode.h"
+#include "percpu.h"
 #include "timer.h"
 #include "smp.h"
 
@@ -67,7 +68,10 @@ static void pop_off(void) {
     int c = smp_cpu_index();
     if (--g_ncli[c] == 0 && g_intena[c]) __asm__ volatile("sti");
 }
-static void sched_lock(void) {
+/* Exported (§2): drivers whose completion IRQ may fire on a *different* CPU than
+   the sleeper must check their condition and sleep under this lock, and wake
+   under it too — local irq_save no longer excludes a remote waker. */
+extern "C" void sched_lock(void) {
     push_off();
     while (__atomic_exchange_n(&sched_locked, 1u, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
 }
@@ -195,19 +199,23 @@ task_t *task_fork(const char *name, struct vmspace *vm,
 static void apply_task_mm(task_t *t) {
     uint64_t cr3 = t->vm ? t->vm->pml4_phys : paging_kernel_pml4();
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
-    if (t->vm) {                 /* user task (BSP-pinned): set the kernel stack */
-        tss_set_rsp0(t->stack_top);
-        g_kernel_rsp = t->stack_top;
-        wrmsr(MSR_FS_BASE, t->fs_base);   /* restore this task's TLS base */
-    }
+    /* Always latch this CPU's kernel stack (syscall entry %gs:kernel_rsp + the
+       TSS rsp0 a ring-3 trap lands on). Done for every task, not just ones with
+       a vm: a task can become a user task after it is first scheduled (init
+       creates its address space inside init_launch), and on first syscall there
+       may have been no reschedule to set it. Harmless for kernel threads. */
+    percpu_set_kernel_stack(t->stack_top);
+    if (t->vm) wrmsr(MSR_FS_BASE, t->fs_base);   /* restore this task's TLS base */
 }
 
-/* Pick a READY task. User tasks (vm != NULL) only run on the BSP for now. */
+/* Pick a READY task. Since §2 user tasks run on any core (per-CPU TSS/GS), so
+   any CPU may pick any ready task — the single global run queue gives implicit
+   work-stealing (an idle core pulls whatever is runnable). */
 static task_t *pick_ready(int cpu) {
+    (void)cpu;
     for (int i = 1; i < MAX_TASKS; i++) {
         task_t *t = &g_tasks[i];
         if (t->state != TASK_READY) continue;
-        if (t->vm && cpu != 0) continue;
         return t;
     }
     return nullptr;
@@ -333,14 +341,20 @@ int task_wait(int *status) {
 
 /* ---- wait queues (public; acquire the lock) ---- */
 
-void wait_queue_sleep(wait_queue_t *wq)    { sched_lock(); wq_sleep_locked(wq); sched_unlock(); }
-void wait_queue_wake_one(wait_queue_t *wq) {
-    sched_lock();
+static void wq_wake_one_locked(wait_queue_t *wq) {
     task_t *t = wq->head;
     if (t) { wq->head = t->wq_next; if (!wq->head) wq->tail = nullptr; t->wq_next = nullptr; make_ready_locked(t); }
-    sched_unlock();
 }
+
+void wait_queue_sleep(wait_queue_t *wq)    { sched_lock(); wq_sleep_locked(wq); sched_unlock(); }
+void wait_queue_wake_one(wait_queue_t *wq) { sched_lock(); wq_wake_one_locked(wq); sched_unlock(); }
 void wait_queue_wake_all(wait_queue_t *wq) { sched_lock(); wq_wake_all_locked(wq); sched_unlock(); }
+
+/* Locked variants — caller already holds sched_lock. The condition check, the
+   sleep, and the wake share the lock, closing the cross-CPU lost-wakeup race. */
+extern "C" void wait_queue_sleep_locked(wait_queue_t *wq)    { wq_sleep_locked(wq); }
+extern "C" void wait_queue_wake_one_locked(wait_queue_t *wq) { wq_wake_one_locked(wq); }
+extern "C" void wait_queue_wake_all_locked(wait_queue_t *wq) { wq_wake_all_locked(wq); }
 
 /* ---- timer-driven sleep + preemption (called from timer.c) ---- */
 

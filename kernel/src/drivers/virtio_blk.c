@@ -43,6 +43,8 @@ typedef struct virtio_blk {
     uint8_t    irq_ok;                /* completion IRQ wired (block vs poll) */
     wait_queue_t wq;                  /* submitter blocks here for completion */
     volatile uint64_t completions;    /* total requests the IRQ has reaped */
+    volatile int busy;                /* a request is in flight (§2: serialize submitters) */
+    wait_queue_t busy_wq;             /* submitters queue here for the device */
 
     /* Per-request scratch: header and trailing status byte. Static so
        their physical address is stable across calls and we can hand it
@@ -71,8 +73,14 @@ static void vblk_irq(uint8_t irq, regs_t *regs) {
     (void)irq; (void)regs;
     uint8_t isr = inb(g_vblk.io + VIRTIO_PCI_ISR);
     if (!(isr & 0x1)) return;       /* not ours / no buffers used */
+    /* Reap and wake under sched_lock: the submitter may be sleeping on another
+       CPU, and it checks last_used_idx under the same lock (ROADMAP §2), so the
+       reap (which advances last_used_idx) and the wake are atomic w.r.t. its
+       check — no lost wakeup. */
+    sched_lock();
     vblk_reap(&g_vblk);
-    wait_queue_wake_one(&g_vblk.wq);
+    wait_queue_wake_all_locked(&g_vblk.wq);
+    sched_unlock();
 }
 
 /* ---- low-level IO ---- */
@@ -139,6 +147,17 @@ static int submit(virtio_blk_t *v, uint32_t type, uint64_t lba,
                   uint32_t count, void *buf, int dev_writes_data) {
     uint32_t data_bytes = count * 512u;
 
+    /* Only one request may use the single descriptor chain / hdr / status at a
+       time. With user tasks on every core (ROADMAP §2), several processes can
+       enter here at once, so claim the device first and let others queue. */
+    int serialize = sched_active();
+    if (serialize) {
+        sched_lock();
+        while (v->busy) wait_queue_sleep_locked(&v->busy_wq);
+        v->busy = 1;
+        sched_unlock();
+    }
+
     v->hdr.type     = type;
     v->hdr.reserved = 0;
     v->hdr.sector   = lba;
@@ -200,10 +219,13 @@ static int submit(virtio_blk_t *v, uint32_t type, uint64_t lba,
        scheduler exists (early-boot self-tests), there's nothing to switch
        to, so fall back to polling and reaping inline. */
     if (sched_active() && v->irq_ok) {
-        uint64_t f = irq_save();
+        /* Check completion and sleep under sched_lock — vblk_irq reaps + wakes
+           under the same lock, so a completion on another CPU can't slip
+           between our check and our sleep (ROADMAP §2). */
+        sched_lock();
         while (v->last_used_idx != want)
-            wait_queue_sleep(&v->wq);
-        irq_restore(f);
+            wait_queue_sleep_locked(&v->wq);
+        sched_unlock();
     } else {
         while (v->last_used_idx != want) {
             __asm__ volatile("pause" ::: "memory");
@@ -211,9 +233,15 @@ static int submit(virtio_blk_t *v, uint32_t type, uint64_t lba,
         }
     }
 
-    if (v->status == VIRTIO_BLK_S_OK)    return BLK_OK;
-    if (v->status == VIRTIO_BLK_S_IOERR) return BLK_ERR_IO;
-    return BLK_ERR_IO;
+    int rc = (v->status == VIRTIO_BLK_S_OK) ? BLK_OK : BLK_ERR_IO;
+
+    if (serialize) {                    /* release the device, wake the next submitter */
+        sched_lock();
+        v->busy = 0;
+        wait_queue_wake_one_locked(&v->busy_wq);
+        sched_unlock();
+    }
+    return rc;
 }
 
 extern "C" uint64_t virtio_blk_completions(void) { return g_vblk.completions; }

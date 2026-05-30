@@ -13,6 +13,7 @@
 #include "smp.h"
 #include "fs.h"
 #include "usermode.h"
+#include "percpu.h"
 #include "../../boot/include/bootinfo.h"
 
 extern "C" block_device_t *ramdisk_init(uint64_t num_blocks);
@@ -194,7 +195,7 @@ extern "C" void kmain(BootInfo *bi) {
 
     gdt_init();
     idt_init();
-    tss_init();        /* ring-3 -> ring-0 stack switch (TSS.rsp0) */
+    percpu_init(0);    /* BSP per-CPU TSS + GS base (ring-3 -> ring-0 stack) */
     syscall_init();    /* SYSCALL/SYSRET entry */
 
     check_bootinfo(bi);
@@ -260,6 +261,7 @@ extern "C" void kmain(BootInfo *bi) {
     sched_init();
     create_initial_tasks();
     smp_init();
+    smp_ipi_selftest();   /* verify the cross-CPU IPI path (ROADMAP §2) */
 
     device_dump();
 

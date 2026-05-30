@@ -5,6 +5,10 @@
     .set USER_CS_RPL3, 0x23
     .set USER_DS_RPL3, 0x1B
 
+    /* Per-CPU block offsets (percpu.h). Reached via %gs after swapgs. */
+    .set PCPU_USER_SCRATCH, 0
+    .set PCPU_KERNEL_RSP,   8
+
     .section .text
     .globl  syscall_entry
     .type   syscall_entry, @function
@@ -12,10 +16,12 @@ syscall_entry:
     /* Entered from `syscall`: still on the USER stack, IF cleared by SFMASK.
        rcx = user return RIP, r11 = user RFLAGS. Syscall number in rax, args
        in rdi,rsi,rdx,r10,r8,r9 (Linux x86_64 ABI). SYSCALL does NOT switch
-       stacks, so we do it: stash the user rsp and load the kernel stack.
-       UP uses a global; SMP §1 replaces this with swapgs + KERNEL_GS_BASE. */
-    movq    %rsp, g_user_rsp(%rip)
-    movq    g_kernel_rsp(%rip), %rsp
+       stacks or GS, so we do both: swapgs to reach this CPU's percpu block,
+       stash the user rsp in its scratch slot, and load the kernel stack. This
+       is per-CPU now (ROADMAP §2), so user tasks run on any core. */
+    swapgs
+    movq    %rsp, %gs:PCPU_USER_SCRATCH
+    movq    %gs:PCPU_KERNEL_RSP, %rsp
 
     /* Build a syscall_frame_t on the kernel stack (see syscall.c). Pushes go
        high->low, so the last push (rax) is the struct's first field. The
@@ -27,7 +33,7 @@ syscall_entry:
     pushq   %r12
     pushq   %rbp
     pushq   %rbx
-    pushq   g_user_rsp(%rip)        /* .user_rsp */
+    pushq   %gs:PCPU_USER_SCRATCH   /* .user_rsp */
     pushq   %r11                    /* .r11  (user rflags) */
     pushq   %rcx                    /* .rcx  (user rip)    */
     pushq   %r9                     /* .r9   (arg6) */
@@ -53,6 +59,7 @@ syscall_entry:
     popq    %rcx                    /* user rip   -> sysret target */
     popq    %r11                    /* user rflags */
     popq    %rsp                    /* back to the user stack */
+    swapgs                          /* restore user GS; KERNEL_GS_BASE -> percpu */
     sysretq                         /* CS/SS from STAR (RPL 3), rax = result */
     .size   syscall_entry, . - syscall_entry
 
@@ -83,6 +90,7 @@ fork_child_return:
     movq    40(%rsp), %r14
     movq    48(%rsp), %r15
     movq    0(%rsp),  %rsp          /* user rsp */
+    swapgs                          /* child returns to ring 3: restore user GS */
     sysretq
     .size   fork_child_return, . - fork_child_return
 
@@ -92,6 +100,12 @@ fork_child_return:
     .type   enter_user, @function
 enter_user:
     cli                             /* assemble the frame without an IRQ in it */
+    /* Going to ring 3 for the first time: swapgs so KERNEL_GS_BASE holds this
+       CPU's percpu block (the kernel GS base) for the next SYSCALL entry. We are
+       in the kernel, so GS base == percpu here; swapgs moves it into
+       KERNEL_GS_BASE. The user GS base (now in GS) is irrelevant — user code
+       uses FS for TLS. */
+    swapgs
     movw    $USER_DS_RPL3, %ax
     movw    %ax, %ds
     movw    %ax, %es
