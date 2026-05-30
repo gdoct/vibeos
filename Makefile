@@ -109,6 +109,9 @@ KERNEL_C_SRCS = \
 	kernel/src/syscall.c \
 	kernel/src/tty.c \
 	kernel/src/elf64.c \
+	kernel/src/random.c \
+	kernel/src/file.c \
+	kernel/src/pipe.c \
 	kernel/src/drivers/fb.c \
 	kernel/src/drivers/font.c \
 	kernel/src/drivers/ramdisk.c \
@@ -141,6 +144,8 @@ USER_SH    = user/build/sh.elf
 # only if musl-gcc is present (apt install musl-tools).
 MUSL_CC    := $(shell command -v musl-gcc 2>/dev/null)
 USER_MHELLO = user/build/mhello.elf
+USER_MFTEST = user/build/ftest.elf
+USER_MPIPE  = user/build/pipetest.elf
 
 .PHONY: all clean run image kernel user
 all: $(EFI) $(KERNEL_ELF) user
@@ -183,13 +188,27 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE)
 
-# Static musl build (host cross-compile). Skipped with a note if musl-gcc is
+# Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
 $(USER_MHELLO): user/musl/hello.c | user/build
 ifeq ($(MUSL_CC),)
 	@echo "warning: musl-gcc not found (apt install musl-tools); skipping $(USER_MHELLO)"
+else
+	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
+endif
+
+$(USER_MFTEST): user/musl/ftest.c | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found (apt install musl-tools); skipping $(USER_MFTEST)"
+else
+	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
+endif
+
+$(USER_MPIPE): user/musl/pipetest.c | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found (apt install musl-tools); skipping $(USER_MPIPE)"
 else
 	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
 endif

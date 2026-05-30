@@ -6,6 +6,7 @@
 #include "task.h"
 #include "usermode.h"
 #include "elf.h"
+#include "random.h"
 
 /*
  * Userspace ELF loader (ROADMAP §3 Phase 2, widened for §4 Linux ABI).
@@ -54,12 +55,6 @@
 #define AT_CLKTCK  17
 #define AT_SECURE  23
 #define AT_RANDOM  25
-
-static inline uint64_t rdtsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
-}
 
 /* Map [va, va+len) as user pages in `vm`, allocating any not already present
    (adjacent segments may share a page). */
@@ -114,9 +109,7 @@ static void build_initial_stack(const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
     /* 16 bytes of entropy for AT_RANDOM (musl's stack canary). */
     sp -= 16;
     uint64_t rnd_va = sp;
-    uint64_t r0 = rdtsc(), r1 = rdtsc() * 0x9E3779B97F4A7C15ULL + 0x1234567;
-    kmemcpy((void *)(uintptr_t)(sp + 0), &r0, 8);
-    kmemcpy((void *)(uintptr_t)(sp + 8), &r1, 8);
+    krandom_bytes((void *)(uintptr_t)sp, 16);
 
     sp &= ~0xFULL;   /* end of the string/aux-data area */
 

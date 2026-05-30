@@ -1031,6 +1031,128 @@ int fs_seek(int fd, uint64_t off) {
     return FS_OK;
 }
 
+/* ---- §4 rung 2: inode-level primitives for the per-process fd layer (fs.h) ---- */
+
+int fs_resolve(const char *path) {
+    if (!g.mounted) return FS_EINVAL;
+    uint32_t ino = path_resolve(path);
+    if (!ino) return FS_ENOENT;
+    return (int)ino;
+}
+
+int fs_istat(uint32_t ino, fs_stat_t *out) {
+    if (!g.mounted) return FS_EINVAL;
+    inode_t in;
+    inode_read(ino, &in);
+    if (in.type == FT_NONE) return FS_ENOENT;
+    out->type  = in.type;
+    out->links = in.links;
+    out->size  = in.size;
+    out->ctime = in.ctime;
+    out->mtime = in.mtime;
+    return FS_OK;
+}
+
+int fs_truncate_ino(uint32_t ino) {
+    if (!g.mounted) return FS_EINVAL;
+    inode_t in;
+    inode_read(ino, &in);
+    if (in.type == FT_DIR) return FS_EISDIR;
+    inode_truncate(ino, &in);
+    flush_meta();
+    return FS_OK;
+}
+
+/* Read up to n bytes from inode `ino` at absolute offset `off`. Returns bytes
+   read (0 at EOF). Mirrors fs_read but without the global-fd offset. */
+int fs_pread(uint32_t ino, uint64_t off, void *buf, uint32_t n) {
+    if (!g.mounted) return FS_EINVAL;
+    inode_t in;
+    inode_read(ino, &in);
+    if (off >= in.size) return 0;
+    uint64_t avail = in.size - off;
+    if (n > avail) n = (uint32_t)avail;
+    uint8_t blk[FS_BLOCK_SIZE];
+    uint32_t done = 0;
+    while (done < n) {
+        uint32_t fbn  = (uint32_t)((off + done) / FS_BLOCK_SIZE);
+        uint32_t boff = (uint32_t)((off + done) % FS_BLOCK_SIZE);
+        uint32_t chunk = FS_BLOCK_SIZE - boff;
+        if (chunk > n - done) chunk = n - done;
+        uint32_t b = bmap(&in, fbn, 0);
+        if (b) { bread(b, blk); kmemcpy((uint8_t *)buf + done, blk + boff, chunk); }
+        else   { kmemset((uint8_t *)buf + done, 0, chunk); }   /* sparse hole */
+        done += chunk;
+    }
+    return (int)done;
+}
+
+/* Write n bytes to inode `ino` at absolute offset `off`, growing the file as
+   needed. Returns bytes written. Mirrors fs_write. */
+int fs_pwrite(uint32_t ino, uint64_t off, const void *buf, uint32_t n) {
+    if (!g.mounted) return FS_EINVAL;
+    inode_t in;
+    inode_read(ino, &in);
+    if (in.type == FT_DIR) return FS_EISDIR;
+    if (off + n > FS_MAXFILEBLKS * (uint64_t)FS_BLOCK_SIZE) return FS_EFBIG;
+    uint8_t blk[FS_BLOCK_SIZE];
+    uint32_t done = 0;
+    while (done < n) {
+        uint32_t fbn  = (uint32_t)((off + done) / FS_BLOCK_SIZE);
+        uint32_t boff = (uint32_t)((off + done) % FS_BLOCK_SIZE);
+        uint32_t b = bmap(&in, fbn, 1);
+        if (!b) { if (done == 0) return FS_ENOSPC; break; }
+        uint32_t chunk = FS_BLOCK_SIZE - boff;
+        if (chunk > n - done) chunk = n - done;
+        if (chunk < FS_BLOCK_SIZE) bread(b, blk);   /* RMW partial block */
+        kmemcpy(blk + boff, (const uint8_t *)buf + done, chunk);
+        bwrite(b, blk);
+        done += chunk;
+    }
+    if (off + done > in.size) in.size = off + done;
+    in.mtime = (uint32_t)timer_ticks();
+    inode_write(ino, &in);
+    if (done) flush_meta();
+    return (int)done;
+}
+
+/* Return one directory entry at byte cursor *pos (advancing it past the
+   consumed record). Skips free slots. Records never span a block. */
+int fs_dirent_at(uint32_t ino, uint64_t *pos, fs_dirent_t *out) {
+    if (!g.mounted) return FS_EINVAL;
+    inode_t in;
+    inode_read(ino, &in);
+    if (in.type != FT_DIR) return FS_ENOTDIR;
+    uint64_t size = in.size;
+    uint8_t buf[FS_BLOCK_SIZE];
+    while (*pos < size) {
+        uint32_t fbn  = (uint32_t)(*pos / FS_BLOCK_SIZE);
+        uint32_t boff = (uint32_t)(*pos % FS_BLOCK_SIZE);
+        uint32_t b = bmap(&in, fbn, 0);
+        if (!b) { *pos = (uint64_t)(fbn + 1) * FS_BLOCK_SIZE; continue; }
+        bread(b, buf);
+        dirent_disk_t *de = (dirent_disk_t *)(buf + boff);
+        uint32_t rlen = de->rec_len;
+        if (rlen < FS_DIRENT_HDR || boff + rlen > FS_BLOCK_SIZE) {
+            *pos = (uint64_t)(fbn + 1) * FS_BLOCK_SIZE;   /* skip to next block */
+            continue;
+        }
+        uint64_t next = *pos + rlen;
+        if (de->inode != 0) {
+            uint32_t nl = de->name_len;
+            if (nl > FS_NAME_MAX) nl = FS_NAME_MAX;
+            kmemcpy(out->name, buf + boff + FS_DIRENT_HDR, nl);
+            out->name[nl] = 0;
+            out->inode = de->inode;
+            out->type  = de->type;
+            *pos = next;
+            return 1;
+        }
+        *pos = next;
+    }
+    return 0;
+}
+
 /* -------------------------------------------------------------------- readdir */
 
 int fs_readdir(const char *path, fs_dirent_t *out, int max) {

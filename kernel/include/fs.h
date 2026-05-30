@@ -143,6 +143,27 @@ int fs_unlink(const char *path);                 /* file or empty directory */
 
 int fs_readdir(const char *path, fs_dirent_t *out, int max);
 
+/* ---- §4 rung 2: inode-level primitives for the per-process fd layer ----
+ * These let the syscall layer own the open-file state (offset, kind) instead
+ * of the fixed 16-slot global pool fs_open uses, and reach directories (which
+ * fs_open refuses) for getdents. Paths are absolute. */
+
+typedef struct {
+    uint16_t type;     /* FT_REG / FT_DIR */
+    uint16_t links;
+    uint64_t size;
+    uint32_t ctime, mtime;   /* timer ticks (100 Hz) */
+} fs_stat_t;
+
+int fs_resolve(const char *path);                    /* inode number (>0) or FS errno */
+int fs_istat  (uint32_t ino, fs_stat_t *out);
+int fs_truncate_ino(uint32_t ino);                   /* drop to zero length */
+int fs_pread  (uint32_t ino, uint64_t off, void *buf, uint32_t n);
+int fs_pwrite (uint32_t ino, uint64_t off, const void *buf, uint32_t n);
+/* Read one directory entry at byte cursor *pos (advances it). Returns 1 on a
+   returned entry, 0 at end, negative on error. */
+int fs_dirent_at(uint32_t ino, uint64_t *pos, fs_dirent_t *out);
+
 #ifdef __cplusplus
 }
 #endif

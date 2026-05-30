@@ -39,6 +39,10 @@ rm -f "$VDISK"
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/hello.elf /bin/hello
 [ -f user/build/mhello.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/mhello.elf /bin/mhello
+[ -f user/build/ftest.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/ftest.elf /bin/ftest
+[ -f user/build/pipetest.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/pipetest.elf /bin/pipetest
 
 step "Volume contents"
 "$DISKUTIL" --diskfile "$VDISK" --ls /

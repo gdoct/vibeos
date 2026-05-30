@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 #define MAX_TASKS  8
+#define VFS_MAX_FD 32       /* per-process file descriptors (0/1/2 = console) */
 
 typedef enum {
     TASK_NONE    = 0,
@@ -21,6 +22,7 @@ typedef enum {
 
 struct vmspace;          /* kernel/include/paging.h */
 struct syscall_frame;    /* kernel/include/usermode.h */
+struct file;             /* kernel/include/file.h */
 
 /*
  * A wait queue is just a FIFO of blocked tasks. wait_queue_sleep blocks
@@ -59,6 +61,12 @@ typedef struct task {
     struct task  *parent;
     int           exit_code;
     wait_queue_t  child_wq;
+
+    /* Per-process fd table (ROADMAP §4 rung 2). Indices 0/1/2 are the serial
+       console implicitly; 3+ point at refcounted open-file objects. NULL == a
+       free descriptor. fork() dups these (sharing the file offset); they
+       survive execve. */
+    struct file  *fdt[VFS_MAX_FD];
 } task_t;
 
 /* Initialize the SMP scheduler. Call once on the BSP before creating tasks

@@ -3,6 +3,7 @@
 #include "irq.h"
 #include "paging.h"
 #include "task.h"
+#include "file.h"
 #include "usermode.h"
 #include "timer.h"
 #include "smp.h"
@@ -144,6 +145,13 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     t->fs_base   = parent->fs_base;     /* child shares the TLS layout (AS copied) */
     t->mmap_next = parent->mmap_next;
 
+    /* Dup the fd table: the child shares each open-file object (and thus its
+       offset) with the parent, à la Linux fork. */
+    for (int i = 0; i < VFS_MAX_FD; i++) {
+        t->fdt[i] = parent->fdt[i];
+        if (t->fdt[i]) file_ref(t->fdt[i]);
+    }
+
     /* Craft the child stack: context_switch -> fork_child_return, which finds a
        copy of the parent's syscall frame (rax forced to 0) and sysrets. The
        callee-saved regs are cloned too, so the child resumes with the parent's
@@ -276,6 +284,10 @@ static void wq_wake_all_locked(wait_queue_t *wq) {
 void task_exit_user(int code) {
     task_t *t = task_current();
     kprintf("[sched] task %d \"%s\" exit(%d)\n", t->id, t->name, code);
+    /* Release open files before becoming a zombie (the address space is reaped
+       later by the parent's wait4). */
+    for (int i = 0; i < VFS_MAX_FD; i++)
+        if (t->fdt[i]) { file_unref(t->fdt[i]); t->fdt[i] = nullptr; }
     sched_lock();
     t->exit_code = code;
     task_t *p = t->parent;
