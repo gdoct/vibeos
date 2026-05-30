@@ -19,10 +19,13 @@
 #define EV_CURRENT    1
 
 #define ET_EXEC     2
+#define ET_DYN      3
 #define EM_X86_64   62
 
 #define PT_NULL     0
 #define PT_LOAD     1
+#define PT_DYNAMIC  2
+#define PT_INTERP   3
 
 #define PF_X 0x1
 #define PF_W 0x2

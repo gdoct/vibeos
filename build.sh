@@ -50,6 +50,17 @@ rm -f "$VDISK"
 [ -f user/build/sigtest.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/sigtest.elf /bin/sigtest
 
+# Dynamic linking (ROADMAP §4): ship the musl dynamic linker as
+# /lib/ld-musl-x86_64.so.1 (the host's musl libc.so doubles as the loader) and a
+# dynamically-linked test program. The kernel reads /bin/dynhello's PT_INTERP,
+# maps the linker, and lets it relocate + run the program.
+MUSL_LD="/usr/lib/x86_64-linux-musl/libc.so"
+if [ -f user/build/dynhello.elf ] && [ -f "$MUSL_LD" ]; then
+  "$DISKUTIL" --diskfile "$VDISK" --mkdir /lib
+  "$DISKUTIL" --diskfile "$VDISK" --import "$MUSL_LD" /lib/ld-musl-x86_64.so.1
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/dynhello.elf /bin/dynhello
+fi
+
 step "Volume contents"
 "$DISKUTIL" --diskfile "$VDISK" --ls /
 "$DISKUTIL" --diskfile "$VDISK" --ls /bin

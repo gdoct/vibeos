@@ -392,25 +392,53 @@ static int64_t sys_writev(int fd, const struct iovec *iov, int cnt) {
     return total;
 }
 
-/* Anonymous mmap arena: a per-process bump allocator in the user half. File
-   backing (BFD, dynamic loaders) is a rung-3 follow-on. */
-static int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags) {
+/* mmap: anonymous arena + file-backed MAP_PRIVATE (ROADMAP §4, for ld-musl).
+   File backing copies the file's bytes into freshly allocated private pages (no
+   shared page cache yet); the tail past EOF stays zero (BSS). */
+static int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
+                        int fd, uint64_t off) {
     if (len == 0) return -EINVAL_;
-    len = PAGE_ALIGN_UP(len);
-    if (!(flags & MAP_ANONYMOUS)) return -ENOSYS_;   /* file-backed: §4 rung 3 */
+    uint64_t mlen = PAGE_ALIGN_UP(len);
+    int anon = (flags & MAP_ANONYMOUS);
 
     task_t *t = task_current();
     uint64_t base = ((flags & MAP_FIXED) && addr) ? PAGE_ALIGN_DOWN(addr)
-                                                  : (t->mmap_next += len) - len;
-    if (prot == 0) return (int64_t)base;             /* PROT_NONE: reserve VA only */
+                                                  : (t->mmap_next += mlen) - mlen;
+    if (anon && prot == 0) return (int64_t)base;     /* PROT_NONE: reserve VA only */
 
-    uint64_t pflags = PTE_P | PTE_U | ((prot & PROT_WRITE) ? PTE_W : 0);
-    for (uint64_t va = base; va < base + len; va += PAGE_SIZE) {
+    file_t *fl = nullptr;
+    if (!anon) {
+        fl = fd_get(fd);
+        if (!fl || fl->kind != FD_FILE) return -EBADF_;
+    }
+
+    /* Map the pages writable first so we can load file content; the requested
+       protection is applied afterwards (e.g. a read-only text segment). */
+    for (uint64_t va = base; va < base + mlen; va += PAGE_SIZE) {
         uint64_t pa;
         if (vmspace_query(t->vm, va, &pa)) continue; /* fixed re-map over live page */
         pa = pmm_alloc_page();
         if (!pa) return -ENOMEM_;
-        vmspace_map(t->vm, va, pa, 1, pflags);
+        vmspace_map(t->vm, va, pa, 1, PTE_P | PTE_W | PTE_U);
+    }
+
+    if (!anon) {                                     /* stream the file in */
+        uint64_t done = 0;
+        while (done < len) {
+            uint32_t chunk = (len - done > 0x100000u) ? 0x100000u : (uint32_t)(len - done);
+            int r = fs_pread(fl->ino, off + done, (void *)(uintptr_t)(base + done), chunk);
+            if (r <= 0) break;                       /* EOF / error: leave the rest zero */
+            done += (uint64_t)r;
+        }
+    }
+
+    /* Apply the final protection (drop write for read-only/exec-only regions). */
+    if (!(prot & PROT_WRITE)) {
+        uint64_t pflags = PTE_P | PTE_U;
+        for (uint64_t va = base; va < base + mlen; va += PAGE_SIZE) {
+            uint64_t pa;
+            if (vmspace_query(t->vm, va, &pa)) vmspace_map(t->vm, va, pa, 1, pflags);
+        }
     }
     return (int64_t)base;
 }
@@ -761,7 +789,8 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 6:   return (uint64_t)sys_stat((const char *)f->rdi,
                                         (struct linux_stat *)f->rsi);  /* lstat (no symlinks) */
     case 8:   return (uint64_t)sys_lseek((int)f->rdi, (int64_t)f->rsi, (int)f->rdx); /* lseek */
-    case 9:   return (uint64_t)sys_mmap(f->rdi, f->rsi, (int)f->rdx, (int)f->r10); /* mmap */
+    case 9:   return (uint64_t)sys_mmap(f->rdi, f->rsi, (int)f->rdx, (int)f->r10,
+                                        (int)f->r8, f->r9);            /* mmap */
     case 10:  return (uint64_t)sys_mprotect(f->rdi, f->rsi, (int)f->rdx);  /* mprotect */
     case 11:  return (uint64_t)sys_munmap(f->rdi, f->rsi);      /* munmap */
     case 12:  return sys_brk(f->rdi);

@@ -150,6 +150,7 @@ USER_MPIPE  = user/build/pipetest.elf
 USER_MFAULT = user/build/faulttest.elf
 USER_MCPU   = user/build/cputest.elf
 USER_MSIG   = user/build/sigtest.elf
+USER_MDYN   = user/build/dynhello.elf
 
 .PHONY: all clean run image kernel user
 all: $(EFI) $(KERNEL_ELF) user
@@ -192,7 +193,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -236,6 +237,14 @@ ifeq ($(MUSL_CC),)
 	@echo "warning: musl-gcc not found; skipping $(USER_MSIG)"
 else
 	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
+endif
+
+# Dynamically-linked musl PIE (NOT -static): exercises the §4 dynamic loader.
+$(USER_MDYN): user/musl/dynhello.c | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found; skipping $(USER_MDYN)"
+else
+	$(MUSL_CC) -O2 -o $@ $<
 endif
 
 user/build:
