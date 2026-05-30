@@ -41,10 +41,16 @@ Detail lives in the code and git history; this file is the map, not the manual.
   64-bit size.
 - **Networking** — virtio-net driver ([virtio_net.c](kernel/src/drivers/virtio_net.c))
   sharing PCI INTx with virtio-blk; a compact IPv4 stack ([net.c](kernel/src/net.c)):
-  ARP, IPv4, ICMP (`ping`), UDP, TCP (handshake/data/close), plus a loopback
+  ARP, IPv4, ICMP (`ping`), UDP, and a **WAN-grade TCP** — 3-way handshake, a
+  send buffer with go-back-N retransmission off an RTO derived from Jacobson/
+  Karels RTT estimation (Karn on retransmits), congestion control (slow start +
+  congestion avoidance + fast retransmit on triple dup ACKs), out-of-order
+  reassembly, delayed ACKs, MSS-option negotiation, a zero-window persist probe,
+  and a 2*MSL TIME-WAIT — all driven by a worker-context timer. Plus a loopback
   netif. **BSD sockets** on the fd table —
   `socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`/`poll`. Static
-  SLIRP addressing (10.0.2.15/24). Ported `/bin/wget` fetches over the stack.
+  SLIRP addressing (10.0.2.15/24). Ported `/bin/wget` fetches over the stack;
+  a loopback self-test pushes 6 KB through the send buffer multi-segment.
 - **Userspace / Linux ABI** — ring 3 via SYSCALL/SYSRET; ELF loader with real
   auxv + argv/envp ([elf64.c](kernel/src/elf64.c)). **Runs unmodified static and
   dynamically-linked musl binaries** — `ET_DYN`/PIE + `PT_INTERP` load
@@ -62,8 +68,10 @@ Detail lives in the code and git history; this file is the map, not the manual.
   images; `./build.sh` + `make run` (`-smp 4`, virtio-blk + virtio-net).
 
 **ABI simplifications still open:** cwd fixed at `/` (no `chdir`); no symlinks;
-dirs open read-only; `FD_CLOEXEC` not enforced. **TCP has no retransmission /
-reassembly / RTT** — fine for loopback and low-loss SLIRP, not yet a WAN stack.
+dirs open read-only; `FD_CLOEXEC` not enforced. TCP's retransmit / reassembly
+paths are implemented but only structurally exercised — loopback/SLIRP is
+lossless and in-order, so loss-recovery awaits verification against a real host
+once outbound connectivity is available.
 
 ---
 
@@ -74,29 +82,25 @@ validation, kstack reclamation, guarded stacks), (2) user tasks on all cores
 (per-CPU TSS/GS/`swapgs`, IPIs/TLB shootdown), (3) signals, (4) dynamic linking
 (`ET_DYN` + `ld-musl`, file-backed `mmap`), and (5) networking (virtio-net +
 ARP/IP/ICMP/UDP/TCP + BSD sockets + ported `wget`) — are **all shipped** and
-serial-verified. See "What works today". What remains, ordered:
+serial-verified, as is **(6) WAN-grade TCP** (send buffer, RTO/RTT, congestion
+control, reassembly, delayed/dup ACKs, TIME-WAIT). See "What works today". What
+remains, ordered:
 
-**1. WAN-grade TCP.** The stack is correct over loopback / low-loss SLIRP but has
-no retransmission queue, RTT estimation, out-of-order reassembly, delayed/
-duplicate ACK handling, or TIME-WAIT. Add those (and a real send buffer) before
-trusting it on a lossy link. Then verify against a real host once outbound
-connectivity is available.
-
-**2. Proper CSPRNG.** ChaCha20 DRBG (or Fortuna) over real entropy — RDRAND,
+**1. Proper CSPRNG.** ChaCha20 DRBG (or Fortuna) over real entropy — RDRAND,
 timing jitter, virtio-rng — replacing `krandom` for TCP ISNs / TLS. (`krandom`
 stays fine for boot entropy / `AT_RANDOM`.) TCP ISNs are currently a fixed
 counter; predictable.
 
-**3. Per-CPU run queues + work-stealing.** Today one global run queue under the
+**2. Per-CPU run queues + work-stealing.** Today one global run queue under the
 `sched_lock` baton serves every core (an idle CPU pulls any ready task — implicit
 work-stealing, but the single lock is the scalability ceiling). Split into
 per-CPU queues with explicit stealing once contention matters.
 
-**4. Userspace quality-of-life.** `chdir`/cwd, symlinks, `FD_CLOEXEC`; a tiny
+**3. Userspace quality-of-life.** `chdir`/cwd, symlinks, `FD_CLOEXEC`; a tiny
 `/proc` (pid dirs + `stat`) and `/dev` (`null`/`zero`/`tty`/`random`); a real
 (small) init that respawns the shell; a package format (tar + VibeFS metadata).
 
-**5. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
+**4. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
 `gcc`/`clang` build for VibeOS directly instead of repurposing host musl.
 
 **Also widening the ABI toward busybox/binutils** as opportunity allows (more

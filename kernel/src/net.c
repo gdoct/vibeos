@@ -407,12 +407,18 @@ static void arp_input(const uint8_t *p, uint32_t len) {
 
 /* ---- TCP ----
  *
- * A compact state machine: 3-way handshake (active + passive open), in-order
- * data transfer with cumulative ACKs and a receive-window byte ring, and FIN
- * close. Because the only transport we exercise is loopback (and a low-loss
- * SLIRP link), there is no retransmission queue, RTT estimation, or out-of-order
- * reassembly — segments are assumed to arrive in order. A real WAN TCP would add
- * those; this is enough to prove the protocol and back the socket layer. */
+ * A WAN-grade state machine: 3-way handshake (active + passive open), a send
+ * buffer with go-back-N retransmission driven by an RTO derived from Jacobson/
+ * Karels RTT estimation (Karn's algorithm on retransmits), congestion control
+ * (slow start + congestion avoidance + fast retransmit on triple dup ACKs),
+ * out-of-order reassembly, delayed ACKs, MSS-option negotiation, a zero-window
+ * persist probe, and a 2*MSL TIME-WAIT.
+ *
+ * Timing is driven by tcp_timer(), run in the net-worker context (where loopback
+ * sends defer to the worker-private loq, never re-entering sched_lock) by a
+ * 50 ms ticker that wakes the worker. All PCB state is mutated under sched_lock:
+ * tcp_input(), tcp_timer(), and the socket-API helpers all hold it, so the
+ * receive path, the timers, and app calls never race. */
 
 typedef enum {
     T_CLOSED, T_LISTEN, T_SYN_SENT, T_SYN_RCVD, T_ESTABLISHED,
@@ -420,34 +426,79 @@ typedef enum {
 } tcp_state_t;
 
 #define TCP_PCB_N   32
-#define TCP_RXBUF   8192
+#define TCP_RXBUF   16384
+#define TCP_SNDBUF  16384
 #define TCP_MSS     1460
 #define TCP_ACCEPTQ 8
+#define TCP_OOO_N   8                 /* out-of-order reassembly slots */
+
+/* Timers, in 100 Hz ticks (1 tick = 10 ms). */
+#define TCP_RTO_INIT   100            /* 1 s before the first RTT sample */
+#define TCP_RTO_MIN    20             /* 200 ms floor */
+#define TCP_RTO_MAX    6000           /* 60 s ceiling */
+#define TCP_2MSL       200            /* TIME-WAIT linger (2 s; real WAN = 2*MSL) */
+#define TCP_DELACK     10             /* delayed-ACK delay (100 ms) */
+#define TCP_PERSIST_MAX 6             /* zero-window probe backoff cap */
+#define TCP_REXMIT_MAX 8              /* drop a connection after this many RTOs */
+
+/* An out-of-order segment held until the gap before it is filled. */
+typedef struct { int used; uint32_t seq; uint32_t len; uint8_t data[TCP_MSS]; } tcp_ooo_t;
 
 typedef struct tcp_pcb {
     int          used;
     tcp_state_t  state;
     uint16_t     local_port, remote_port;
     uint32_t     local_ip, remote_ip;
-    uint32_t     snd_una, snd_nxt, iss;
+
+    /* send sequence space */
+    uint32_t     iss, snd_una, snd_nxt;
+    uint32_t     snd_wnd;                      /* peer's advertised window */
+    uint32_t     snd_wl1, snd_wl2;             /* seq/ack of last window update */
+    uint16_t     snd_mss;                      /* min(our MSS, peer's MSS option) */
+    int          syn_acked;
+
+    /* send buffer: unacked + unsent DATA bytes, seq [snd_buf_seq, +snd_buf_len) */
+    uint8_t      sndbuf[TCP_SNDBUF];
+    uint32_t     snd_buf_seq;                  /* seq of sndbuf[snd_buf_off] */
+    uint32_t     snd_buf_off, snd_buf_len;
+    int          need_fin;                     /* app closed: emit FIN after data */
+    uint32_t     fin_seq;                      /* seq the FIN occupies */
+    int          need_output;                  /* app queued work; worker must pump */
+
+    /* congestion control + RTT/RTO (Jacobson/Karels) */
+    uint32_t     cwnd, ssthresh;
+    uint32_t     rto, srtt, rttvar;            /* srtt scaled x8, rttvar scaled x4 */
+    int          rtt_active; uint32_t rtt_seq; uint64_t rtt_start;
+    int          rexmit_running, backoff, dupacks;
+    uint64_t     rto_deadline;
+
+    /* receive sequence space */
     uint32_t     rcv_nxt;
-    uint16_t     snd_wnd;
     uint8_t      rxbuf[TCP_RXBUF];
-    uint32_t     rxhead, rxtail;              /* byte ring (head=producer) */
-    int          peer_fin;                    /* received a FIN (EOF) */
-    int          reset;                       /* connection reset */
-    struct tcp_pcb *listener;                 /* parent, for SYN_RCVD children */
-    struct tcp_pcb *acceptq[TCP_ACCEPTQ];     /* established, awaiting accept() */
+    uint32_t     rxhead, rxtail;               /* byte ring (head=producer) */
+    tcp_ooo_t    ooo[TCP_OOO_N];
+    int          peer_fin;                     /* received a FIN (EOF) */
+    int          reset;                        /* connection reset */
+    int          delack; uint64_t delack_deadline;
+
+    uint64_t     tw_deadline;                  /* TIME-WAIT expiry */
+
+    struct tcp_pcb *listener;                  /* parent, for SYN_RCVD children */
+    struct tcp_pcb *acceptq[TCP_ACCEPTQ];      /* established, awaiting accept() */
     int          aq_head, aq_tail;
-    int          app_closed;                  /* app called close(); free once CLOSED */
-    wait_queue_t wq;                          /* any state change wakes waiters */
+    int          app_closed;                   /* app called close(); free once dead */
+    wait_queue_t wq;                           /* any state change wakes waiters */
 } tcp_pcb_t;
 
 static tcp_pcb_t g_tcp[TCP_PCB_N];
 static uint32_t  g_iss = 0x10000;
+static volatile int g_tcp_timer_pending;       /* ticker -> worker: run tcp_timer() */
+static volatile int g_tcp_work;                /* app -> worker: pcbs need_output */
 
 static inline int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
 static inline int seq_gt(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
+static inline int seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+static inline int seq_ge(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }
 
 static uint16_t l4_checksum(uint8_t proto, uint32_t src, uint32_t dst,
                             const uint8_t *seg, uint32_t len) {
@@ -463,38 +514,152 @@ static uint16_t l4_checksum(uint8_t proto, uint32_t src, uint32_t dst,
 
 static uint32_t tcp_rx_used(tcp_pcb_t *t) { return (t->rxhead - t->rxtail) % TCP_RXBUF; }
 static uint32_t tcp_rx_free(tcp_pcb_t *t) { return TCP_RXBUF - 1 - tcp_rx_used(t); }
+static uint32_t tcp_snd_free(tcp_pcb_t *t) { return TCP_SNDBUF - t->snd_buf_len; }
+static uint32_t tcp_flight(tcp_pcb_t *t) { return t->snd_nxt - t->snd_una; }
 
 static tcp_pcb_t *tcp_alloc(void) {
     for (int i = 0; i < TCP_PCB_N; i++) {
         if (g_tcp[i].used) continue;
         kmemset(&g_tcp[i], 0, sizeof g_tcp[i]);
         g_tcp[i].used = 1;
+        g_tcp[i].snd_mss = TCP_MSS;
+        g_tcp[i].cwnd = 4 * TCP_MSS;           /* RFC 6928-ish initial window */
+        g_tcp[i].ssthresh = 0xFFFF;
+        g_tcp[i].rto = TCP_RTO_INIT;
         return &g_tcp[i];
     }
     return nullptr;
 }
 
-/* Emit a segment from `t` carrying `flags` and `len` payload bytes. */
-static void tcp_xmit(tcp_pcb_t *t, uint8_t flags, const uint8_t *data, uint32_t len) {
-    uint8_t seg[sizeof(tcp_hdr_t) + TCP_MSS];
-    if (len > TCP_MSS) len = TCP_MSS;
+/* Copy `n` send-buffer bytes for sequence `seq` into `dst`. */
+static void snd_copyout(tcp_pcb_t *t, uint32_t seq, uint8_t *dst, uint32_t n) {
+    uint32_t off = seq - t->snd_buf_seq;
+    uint32_t idx = (t->snd_buf_off + off) % TCP_SNDBUF;
+    for (uint32_t i = 0; i < n; i++) { dst[i] = t->sndbuf[idx]; idx = (idx + 1) % TCP_SNDBUF; }
+}
+
+/* Emit one segment with explicit seq/flags/payload. Does NOT advance snd_nxt;
+   tcp_output() owns sequence advancement. Sending any segment clears delack
+   (the segment carries our current rcv_nxt). With `mss_opt`, append an MSS
+   option (used on SYN / SYN-ACK). */
+static void tcp_send_seg(tcp_pcb_t *t, uint32_t seq, uint8_t flags,
+                         const uint8_t *data, uint32_t len, int mss_opt) {
+    uint8_t seg[sizeof(tcp_hdr_t) + 4 + TCP_MSS];
     tcp_hdr_t *th = (tcp_hdr_t *)seg;
+    uint32_t hlen = sizeof(tcp_hdr_t);
     th->src_port = htons_(t->local_port);
     th->dst_port = htons_(t->remote_port);
-    th->seq = htonl_(t->snd_nxt);
+    th->seq = htonl_(seq);
     th->ack = htonl_(t->rcv_nxt);
-    th->data_off = (sizeof(tcp_hdr_t) / 4) << 4;
     th->flags = flags;
     uint32_t freew = tcp_rx_free(t);
     th->window = htons_((uint16_t)(freew > 0xFFFF ? 0xFFFF : freew));
     th->csum = 0; th->urg = 0;
-    if (len) kmemcpy(seg + sizeof(tcp_hdr_t), data, len);
-    uint32_t tot = sizeof(tcp_hdr_t) + len;
+    if (mss_opt) {                              /* kind=2, len=4, value */
+        seg[hlen + 0] = 2; seg[hlen + 1] = 4;
+        seg[hlen + 2] = (uint8_t)(TCP_MSS >> 8); seg[hlen + 3] = (uint8_t)TCP_MSS;
+        hlen += 4;
+    }
+    th->data_off = (uint8_t)((hlen / 4) << 4);
+    if (len) kmemcpy(seg + hlen, data, len);
+    uint32_t tot = hlen + len;
     uint32_t sip = is_loopback(t->remote_ip) ? t->remote_ip : LOCAL_IP;
     th->csum = htons_(l4_checksum(IPPROTO_TCP, sip, t->remote_ip, seg, tot));
     ip_send(t->remote_ip, IPPROTO_TCP, seg, tot);
-    if (flags & (TCP_SYN | TCP_FIN)) t->snd_nxt += 1;   /* SYN/FIN take a seq */
-    t->snd_nxt += len;
+    t->delack = 0;
+}
+
+/* Arm/disarm the retransmission timer based on whether data is in flight. */
+static void tcp_set_rexmit(tcp_pcb_t *t) {
+    if (seq_lt(t->snd_una, t->snd_nxt)) {
+        t->rexmit_running = 1;
+        t->rto_deadline = timer_ticks() + t->rto;
+    } else {
+        t->rexmit_running = 0;
+        t->backoff = 0;
+    }
+}
+
+/* The sequence one past the last byte we have to send (data + an optional FIN). */
+static uint32_t tcp_send_high(tcp_pcb_t *t) {
+    uint32_t hi = t->snd_buf_seq + t->snd_buf_len;
+    if (t->need_fin) hi = t->fin_seq + 1;
+    return hi;
+}
+
+/* Send whatever the window allows: SYN, new data segments, and/or FIN, advancing
+   snd_nxt. Re-arms the RTO timer. Called after every state change that may free
+   window or queue data. Runs under sched_lock. */
+static void tcp_output(tcp_pcb_t *t) {
+    if (t->state == T_SYN_SENT) {               /* (re)send the SYN */
+        if (t->snd_nxt == t->iss) { tcp_send_seg(t, t->iss, TCP_SYN, nullptr, 0, 1); t->snd_nxt = t->iss + 1; }
+        tcp_set_rexmit(t);
+        return;
+    }
+    if (t->state == T_SYN_RCVD) {               /* (re)send the SYN-ACK */
+        if (t->snd_nxt == t->iss) { tcp_send_seg(t, t->iss, TCP_SYN | TCP_ACK, nullptr, 0, 1); t->snd_nxt = t->iss + 1; }
+        tcp_set_rexmit(t);
+        return;
+    }
+    if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT &&
+        t->state != T_FIN_WAIT_1 && t->state != T_CLOSING && t->state != T_LAST_ACK)
+        return;
+
+    uint32_t mss = t->snd_mss ? t->snd_mss : TCP_MSS;
+    uint32_t cwnd_win = t->cwnd;
+    uint32_t awnd = t->snd_wnd;
+    uint32_t win = cwnd_win < awnd ? cwnd_win : awnd;
+    uint32_t win_end = t->snd_una + win;
+    uint32_t data_hi = t->snd_buf_seq + t->snd_buf_len;
+    int sent_any = 0;
+
+    /* New data segments. */
+    while (seq_lt(t->snd_nxt, data_hi) && seq_lt(t->snd_nxt, win_end)) {
+        uint32_t n = data_hi - t->snd_nxt;
+        uint32_t room = win_end - t->snd_nxt;
+        if (n > room) n = room;
+        if (n > mss) n = mss;
+        if (n == 0) break;
+        uint8_t buf[TCP_MSS];
+        snd_copyout(t, t->snd_nxt, buf, n);
+        uint8_t fl = TCP_ACK | TCP_PSH;
+        tcp_send_seg(t, t->snd_nxt, fl, buf, n, 0);
+        if (!t->rtt_active) { t->rtt_active = 1; t->rtt_seq = t->snd_nxt; t->rtt_start = timer_ticks(); }
+        t->snd_nxt += n;
+        sent_any = 1;
+    }
+
+    /* FIN, once all data has been sent and the window admits it. */
+    if (t->need_fin && t->snd_nxt == t->fin_seq && seq_lt(t->snd_nxt, win_end + 1)) {
+        uint8_t fl = TCP_FIN | TCP_ACK;
+        tcp_send_seg(t, t->snd_nxt, fl, nullptr, 0, 0);
+        t->snd_nxt += 1;
+        sent_any = 1;
+    }
+    (void)sent_any;
+    tcp_set_rexmit(t);
+}
+
+/* App-context request to transmit: mark the pcb and wake the worker. Because a
+   loopback send re-enters the sched_lock-protected rx path, app threads (which
+   hold sched_lock) must never call tcp_output() directly — they defer it to the
+   worker, where loopback sends queue to the worker-private loq instead. Caller
+   holds sched_lock. */
+static void tcp_kick(tcp_pcb_t *t) {
+    t->need_output = 1;
+    g_tcp_work = 1;
+    wait_queue_wake_all_locked(&g_rxq_wq);
+}
+
+/* Worker-context: flush every pcb an app thread queued output on. Under lock. */
+static void tcp_pump(void) {
+    for (int i = 0; i < TCP_PCB_N; i++) {
+        tcp_pcb_t *t = &g_tcp[i];
+        if (!t->used || !t->need_output) continue;
+        t->need_output = 0;
+        tcp_output(t);
+        wait_queue_wake_all_locked(&t->wq);
+    }
 }
 
 /* Send a bare RST in response to a segment with no matching connection. */
@@ -508,6 +673,25 @@ static void tcp_send_rst(uint32_t dst, uint16_t dport, uint16_t sport, uint32_t 
     uint32_t sip = is_loopback(dst) ? dst : LOCAL_IP;
     th.csum = htons_(l4_checksum(IPPROTO_TCP, sip, dst, (uint8_t *)&th, sizeof th));
     ip_send(dst, IPPROTO_TCP, &th, sizeof th);
+}
+
+/* Parse a peer SYN's options for the MSS option; clamp our send MSS. */
+static void tcp_parse_mss(tcp_pcb_t *t, const uint8_t *p, uint32_t doff) {
+    const uint8_t *o = p + sizeof(tcp_hdr_t);
+    const uint8_t *end = p + doff;
+    while (o < end) {
+        uint8_t kind = o[0];
+        if (kind == 0) break;                   /* EOL */
+        if (kind == 1) { o++; continue; }       /* NOP */
+        if (o + 1 >= end) break;
+        uint8_t olen = o[1];
+        if (olen < 2 || o + olen > end) break;
+        if (kind == 2 && olen == 4) {
+            uint16_t pm = (uint16_t)((o[2] << 8) | o[3]);
+            if (pm && pm < t->snd_mss) t->snd_mss = pm;
+        }
+        o += olen;
+    }
 }
 
 /* ---- kernel-side TCP API (wrapped by socket syscalls in the next rung) ---- */
@@ -543,9 +727,10 @@ static tcp_pcb_t *tcp_connect(uint32_t dip, uint16_t dport) {
     t->remote_ip = dip; t->remote_port = dport;
     t->iss = g_iss; g_iss += 0x10000;
     t->snd_una = t->snd_nxt = t->iss;
-    t->snd_wnd = 0xFFFF;
-    tcp_xmit(t, TCP_SYN, nullptr, 0);          /* SYN; snd_nxt -> iss+1 */
+    t->snd_buf_seq = t->iss + 1;                /* first data byte lands here */
+    t->snd_wnd = TCP_MSS;                        /* until the SYN-ACK tells us more */
     sched_lock();
+    tcp_kick(t);                                /* worker emits the SYN */
     while (t->used && t->state == T_SYN_SENT && !t->reset)
         wait_queue_sleep_locked(&t->wq);
     int ok = t->used && t->state == T_ESTABLISHED;
@@ -559,22 +744,25 @@ static int tcp_write(tcp_pcb_t *t, const uint8_t *data, uint32_t len) {
     while (sent < len) {
         sched_lock();
         while (t->used && !t->reset &&
-               (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT)) {
-            uint32_t inflight = t->snd_nxt - t->snd_una;
-            uint32_t wnd = t->snd_wnd > inflight ? t->snd_wnd - inflight : 0;
-            if (wnd > 0) { sched_unlock(); goto cansend; }
-            wait_queue_sleep_locked(&t->wq);     /* wait for the window to open */
+               (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) &&
+               tcp_snd_free(t) == 0)
+            wait_queue_sleep_locked(&t->wq);     /* wait for buffer room */
+        if (!t->used || t->reset ||
+            (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT)) {
+            sched_unlock();
+            return sent ? (int)sent : -1;        /* connection no longer writable */
         }
-        sched_unlock();
-        return sent ? (int)sent : -1;            /* connection no longer writable */
-    cansend:;
-        uint32_t inflight = t->snd_nxt - t->snd_una;
-        uint32_t wnd = t->snd_wnd > inflight ? t->snd_wnd - inflight : TCP_MSS;
+        uint32_t room = tcp_snd_free(t);
         uint32_t chunk = len - sent;
-        if (chunk > TCP_MSS) chunk = TCP_MSS;
-        if (chunk > wnd) chunk = wnd;
-        tcp_xmit(t, TCP_PSH | TCP_ACK, data + sent, chunk);
+        if (chunk > room) chunk = room;
+        for (uint32_t i = 0; i < chunk; i++) {
+            uint32_t idx = (t->snd_buf_off + t->snd_buf_len) % TCP_SNDBUF;
+            t->sndbuf[idx] = data[sent + i];
+            t->snd_buf_len++;
+        }
         sent += chunk;
+        tcp_kick(t);                             /* worker pushes within the window */
+        sched_unlock();
     }
     return (int)sent;
 }
@@ -587,36 +775,37 @@ static int tcp_read(tcp_pcb_t *t, uint8_t *buf, uint32_t len) {
     if (!t->used || t->reset) { sched_unlock(); return -1; }
     uint32_t avail = tcp_rx_used(t);
     uint32_t n = avail < len ? avail : len;
+    int was_full = (tcp_rx_free(t) == 0);
     for (uint32_t i = 0; i < n; i++) {
         buf[i] = t->rxbuf[t->rxtail];
         t->rxtail = (t->rxtail + 1) % TCP_RXBUF;
     }
     int eof = (n == 0 && t->peer_fin);
+    if (was_full && n > 0) tcp_kick(t);          /* window opened: advertise it */
     sched_unlock();
     return eof ? 0 : (int)n;
 }
 
 static void tcp_close(tcp_pcb_t *t) {
-    /* Decide under the lock, but transmit the FIN *after* releasing it: tcp_close
-       runs in task context, and a loopback send re-enters net_rx (which takes
-       sched_lock), so emitting while holding it would self-deadlock. */
-    int send_fin = 0;
     sched_lock();
     t->app_closed = 1;
     if (t->used && (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT)) {
+        t->need_fin = 1;
+        t->fin_seq = t->snd_buf_seq + t->snd_buf_len;   /* after all queued data */
         t->state = (t->state == T_CLOSE_WAIT) ? T_LAST_ACK : T_FIN_WAIT_1;
-        send_fin = 1;
-    } else {
-        t->used = 0;                            /* LISTEN / already closing: drop */
+        tcp_kick(t);                            /* worker emits the FIN once data drains */
+    } else if (t->state != T_TIME_WAIT && t->state != T_FIN_WAIT_1 &&
+               t->state != T_FIN_WAIT_2 && t->state != T_CLOSING &&
+               t->state != T_LAST_ACK) {
+        t->used = 0;                            /* LISTEN / SYN_SENT: drop */
     }
     sched_unlock();
-    if (send_fin) tcp_xmit(t, TCP_FIN | TCP_ACK, nullptr, 0);
 }
 
-/* ---- TCP receive path (worker context) ---- */
+/* ---- TCP receive path (worker context, under sched_lock) ---- */
 
-static void tcp_deliver_data(tcp_pcb_t *t, uint32_t seq, const uint8_t *data, uint32_t plen) {
-    if (plen == 0 || seq != t->rcv_nxt) return;   /* in-order only */
+/* Append in-order bytes [seq, seq+plen) to the rx ring; returns bytes accepted. */
+static uint32_t tcp_rx_append(tcp_pcb_t *t, const uint8_t *data, uint32_t plen) {
     uint32_t freew = tcp_rx_free(t);
     uint32_t n = plen < freew ? plen : freew;
     for (uint32_t i = 0; i < n; i++) {
@@ -624,6 +813,139 @@ static void tcp_deliver_data(tcp_pcb_t *t, uint32_t seq, const uint8_t *data, ui
         t->rxhead = (t->rxhead + 1) % TCP_RXBUF;
     }
     t->rcv_nxt += n;
+    return n;
+}
+
+/* After rcv_nxt advances, splice in any OOO segments that are now contiguous. */
+static void tcp_reassemble(tcp_pcb_t *t) {
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        for (int i = 0; i < TCP_OOO_N; i++) {
+            tcp_ooo_t *o = &t->ooo[i];
+            if (!o->used) continue;
+            if (seq_le(o->seq, t->rcv_nxt) && seq_gt(o->seq + o->len, t->rcv_nxt)) {
+                uint32_t skip = t->rcv_nxt - o->seq;
+                tcp_rx_append(t, o->data + skip, o->len - skip);
+                o->used = 0; progress = 1;
+            } else if (seq_le(o->seq + o->len, t->rcv_nxt)) {
+                o->used = 0;                    /* wholly stale */
+            }
+        }
+    }
+}
+
+/* Buffer an out-of-order segment for later reassembly (best effort). */
+static void tcp_ooo_store(tcp_pcb_t *t, uint32_t seq, const uint8_t *data, uint32_t plen) {
+    if (plen > TCP_MSS) plen = TCP_MSS;
+    for (int i = 0; i < TCP_OOO_N; i++)         /* drop exact duplicates */
+        if (t->ooo[i].used && t->ooo[i].seq == seq && t->ooo[i].len >= plen) return;
+    for (int i = 0; i < TCP_OOO_N; i++) {
+        if (t->ooo[i].used) continue;
+        t->ooo[i].used = 1; t->ooo[i].seq = seq; t->ooo[i].len = plen;
+        kmemcpy(t->ooo[i].data, data, plen);
+        return;
+    }
+    /* table full: drop — the sender will retransmit */
+}
+
+/* Receive-side data handling: in-order delivery, OOO buffering, and the ACK
+   policy (immediate dup-ACK out of order, else delayed ACK). */
+static void tcp_recv_data(tcp_pcb_t *t, uint32_t seq, const uint8_t *data, uint32_t plen) {
+    if (plen == 0) return;
+    uint32_t seg_end = seq + plen;
+    if (seq_le(seg_end, t->rcv_nxt)) {          /* fully old: ACK to re-sync peer */
+        tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
+        return;
+    }
+    if (seq == t->rcv_nxt) {                     /* in order */
+        tcp_rx_append(t, data, plen);
+        tcp_reassemble(t);
+        if (++t->delack >= 2) {                  /* ACK every second segment */
+            tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
+            t->delack = 0;
+        } else {
+            t->delack_deadline = timer_ticks() + TCP_DELACK;
+        }
+    } else if (seq_gt(seq, t->rcv_nxt)) {        /* gap: buffer + immediate dup ACK */
+        tcp_ooo_store(t, seq, data, plen);
+        tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
+    } else {                                     /* partial overlap below rcv_nxt */
+        uint32_t skip = t->rcv_nxt - seq;
+        tcp_rx_append(t, data + skip, plen - skip);
+        tcp_reassemble(t);
+        tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
+        t->delack = 0;
+    }
+}
+
+/* Process an incoming ACK: advance snd_una, free the send buffer, sample RTT,
+   grow the congestion window, and fast-retransmit on triple dup ACKs. */
+static void tcp_recv_ack(tcp_pcb_t *t, uint32_t ack, uint16_t win, uint32_t seq) {
+    uint32_t mss = t->snd_mss ? t->snd_mss : TCP_MSS;
+
+    if (seq_gt(ack, t->snd_una) && seq_le(ack, t->snd_nxt)) {
+        uint32_t acked = ack - t->snd_una;
+
+        /* Free acknowledged DATA from the send buffer. */
+        if (seq_gt(ack, t->snd_buf_seq)) {
+            uint32_t fb = ack - t->snd_buf_seq;
+            if (fb > t->snd_buf_len) fb = t->snd_buf_len;
+            t->snd_buf_off = (t->snd_buf_off + fb) % TCP_SNDBUF;
+            t->snd_buf_len -= fb;
+            t->snd_buf_seq += fb;
+        }
+        t->snd_una = ack;
+        t->dupacks = 0;
+        t->backoff = 0;
+
+        /* RTT sample (Karn: only for non-retransmitted segments). */
+        if (t->rtt_active && seq_ge(ack, t->rtt_seq + 1)) {
+            uint32_t m = (uint32_t)(timer_ticks() - t->rtt_start);
+            if ((int32_t)m < 1) m = 1;
+            if (!t->srtt) { t->srtt = m << 3; t->rttvar = m << 1; }
+            else {
+                int32_t err = (int32_t)m - (int32_t)(t->srtt >> 3);
+                t->srtt = (uint32_t)((int32_t)t->srtt + err);
+                if (err < 0) err = -err;
+                t->rttvar = (uint32_t)((int32_t)t->rttvar + (err - (int32_t)(t->rttvar >> 2)));
+            }
+            t->rto = (t->srtt >> 3) + t->rttvar;
+            if (t->rto < TCP_RTO_MIN) t->rto = TCP_RTO_MIN;
+            if (t->rto > TCP_RTO_MAX) t->rto = TCP_RTO_MAX;
+            t->rtt_active = 0;
+        }
+
+        /* Congestion window growth. */
+        if (t->cwnd < t->ssthresh) t->cwnd += mss;                  /* slow start */
+        else t->cwnd += mss * mss / (t->cwnd ? t->cwnd : mss);      /* cong. avoidance */
+        if (t->cwnd > 0xFFFFFF) t->cwnd = 0xFFFFFF;
+        (void)acked;
+    } else if (ack == t->snd_una && seq_lt(t->snd_una, t->snd_nxt)) {
+        /* Duplicate ACK: count, fast-retransmit on the third. */
+        if (++t->dupacks == 3) {
+            uint32_t flight = tcp_flight(t);
+            t->ssthresh = (flight / 2 > 2u * mss) ? flight / 2 : 2u * mss;
+            t->cwnd = t->ssthresh;
+            t->snd_nxt = t->snd_una;             /* go-back-N from the gap */
+            t->rtt_active = 0;
+            tcp_output(t);
+        }
+    }
+
+    /* Update the send window (SND.WND) on newer info. */
+    if (seq_lt(t->snd_wl1, seq) || (t->snd_wl1 == seq && seq_le(t->snd_wl2, ack))) {
+        t->snd_wnd = win; t->snd_wl1 = seq; t->snd_wl2 = ack;
+    }
+    if (win == 0 && seq_lt(t->snd_una, tcp_send_high(t))) {
+        /* zero window: leave the RTO running as a persist timer */
+    }
+}
+
+static void tcp_enter_timewait(tcp_pcb_t *t) {
+    t->state = T_TIME_WAIT;
+    t->rexmit_running = 0;
+    t->tw_deadline = timer_ticks() + TCP_2MSL;
 }
 
 static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
@@ -659,9 +981,13 @@ static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
                 c->remote_ip = src; c->remote_port = sport;
                 c->iss = g_iss; g_iss += 0x10000;
                 c->snd_una = c->snd_nxt = c->iss;
-                c->rcv_nxt = seq + 1;             /* +1 for the SYN */
-                c->snd_wnd = win; c->listener = lst;
-                tcp_xmit(c, TCP_SYN | TCP_ACK, nullptr, 0);
+                c->snd_buf_seq = c->iss + 1;
+                c->rcv_nxt = seq + 1;            /* +1 for the SYN */
+                c->snd_wnd = win ? win : TCP_MSS;
+                c->snd_wl1 = seq; c->snd_wl2 = c->iss;
+                c->listener = lst;
+                tcp_parse_mss(c, p, doff);
+                tcp_output(c);                   /* SYN-ACK */
             }
         } else if (!(flags & TCP_RST)) {
             tcp_send_rst(src, dport, sport, seq + plen + ((flags & TCP_SYN) ? 1 : 0));
@@ -670,25 +996,46 @@ static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
         return;
     }
 
-    if (flags & TCP_RST) { t->reset = 1; t->state = T_CLOSED; wait_queue_wake_all_locked(&t->wq); sched_unlock(); return; }
-
-    if (flags & TCP_ACK) {
-        if (seq_gt(ack, t->snd_una)) t->snd_una = ack;
-        t->snd_wnd = win;
+    if (flags & TCP_RST) {
+        t->reset = 1; t->state = T_CLOSED;
+        wait_queue_wake_all_locked(&t->wq);
+        if (t->app_closed) t->used = 0;
+        sched_unlock();
+        return;
     }
+
+    /* A retransmitted SYN-ACK or FIN reaching TIME-WAIT: re-ACK and restart 2MSL. */
+    if (t->state == T_TIME_WAIT) {
+        tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
+        t->tw_deadline = timer_ticks() + TCP_2MSL;
+        sched_unlock();
+        return;
+    }
+
+    if (flags & TCP_ACK) tcp_recv_ack(t, ack, win, seq);
 
     switch (t->state) {
     case T_SYN_SENT:
         if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
             t->rcv_nxt = seq + 1;
+            t->snd_wnd = win ? win : TCP_MSS;
+            t->snd_wl1 = seq; t->snd_wl2 = ack;
+            t->syn_acked = 1;
+            tcp_parse_mss(t, p, doff);
             t->state = T_ESTABLISHED;
-            tcp_xmit(t, TCP_ACK, nullptr, 0);
+            tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
+            tcp_output(t);                       /* flush any queued data */
+        } else if (flags & TCP_SYN) {            /* simultaneous open */
+            t->rcv_nxt = seq + 1;
+            t->state = T_SYN_RCVD;
+            tcp_output(t);
         }
         break;
     case T_SYN_RCVD:
         if (flags & TCP_ACK) {
             t->state = T_ESTABLISHED;
-            tcp_pcb_t *l = t->listener;           /* hand to accept() */
+            t->syn_acked = 1;
+            tcp_pcb_t *l = t->listener;          /* hand to accept() */
             if (l) {
                 int next = (l->aq_head + 1) % TCP_ACCEPTQ;
                 if (next != l->aq_tail) { l->acceptq[l->aq_head] = t; l->aq_head = next; }
@@ -699,36 +1046,96 @@ static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
     default: break;
     }
 
-    if (t->state == T_ESTABLISHED || t->state == T_FIN_WAIT_1 || t->state == T_FIN_WAIT_2) {
-        if (plen && seq == t->rcv_nxt) {
-            tcp_deliver_data(t, seq, data, plen);
-            tcp_xmit(t, TCP_ACK, nullptr, 0);
-        }
+    if (t->state == T_ESTABLISHED || t->state == T_FIN_WAIT_1 ||
+        t->state == T_FIN_WAIT_2 || t->state == T_CLOSING) {
+        if (plen) tcp_recv_data(t, seq, data, plen);
     }
 
-    /* FIN handling (only when it is the next in-order byte). */
-    if ((flags & TCP_FIN) && seq + plen == t->rcv_nxt) {
+    /* FIN handling (only once it is the next in-order byte). */
+    if ((flags & TCP_FIN) && seq_le(seq, t->rcv_nxt) &&
+        seq + plen == t->rcv_nxt && !t->peer_fin) {
         t->rcv_nxt += 1;
         t->peer_fin = 1;
-        tcp_xmit(t, TCP_ACK, nullptr, 0);
+        tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
         if (t->state == T_ESTABLISHED)      t->state = T_CLOSE_WAIT;
         else if (t->state == T_FIN_WAIT_1)  t->state = T_CLOSING;
-        else if (t->state == T_FIN_WAIT_2)  t->state = T_CLOSED;
+        else if (t->state == T_FIN_WAIT_2)  tcp_enter_timewait(t);
     }
 
-    /* Our FIN being ACKed. */
-    if ((flags & TCP_ACK) && t->snd_una == t->snd_nxt) {
-        if (t->state == T_FIN_WAIT_1)     t->state = t->peer_fin ? T_CLOSED : T_FIN_WAIT_2;
-        else if (t->state == T_CLOSING)   t->state = T_CLOSED;
-        else if (t->state == T_LAST_ACK)  t->state = T_CLOSED;
+    /* Our FIN being ACKed (snd_una has reached snd_nxt with the FIN counted). */
+    if ((flags & TCP_ACK) && t->snd_una == t->snd_nxt && t->need_fin &&
+        seq_gt(t->snd_una, t->fin_seq)) {
+        if (t->state == T_FIN_WAIT_1)     t->state = t->peer_fin ? (tcp_enter_timewait(t), T_TIME_WAIT) : T_FIN_WAIT_2;
+        else if (t->state == T_CLOSING)   tcp_enter_timewait(t);
+        else if (t->state == T_LAST_ACK)  { t->state = T_CLOSED; if (t->app_closed) t->used = 0; }
     }
+
+    /* Otherwise push any newly-admitted data/window forward. */
+    if (t->used && (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT))
+        tcp_output(t);
 
     wait_queue_wake_all_locked(&t->wq);
-    /* Reclaim a fully-closed connection once the app is also done with it (skip
-       TIME_WAIT — loopback/SLIRP won't deliver stale segments). Otherwise CLOSED
-       pcbs would leak and eventually exhaust the pool, silently dropping SYNs. */
-    if (t->state == T_CLOSED && t->app_closed) t->used = 0;
     sched_unlock();
+}
+
+/* The TCP slow/fast timer: retransmission, delayed-ACK flush, zero-window
+   persist, and TIME-WAIT expiry. Runs in the worker context under sched_lock,
+   so its loopback sends defer to the worker's loq like any other rx-path send. */
+static void tcp_timer(void) {
+    uint64_t now = timer_ticks();
+    for (int i = 0; i < TCP_PCB_N; i++) {
+        tcp_pcb_t *t = &g_tcp[i];
+        if (!t->used) continue;
+
+        if (t->state == T_TIME_WAIT) {
+            if (seq_ge((uint32_t)now, (uint32_t)t->tw_deadline) && now >= t->tw_deadline) {
+                t->used = 0; wait_queue_wake_all_locked(&t->wq);
+            }
+            continue;
+        }
+
+        /* Delayed-ACK flush. */
+        if (t->delack && now >= t->delack_deadline) {
+            tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
+            t->delack = 0;
+        }
+
+        /* Retransmission timeout. */
+        if (t->rexmit_running && now >= t->rto_deadline) {
+            if (++t->backoff > TCP_REXMIT_MAX) {        /* give up */
+                t->reset = 1; t->state = T_CLOSED;
+                wait_queue_wake_all_locked(&t->wq);
+                if (t->app_closed) t->used = 0;
+                continue;
+            }
+            t->rto <<= 1;
+            if (t->rto > TCP_RTO_MAX) t->rto = TCP_RTO_MAX;
+            uint32_t flight = tcp_flight(t);
+            uint32_t mss = t->snd_mss ? t->snd_mss : TCP_MSS;
+            t->ssthresh = (flight / 2 > 2u * mss) ? flight / 2 : 2u * mss;
+            t->cwnd = mss;                              /* collapse to slow start */
+            t->rtt_active = 0;                          /* Karn */
+            t->dupacks = 0;
+            t->snd_nxt = t->snd_una;                    /* go-back-N */
+
+            if (t->snd_wnd == 0 && seq_lt(t->snd_una, tcp_send_high(t))) {
+                /* Zero-window persist: probe one byte past the window. */
+                uint32_t hi = t->snd_buf_seq + t->snd_buf_len;
+                if (seq_lt(t->snd_una, hi)) {
+                    uint8_t b; snd_copyout(t, t->snd_una, &b, 1);
+                    tcp_send_seg(t, t->snd_una, TCP_ACK | TCP_PSH, &b, 1, 0);
+                    if (t->snd_una == t->snd_nxt) t->snd_nxt = t->snd_una + 1;
+                }
+                t->rexmit_running = 1;
+                t->rto_deadline = now + t->rto;
+            } else {
+                tcp_output(t);                          /* resend from snd_una */
+                t->rexmit_running = 1;
+                t->rto_deadline = now + t->rto;
+            }
+            wait_queue_wake_all_locked(&t->wq);
+        }
+    }
 }
 
 /* ---- socket layer (wraps the UDP/TCP PCBs for the syscall interface) ---- */
@@ -837,7 +1244,10 @@ int ksock_poll(void *vp, int want) {
         if ((want & NET_POLLIN) &&
             (tcp_rx_used(t) > 0 || t->peer_fin || t->aq_head != t->aq_tail || t->reset))
             r |= NET_POLLIN;
-        if ((want & NET_POLLOUT) && t->state == T_ESTABLISHED) r |= NET_POLLOUT;
+        if ((want & NET_POLLOUT) &&
+            (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) &&
+            tcp_snd_free(t) > 0)
+            r |= NET_POLLOUT;
     } else if (s->udp) {
         if ((want & NET_POLLIN) && s->udp->qhead != s->udp->qtail) r |= NET_POLLIN;
         if (want & NET_POLLOUT) r |= NET_POLLOUT;
@@ -871,17 +1281,24 @@ static void net_worker(void *arg) {
     g_net_worker = task_current();
     for (;;) {
         sched_lock();
-        while (g_rxq_head == g_rxq_tail)
+        while (g_rxq_head == g_rxq_tail && !g_tcp_timer_pending && !g_tcp_work)
             wait_queue_sleep_locked(&g_rxq_wq);
-        rxslot_t *s = &g_rxq[g_rxq_tail];
+        int run_timer = g_tcp_timer_pending; g_tcp_timer_pending = 0;
+        g_tcp_work = 0;
         static uint8_t local[ETH_FRAME_MAX];
-        uint16_t n = s->len;
-        kmemcpy(local, s->data, n);
-        g_rxq_tail = (g_rxq_tail + 1) % RXQ_N;
+        uint16_t n = 0;
+        if (g_rxq_head != g_rxq_tail) {
+            rxslot_t *s = &g_rxq[g_rxq_tail];
+            n = s->len;
+            kmemcpy(local, s->data, n);
+            g_rxq_tail = (g_rxq_tail + 1) % RXQ_N;
+        }
+        if (run_timer) tcp_timer();              /* drives RTO / delack / TIME-WAIT */
+        tcp_pump();                              /* flush app-queued output */
         sched_unlock();
-        net_input(local, n);
+        if (n) net_input(local, n);
 
-        /* Drain loopback frames this frame generated (and any they generate). */
+        /* Drain loopback frames this frame (and the timer) generated. */
         while (g_loq_head != g_loq_tail) {
             static uint8_t lb[ETH_FRAME_MAX];
             uint16_t ln = g_loq[g_loq_tail].len;
@@ -889,6 +1306,19 @@ static void net_worker(void *arg) {
             g_loq_tail = (g_loq_tail + 1) % LOQ_N;
             net_input(lb, ln);
         }
+    }
+}
+
+/* A 50 ms ticker that nudges the worker to run tcp_timer(). Kept separate from
+   the worker so the worker can keep blocking on the rx queue between ticks. */
+static void net_tcp_ticker(void *arg) {
+    (void)arg;
+    for (;;) {
+        ksleep_ms(50);
+        sched_lock();
+        g_tcp_timer_pending = 1;
+        wait_queue_wake_all_locked(&g_rxq_wq);
+        sched_unlock();
     }
 }
 
@@ -950,6 +1380,16 @@ static void net_pinger(void *arg) {
     } else {
         kprintf("[net] tcp connect to :8080 failed\n");
     }
+
+    /* Bulk transfer: stream several MSS-worth through the send buffer / window. */
+    tcp_pcb_t *b = tcp_connect(LOCAL_IP, 8081);
+    if (b) {
+        static uint8_t blk[6000];
+        for (uint32_t i = 0; i < sizeof blk; i++) blk[i] = (uint8_t)('A' + (i % 26));
+        int w = tcp_write(b, blk, sizeof blk);
+        kprintf("[net] tcp bulk wrote %d bytes to :8081\n", w);
+        tcp_close(b);
+    }
 }
 
 /* Tiny in-guest HTTP/1.0 server on port 80, so a userspace HTTP client (our
@@ -1008,6 +1448,27 @@ static void net_tcp_server(void *arg) {
     }
 }
 
+/* Bulk sink on port 8081: drain to EOF and report the byte count. Exercises the
+   multi-segment send-buffer / window path (the echo test never exceeds one MSS). */
+static void net_tcp_sink(void *arg) {
+    (void)arg;
+    tcp_pcb_t *l = tcp_listen(8081);
+    if (!l) return;
+    for (;;) {
+        tcp_pcb_t *c = tcp_accept(l);
+        if (!c) continue;
+        uint8_t buf[1024];
+        uint32_t total = 0;
+        for (;;) {
+            int n = tcp_read(c, buf, sizeof buf);
+            if (n <= 0) break;
+            total += (uint32_t)n;
+        }
+        kprintf("[net] tcp sink received %u bytes (multi-segment)\n", total);
+        tcp_close(c);
+    }
+}
+
 void net_attach(net_device_t *dev) { g_dev = dev; g_up = 1; }
 int  net_up(void)        { return g_up; }
 uint32_t net_local_ip(void) { return LOCAL_IP; }
@@ -1015,7 +1476,9 @@ uint32_t net_local_ip(void) { return LOCAL_IP; }
 void net_init(void) {
     if (!virtio_net_init()) { kprintf("[net] no NIC; networking disabled\n"); return; }
     task_create("netd", net_worker, nullptr);
+    task_create("net-tcptmr", net_tcp_ticker, nullptr);
     task_create("net-tcpd", net_tcp_server, nullptr);
+    task_create("net-sinkd", net_tcp_sink, nullptr);
     task_create("net-httpd", net_http_server, nullptr);
     task_create("net-ping", net_pinger, nullptr);
     kprintf("[net] up: 10.0.2.15/24 gw 10.0.2.2\n");
