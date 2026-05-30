@@ -12,6 +12,7 @@
 #include "apic.h"
 #include "smp.h"
 #include "fs.h"
+#include "net.h"
 #include "usermode.h"
 #include "percpu.h"
 #include "../../boot/include/bootinfo.h"
@@ -259,6 +260,7 @@ extern "C" void kmain(BootInfo *bi) {
        bring up the other CPUs (each joins the scheduler from ap_entry). The
        initial tasks exist first so the APs have work the moment they're up. */
     sched_init();
+    net_init();           /* probe virtio-net + start the net worker (ROADMAP §5) */
     create_initial_tasks();
     smp_init();
     smp_ipi_selftest();   /* verify the cross-CPU IPI path (ROADMAP §2) */

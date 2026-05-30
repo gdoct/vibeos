@@ -61,7 +61,23 @@ typedef struct virtio_blk_req_hdr {
 #define VIRTIO_PCI_VENDOR          0x1AF4
 #define VIRTIO_PCI_DEVICE_LO       0x1000
 #define VIRTIO_PCI_DEVICE_HI       0x107F
+#define VIRTIO_SUBSYSTEM_NET       1     /* PCI subsystem id for net */
 #define VIRTIO_SUBSYSTEM_BLOCK     2     /* PCI subsystem id for blk */
+
+/* virtio-net feature bits (legacy). We accept only MAC so the device-config MAC
+   is valid; declining MRG_RXBUF/VERSION_1 keeps the rx/tx header at 10 bytes. */
+#define VIRTIO_NET_F_MAC           (1u << 5)
+
+/* Legacy virtio-net header prepended to every rx/tx buffer (no mergeable
+   rx buffers, no VERSION_1). */
+typedef struct virtio_net_hdr {
+    uint8_t  flags;
+    uint8_t  gso_type;
+    uint16_t hdr_len;
+    uint16_t gso_size;
+    uint16_t csum_start;
+    uint16_t csum_offset;
+} __attribute__((packed)) virtio_net_hdr_t;
 
 #ifdef __cplusplus
 }

@@ -72,3 +72,21 @@ int pci_find(uint16_t vendor, uint16_t device_lo, uint16_t device_hi,
     }
     return 0;
 }
+
+int pci_find_subsys(uint16_t vendor, uint16_t subsys, pci_dev_t *out) {
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t dev = 0; dev < 32; dev++) {
+            for (uint8_t fn = 0; fn < 8; fn++) {
+                uint32_t vd = pci_read32((uint8_t)bus, dev, fn, 0);
+                uint16_t ven = (uint16_t)(vd & 0xFFFF);
+                if (ven == 0xFFFF || ven != vendor) continue;
+                if (pci_read16((uint8_t)bus, dev, fn, PCI_SUBSYSTEM_ID) != subsys) continue;
+                out->bus = (uint8_t)bus; out->dev = dev; out->fn = fn;
+                out->vendor = ven;
+                out->device = (uint16_t)(vd >> 16);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}

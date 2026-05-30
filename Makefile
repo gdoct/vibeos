@@ -113,6 +113,8 @@ KERNEL_C_SRCS = \
 	kernel/src/random.c \
 	kernel/src/file.c \
 	kernel/src/pipe.c \
+	kernel/src/net.c \
+	kernel/src/drivers/virtio_net.c \
 	kernel/src/drivers/fb.c \
 	kernel/src/drivers/font.c \
 	kernel/src/drivers/ramdisk.c \
@@ -303,7 +305,8 @@ run: $(IMG) $(VDISK)
 	  -drive format=raw,file=$(IMG) \
 	  -drive if=none,id=vd0,format=raw,file=$(VDISK) \
 	  -device virtio-blk-pci,drive=vd0 \
-	  -net none -serial stdio
+	  -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+	  -serial stdio
 
 clean:
 	rm -rf boot/build kernel/build user/build

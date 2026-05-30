@@ -262,7 +262,9 @@ static int vblk_write(block_device_t *bd, uint64_t lba, uint32_t count, const vo
 
 extern "C" block_device_t *virtio_blk_init(void) {
     pci_dev_t d;
-    if (!pci_find(VIRTIO_PCI_VENDOR, VIRTIO_PCI_DEVICE_LO, VIRTIO_PCI_DEVICE_HI, &d)) {
+    /* Match the block subsystem specifically so we don't grab the NIC (both are
+       virtio, same device-id range) — ROADMAP §5. */
+    if (!pci_find_subsys(VIRTIO_PCI_VENDOR, VIRTIO_SUBSYSTEM_BLOCK, &d)) {
         kprintf("[virtio-blk] no device found\n");
         return nullptr;
     }

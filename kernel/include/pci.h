@@ -16,6 +16,7 @@ extern "C" {
 #define PCI_BAR0            0x10
 #define PCI_INTERRUPT_LINE  0x3C   /* 8-bit: PIC IRQ the device is wired to */
 #define PCI_INTERRUPT_PIN   0x3D   /* 8-bit: INTA#..INTD# (1..4), 0 = none */
+#define PCI_SUBSYSTEM_ID    0x2E   /* 16-bit: legacy virtio device type lives here */
 
 #define PCI_CMD_IO          (1u << 0)
 #define PCI_CMD_MEMORY      (1u << 1)
@@ -37,6 +38,11 @@ void     pci_write16(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint16_t
    [device_lo, device_hi]. Returns 1 if found, 0 otherwise. */
 int pci_find(uint16_t vendor, uint16_t device_lo, uint16_t device_hi,
              pci_dev_t *out);
+
+/* Find the first device matching `vendor` and the given PCI subsystem id. Legacy
+   virtio uses the subsystem id as the device type (1 = net, 2 = block), so this
+   disambiguates several virtio functions that share the same device-id range. */
+int pci_find_subsys(uint16_t vendor, uint16_t subsys, pci_dev_t *out);
 
 #ifdef __cplusplus
 }
