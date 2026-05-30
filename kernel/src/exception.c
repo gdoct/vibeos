@@ -1,5 +1,7 @@
 #include "kernel.h"
 #include "regs.h"
+#include "task.h"
+#include "paging.h"
 
 static const char *exc_name(uint64_t v) {
     switch (v) {
@@ -27,10 +29,32 @@ static const char *exc_name(uint64_t v) {
     }
 }
 
-extern "C" __attribute__((noreturn))
+extern "C"
 void exception_handler(regs_t *r) {
     uint64_t cr2;
     __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+    /* Copy-on-write repair: a ring-3 write to a present, user, read-only page
+       that carries PTE_COW is fixed up here (private copy, or re-grant write if
+       sole owner). On success we return and the faulting store is retried by the
+       iretq in isr_common. (#PF error: bit1 = write, bit2 = user.) */
+    if (r->vector == 14 && (r->error_code & 2) && (r->error_code & 4)) {
+        task_t *t = task_current();
+        if (t && t->vm && paging_cow_fault(t->vm, cr2))
+            return;
+    }
+
+    /* A fault that came from ring 3 (or otherwise belongs to a running user
+       task) is the process's bug, not the kernel's — kill it and reschedule
+       rather than taking the whole system down (ROADMAP §1.1: guarded user
+       stacks / bad user pointers must not panic). */
+    if ((r->cs & 3) == 3 && sched_active()) {
+        task_t *t = task_current();
+        kprintf("\n[fault] %s in user task %d \"%s\": err=%lx rip=%016lx cr2=%016lx -> SIGSEGV\n",
+                exc_name(r->vector), t ? t->id : -1, t ? t->name : "?",
+                r->error_code, r->rip, cr2);
+        task_exit_user(139);            /* 128 + SIGSEGV; reported via wait4 */
+    }
 
     kprintf("\n!! EXCEPTION %lu (%s) err=%lx\n",
             r->vector, exc_name(r->vector), r->error_code);

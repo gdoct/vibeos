@@ -57,6 +57,11 @@ extern "C" void syscall_entry(void);
 #define ENOSPC_     28
 #define E2BIG_      7
 #define ENOSYS_     38
+#define EFAULT_     14
+
+/* The current user task's address space — the target for all copy_*_user
+   validation. Kernel threads have no vm and never reach the user-pointer paths. */
+static inline vmspace_t *cur_vm(void) { return task_current()->vm; }
 
 /* Linux open() flags (subset). */
 #define O_WRONLY      0x1
@@ -226,6 +231,8 @@ static int fd_install(file_t *f) {
 /* ---- basic I/O / exit ---- */
 
 static int64_t sys_write(int fd, const void *buf, uint64_t n) {
+    if (n && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)buf, n, 0))
+        return -EFAULT_;                        /* bad user buffer: no kernel fault */
     if (fd == 1 || fd == 2) {                   /* stdout / stderr -> serial */
         serial_write((const char *)buf, (size_t)n);
         return (int64_t)n;
@@ -247,6 +254,8 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
 }
 
 static int64_t sys_read(int fd, void *buf, uint64_t n) {
+    if (n && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)buf, n, 1))
+        return -EFAULT_;                        /* writable check + COW break */
     if (fd == 0)                                /* stdin -> serial console TTY */
         return tty_read((char *)buf, (uint32_t)n);
     if (fd == 1 || fd == 2) return -EBADF_;
@@ -267,12 +276,12 @@ static void sys_exit(int code) {
     __builtin_unreachable();
 }
 
-/* Copy a NUL-terminated user string into a kernel buffer (must run while the
-   caller's address space is still active). No fault handling yet. */
+/* Copy a NUL-terminated user string into a kernel buffer, validating the user
+   pages as it goes. A bad pointer yields an empty string rather than a kernel
+   fault (callers that care about the distinction use strncpy_from_user). */
 static void copy_user_str(char *dst, const char *src, unsigned n) {
-    unsigned i = 0;
-    for (; i + 1 < n && src[i]; i++) dst[i] = src[i];
-    dst[i] = '\0';
+    if (strncpy_from_user(dst, cur_vm(), (uint64_t)(uintptr_t)src, n) < 0)
+        dst[0] = '\0';
 }
 
 /* ---- execve (argv/envp pass-through) ---- */
@@ -295,13 +304,15 @@ static int copy_user_vec(char *const uvec[], char **kvec,
     unsigned off = *used;
     int n = 0;
     if (uvec) {
-        for (; n < EXEC_MAX_ARGS && uvec[n]; n++) {
-            const char *s = uvec[n];
+        for (; n < EXEC_MAX_ARGS; n++) {
+            uint64_t sptr;                          /* read uvec[n] safely */
+            if (copy_from_user(&sptr, cur_vm(),
+                    (uint64_t)(uintptr_t)&uvec[n], sizeof sptr) < 0) return -1;
+            if (sptr == 0) break;                   /* NULL terminator */
             kvec[n] = buf + off;
-            unsigned i = 0;
-            while (off + 1 < bufsz && s[i]) buf[off++] = s[i++];
-            if (off + 1 >= bufsz) return -1;        /* no room for the NUL */
-            buf[off++] = '\0';
+            long len = strncpy_from_user(buf + off, cur_vm(), sptr, bufsz - off);
+            if (len < 0) return -1;                 /* fault or no room for the NUL */
+            off += (unsigned)len + 1;
         }
     }
     kvec[n] = nullptr;
@@ -355,12 +366,19 @@ static int64_t sys_arch_prctl(int code, uint64_t addr) {
     task_t *t = task_current();
     switch (code) {
     case ARCH_SET_FS: t->fs_base = addr; wrmsr(MSR_FS_BASE, addr); return 0;
-    case ARCH_GET_FS: *(uint64_t *)(uintptr_t)addr = t->fs_base; return 0;
+    case ARCH_GET_FS:
+        if (copy_to_user(cur_vm(), addr, &t->fs_base, sizeof t->fs_base) < 0)
+            return -EFAULT_;
+        return 0;
     default:          return -EINVAL_;
     }
 }
 
 static int64_t sys_writev(int fd, const struct iovec *iov, int cnt) {
+    if (cnt < 0) return -EINVAL_;
+    if (cnt && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)iov,
+                               (uint64_t)cnt * sizeof(struct iovec), 0))
+        return -EFAULT_;
     int64_t total = 0;
     for (int i = 0; i < cnt; i++) {
         if (iov[i].iov_len == 0) continue;
@@ -402,7 +420,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t len) {
     task_t *t = task_current();
     for (uint64_t va = addr; va < addr + len; va += PAGE_SIZE) {
         uint64_t pa;
-        if (vmspace_query(t->vm, va, &pa)) pmm_free_page(pa);
+        if (vmspace_query(t->vm, va, &pa)) paging_unref_page(pa);  /* COW-aware free */
     }
     vmspace_unmap(t->vm, addr, len / PAGE_SIZE);
     return 0;
@@ -412,10 +430,16 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot) {
     len  = PAGE_ALIGN_UP(len);
     addr = PAGE_ALIGN_DOWN(addr);
     task_t *t = task_current();
-    uint64_t pflags = PTE_P | PTE_U | ((prot & PROT_WRITE) ? PTE_W : 0);
     for (uint64_t va = addr; va < addr + len; va += PAGE_SIZE) {
         uint64_t pa;
-        if (vmspace_query(t->vm, va, &pa)) vmspace_map(t->vm, va, pa, 1, pflags);
+        if (!vmspace_query(t->vm, va, &pa)) continue;
+        if (prot & PROT_WRITE) {
+            paging_cow_fault(t->vm, va);            /* privatise if COW-shared */
+            if (!vmspace_query(t->vm, va, &pa)) continue;  /* pa may have moved */
+            vmspace_map(t->vm, va, pa, 1, PTE_P | PTE_U | PTE_W);
+        } else {
+            vmspace_map(t->vm, va, pa, 1, PTE_P | PTE_U);
+        }
     }
     return 0;
 }
@@ -525,48 +549,66 @@ static int64_t sys_lseek(int fd, int64_t off, int whence) {
     return n;
 }
 
-static int64_t sys_fstat(int fd, struct linux_stat *st) {
-    if (fd >= 0 && fd <= 2) { fill_stat_console(st); return 0; }
+/* Fill `out` (a kernel struct) for an fd; the caller copies it to user space. */
+static int64_t fstat_k(int fd, struct linux_stat *out) {
+    if (fd >= 0 && fd <= 2) { fill_stat_console(out); return 0; }
     file_t *f = fd_get(fd);
     if (!f) return -EBADF_;
     if (f->kind == FD_PIPE_RD || f->kind == FD_PIPE_WR) {
-        kmemset(st, 0, sizeof *st);
-        st->st_mode = S_IFIFO | 0600;
-        st->st_nlink = 1;
-        st->st_blksize = 4096;
+        kmemset(out, 0, sizeof *out);
+        out->st_mode = S_IFIFO | 0600;
+        out->st_nlink = 1;
+        out->st_blksize = 4096;
         return 0;
     }
     fs_stat_t s;
     if (fs_istat(f->ino, &s) != FS_OK) return -ENOENT_;
-    fill_stat(st, f->ino, &s);
+    fill_stat(out, f->ino, &s);
+    return 0;
+}
+
+static int64_t sys_fstat(int fd, struct linux_stat *st) {
+    struct linux_stat ks;
+    int64_t r = fstat_k(fd, &ks);
+    if (r < 0) return r;
+    if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)st, &ks, sizeof ks) < 0) return -EFAULT_;
+    return 0;
+}
+
+/* Fill `out` for a path; the caller copies it to user space. */
+static int64_t pathstat_k(const char *upath, struct linux_stat *out) {
+    char path[256];
+    resolve_path(path, sizeof path, upath);
+    int ino = fs_resolve(path);
+    if (ino < 0) return fs_to_errno(ino);
+    fs_stat_t s;
+    if (fs_istat((uint32_t)ino, &s) != FS_OK) return -ENOENT_;
+    fill_stat(out, (uint32_t)ino, &s);
     return 0;
 }
 
 static int64_t sys_newfstatat(int dirfd, const char *upath,
                               struct linux_stat *st, int flag) {
+    struct linux_stat ks;
+    int64_t r;
     /* AT_EMPTY_PATH with an empty string means stat the dirfd itself. */
     if (flag & AT_EMPTY_PATH) {
         char tmp[4]; copy_user_str(tmp, upath, sizeof tmp);
-        if (tmp[0] == '\0') return sys_fstat(dirfd, st);
+        if (tmp[0] == '\0') r = fstat_k(dirfd, &ks);
+        else                r = pathstat_k(upath, &ks);
+    } else {
+        r = pathstat_k(upath, &ks);
     }
-    char path[256];
-    resolve_path(path, sizeof path, upath);
-    int ino = fs_resolve(path);
-    if (ino < 0) return fs_to_errno(ino);
-    fs_stat_t s;
-    if (fs_istat((uint32_t)ino, &s) != FS_OK) return -ENOENT_;
-    fill_stat(st, (uint32_t)ino, &s);
+    if (r < 0) return r;
+    if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)st, &ks, sizeof ks) < 0) return -EFAULT_;
     return 0;
 }
 
 static int64_t sys_stat(const char *upath, struct linux_stat *st) {
-    char path[256];
-    resolve_path(path, sizeof path, upath);
-    int ino = fs_resolve(path);
-    if (ino < 0) return fs_to_errno(ino);
-    fs_stat_t s;
-    if (fs_istat((uint32_t)ino, &s) != FS_OK) return -ENOENT_;
-    fill_stat(st, (uint32_t)ino, &s);
+    struct linux_stat ks;
+    int64_t r = pathstat_k(upath, &ks);
+    if (r < 0) return r;
+    if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)st, &ks, sizeof ks) < 0) return -EFAULT_;
     return 0;
 }
 
@@ -574,6 +616,8 @@ static int64_t sys_getdents64(int fd, void *ubuf, uint64_t count) {
     file_t *f = fd_get(fd);
     if (!f) return -EBADF_;
     if (f->kind != FD_DIR) return -ENOTDIR_;
+    if (count && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)ubuf, count, 1))
+        return -EFAULT_;
 
     uint8_t *out = (uint8_t *)ubuf;
     uint64_t used = 0;
@@ -606,7 +650,7 @@ static int64_t sys_getcwd(char *ubuf, uint64_t size) {
     const char *cwd = "/";                       /* no chdir yet */
     uint64_t n = (uint64_t)kstrlen(cwd) + 1;
     if (size < n) return -34;                    /* -ERANGE */
-    kmemcpy(ubuf, cwd, n);
+    if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)ubuf, cwd, n) < 0) return -EFAULT_;
     return (int64_t)n;
 }
 
@@ -614,6 +658,8 @@ static int64_t sys_getcwd(char *ubuf, uint64_t size) {
    descriptors, writing them to ufds[0]/ufds[1]. O_NONBLOCK/O_CLOEXEC in flags
    are honored as far as we model them (CLOEXEC is a no-op today). */
 static int64_t sys_pipe2(int *ufds, int flags) {
+    if (!paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)ufds, 2 * sizeof(int), 1))
+        return -EFAULT_;                         /* validate before allocating */
     pipe_t *p = pipe_create();
     if (!p) return -ENOMEM_;
 
@@ -694,7 +740,12 @@ static int64_t sys_wait4(int pid, int *ustatus, int options, void *rusage) {
     int code = 0;
     int got = task_wait(&code);
     if (got < 0) return got;                    /* -ECHILD */
-    if (ustatus) *ustatus = (code & 0xff) << 8; /* WEXITSTATUS-compatible */
+    if (ustatus) {
+        int wstatus = (code & 0xff) << 8;       /* WEXITSTATUS-compatible */
+        if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)ustatus,
+                         &wstatus, sizeof wstatus) < 0)
+            return -EFAULT_;
+    }
     return got;
 }
 

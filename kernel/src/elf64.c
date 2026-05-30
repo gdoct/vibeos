@@ -191,7 +191,10 @@ int user_load_path(vmspace_t *vm, const char *path,
     }
     fs_close(fd);
 
-    /* Stack. */
+    /* Stack. The page just below stk_lo is deliberately left unmapped as a
+       guard (ROADMAP §1.1, mirroring the kernel kstack guard): a stack overflow
+       faults into it and the process is killed (exception.c) instead of silently
+       trampling whatever lies below. Nothing else is mapped down there. */
     uint64_t stk_lo = USER_STACK_TOP - (uint64_t)USER_STACK_PAGES * PAGE_SIZE;
     map_user(vm, stk_lo, USER_STACK_TOP - stk_lo);
     build_initial_stack(&eh, ph, argv, envp, rsp_out);

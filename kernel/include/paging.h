@@ -32,6 +32,12 @@ extern "C" {
 #define PTE_PWT  (1ULL << 3)    /* write-through */
 #define PTE_PCD  (1ULL << 4)    /* cache disable */
 #define PTE_PS   (1ULL << 7)    /* page size (2 MiB at PD level) */
+#define PTE_COW  (1ULL << 9)    /* OS bit: copy-on-write (read-only, shared) */
+
+/* Highest userspace virtual address + 1. The low (user) half of the canonical
+   address space is [0, 0x0000_8000_0000_0000); copy_*_user rejects anything
+   at/above this so a bogus user pointer can never reach kernel memory. */
+#define USER_ADDR_END   0x0000800000000000ULL
 
 /* Build our page tables (identity + direct map) and load CR3. Must run
    after pmm_init — it allocates table pages from the PMM. */
@@ -66,8 +72,46 @@ void       vmspace_map(vmspace_t *vm, uint64_t va, uint64_t pa,
                        size_t pages, uint64_t flags);
 int        vmspace_query(vmspace_t *vm, uint64_t va, uint64_t *pa_out);
 void       vmspace_unmap(vmspace_t *vm, uint64_t va, size_t pages);  /* PTEs only; caller frees pa */
-vmspace_t *vmspace_fork(vmspace_t *parent);          /* eager deep copy */
+vmspace_t *vmspace_fork(vmspace_t *parent);          /* copy-on-write share */
 void       vmspace_destroy(vmspace_t *vm);           /* not while active */
+
+/* ---- Copy-on-write + page refcounts (ROADMAP §1.1). ----
+ * Every arena page carries a refcount = (number of PTEs pointing at it) - 1,
+ * so a privately-mapped page has refcount 0. vmspace_fork shares pages read-only
+ * with PTE_COW set and bumps the count; a write fault on such a page is repaired
+ * by paging_cow_fault (private copy, or just re-grant write if sole owner). */
+void page_refcount_init(void);
+
+/* Handle a user write fault at `va` in `vm`. Returns 1 if it was a COW page and
+   has now been made writable (the faulting instruction should be retried), 0 if
+   the fault is not a COW case (genuine protection violation). */
+int  paging_cow_fault(vmspace_t *vm, uint64_t va);
+
+/* Drop one reference to physical page `pa` (an arena page that backed a user
+   mapping), freeing it once the last reference goes away. */
+void paging_unref_page(uint64_t pa);
+
+/* ---- Validated user/kernel copies (ROADMAP §1.1). ----
+ * Move `n` bytes between a kernel buffer and user virtual addresses in `vm`,
+ * checking every page is present and user-accessible (and, for writes,
+ * breaking COW first) before touching it. Data moves through the direct map, so
+ * these are correct regardless of which CR3 is live and never fault in the
+ * kernel. Return 0 on success, -1 if any part of the user range is unmapped /
+ * not user / (for writes) read-only and not COW. */
+long copy_from_user(void *kdst, vmspace_t *vm, uint64_t usrc, uint64_t n);
+long copy_to_user(vmspace_t *vm, uint64_t udst, const void *ksrc, uint64_t n);
+
+/* Validate that [addr, addr+n) is entirely user-accessible in `vm` (breaking COW
+   for write==1 so the pages become privately writable). Returns 1 if the whole
+   range is usable, 0 otherwise. Lets a syscall hand a user buffer straight to a
+   driver/FS that reads or writes it through the (active) user VA without risking
+   a kernel fault. */
+int  paging_user_ok(vmspace_t *vm, uint64_t addr, uint64_t n, int write);
+
+/* Copy a NUL-terminated string from user space into `kdst` (capacity `max`,
+   always NUL-terminated on success). Returns the string length (excluding NUL),
+   -1 on a bad user address, or -2 if it did not fit in `max`. */
+long strncpy_from_user(char *kdst, vmspace_t *vm, uint64_t usrc, uint64_t max);
 
 /* Allocate a kernel stack of `pages` 4 KiB pages in the KSTACK_REGION
    window, with an unmapped guard page just below it. Returns the stack

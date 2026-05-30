@@ -210,6 +210,7 @@ extern "C" void kmain(BootInfo *bi) {
 
     pmm_init(bi);
     paging_init(bi);
+    page_refcount_init();   /* COW/usercopy page-refcount table (ROADMAP §1.1) */
     selftest_paging();
     selftest_heap();
 

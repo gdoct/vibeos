@@ -122,6 +122,21 @@ static int query_at(uint64_t pml4_phys, uint64_t va, uint64_t *pa_out) {
     return 1;
 }
 
+/* Return a pointer to the existing 4 KiB leaf PTE for `va` in `pml4_phys`, or
+   nullptr if any level along the way is absent (or a large page). The pointer
+   lives in the direct map, so writes to it edit the live table in place. */
+static uint64_t *leaf_pte(uint64_t pml4_phys, uint64_t va) {
+    uint64_t *pml4 = table(pml4_phys);
+    if (!(pml4[PML4_IDX(va)] & PTE_P)) return nullptr;
+    uint64_t *pdpt = table(pml4[PML4_IDX(va)] & PTE_ADDR);
+    if (!(pdpt[PDPT_IDX(va)] & PTE_P) || (pdpt[PDPT_IDX(va)] & PTE_PS)) return nullptr;
+    uint64_t *pd = table(pdpt[PDPT_IDX(va)] & PTE_ADDR);
+    if (!(pd[PD_IDX(va)] & PTE_P) || (pd[PD_IDX(va)] & PTE_PS)) return nullptr;
+    uint64_t *pt = table(pd[PD_IDX(va)] & PTE_ADDR);
+    if (!(pt[PT_IDX(va)] & PTE_P)) return nullptr;
+    return &pt[PT_IDX(va)];
+}
+
 void vmap(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
     map_at(g_pml4_phys, va, pa, pages, flags);
 }
@@ -216,6 +231,153 @@ uint64_t kstack_alloc(size_t pages, uint64_t *base_out) {
     return top;
 }
 
+/* ==== Page refcounts + copy-on-write (ROADMAP §1.1) ======================= */
+
+/* refcnt[i] = (number of PTEs pointing at arena page i) - 1. A page mapped by a
+   single PTE therefore reads as 0 (the zero-initialised default), so ordinary
+   private mappings need no bookkeeping; only fork()'s sharing touches this. */
+static uint16_t *g_refcnt = nullptr;
+static uint64_t  g_rc_base  = 0;     /* arena base phys */
+static uint64_t  g_rc_pages = 0;
+
+void page_refcount_init(void) {
+    g_rc_base  = pmm_arena_base();
+    g_rc_pages = pmm_arena_pages();
+    uint64_t bytes = g_rc_pages * sizeof(uint16_t);
+    uint64_t need  = PAGE_ALIGN_UP(bytes) / PAGE_SIZE;
+    uint64_t phys  = pmm_alloc_pages(need);     /* zeroed by the PMM */
+    if (!phys) panic("page_refcount_init: out of memory for %lu pages",
+                     (unsigned long)need);
+    g_refcnt = (uint16_t *)phys_to_virt(phys);
+    kprintf("[paging] page refcounts: %lu arena pages, %lu KiB table\n",
+            (unsigned long)g_rc_pages, (unsigned long)(need * PAGE_SIZE >> 10));
+}
+
+static inline int rc_index(uint64_t pa, uint64_t *idx) {
+    if (!g_refcnt || pa < g_rc_base) return 0;
+    uint64_t i = (pa - g_rc_base) >> 12;
+    if (i >= g_rc_pages) return 0;
+    *idx = i;
+    return 1;
+}
+
+/* Add a shared reference to `pa` (called when a second PTE starts pointing at
+   it, e.g. fork sharing). Pages outside the arena (none, in practice) are
+   silently ignored. */
+static void page_ref(uint64_t pa) {
+    uint64_t i;
+    if (rc_index(pa, &i)) g_refcnt[i]++;
+}
+
+void paging_unref_page(uint64_t pa) {
+    uint64_t i;
+    if (rc_index(pa, &i) && g_refcnt[i] > 0) { g_refcnt[i]--; return; }
+    pmm_free_page(pa);                          /* last (or untracked) reference */
+}
+
+int paging_cow_fault(vmspace_t *vm, uint64_t va) {
+    va &= ~PAGE_MASK;
+    uint64_t *pte = leaf_pte(vm->pml4_phys, va);
+    if (!pte) return 0;
+    uint64_t e = *pte;
+    if (!(e & PTE_U) || !(e & PTE_COW)) return 0;   /* not a COW page */
+
+    uint64_t old = e & PTE_ADDR;
+    uint64_t i;
+    if (rc_index(old, &i) && g_refcnt[i] > 0) {     /* still shared: private copy */
+        uint64_t neu = pmm_alloc_page();
+        if (!neu) return 0;                         /* OOM: caller kills the task */
+        kmemcpy(phys_to_virt(neu), phys_to_virt(old), PAGE_SIZE);
+        g_refcnt[i]--;
+        *pte = (neu & PTE_ADDR) | (e & ~PTE_ADDR & ~PTE_COW) | PTE_W;
+    } else {                                        /* sole owner: just re-grant W */
+        *pte = (e & ~PTE_COW) | PTE_W;
+    }
+    invlpg(va);
+    return 1;
+}
+
+/* ---- validated user/kernel copies ---- */
+
+/* Resolve user page `uva` in `vm` to its physical address, ensuring access.
+   For writes, break COW so the page is privately writable. Returns 0 on
+   success with *pa_out set, -1 on any access violation. */
+static int user_page_pa(vmspace_t *vm, uint64_t uva, int write, uint64_t *pa_out) {
+    uva &= ~PAGE_MASK;
+    uint64_t *pte = leaf_pte(vm->pml4_phys, uva);
+    if (!pte || !(*pte & PTE_U)) return -1;
+    if (write && !(*pte & PTE_W)) {
+        if (!paging_cow_fault(vm, uva)) return -1;  /* RO and not COW: refuse */
+        pte = leaf_pte(vm->pml4_phys, uva);
+        if (!pte || !(*pte & PTE_W)) return -1;
+    }
+    *pa_out = *pte & PTE_ADDR;
+    return 0;
+}
+
+/* Range entirely inside the user half and non-wrapping. */
+static int user_range_ok(uint64_t addr, uint64_t n) {
+    if (n == 0) return 1;
+    if (addr >= USER_ADDR_END) return 0;
+    if (addr + n < addr) return 0;                  /* wrap */
+    if (addr + n > USER_ADDR_END) return 0;
+    return 1;
+}
+
+long copy_from_user(void *kdst, vmspace_t *vm, uint64_t usrc, uint64_t n) {
+    if (!user_range_ok(usrc, n)) return -1;
+    uint8_t *d = (uint8_t *)kdst;
+    while (n) {
+        uint64_t pa, off = usrc & PAGE_MASK;
+        uint64_t chunk = PAGE_SIZE - off;
+        if (chunk > n) chunk = n;
+        if (user_page_pa(vm, usrc, 0, &pa) < 0) return -1;
+        kmemcpy(d, (uint8_t *)phys_to_virt(pa) + off, chunk);
+        d += chunk; usrc += chunk; n -= chunk;
+    }
+    return 0;
+}
+
+long copy_to_user(vmspace_t *vm, uint64_t udst, const void *ksrc, uint64_t n) {
+    if (!user_range_ok(udst, n)) return -1;
+    const uint8_t *s = (const uint8_t *)ksrc;
+    while (n) {
+        uint64_t pa, off = udst & PAGE_MASK;
+        uint64_t chunk = PAGE_SIZE - off;
+        if (chunk > n) chunk = n;
+        if (user_page_pa(vm, udst, 1, &pa) < 0) return -1;
+        kmemcpy((uint8_t *)phys_to_virt(pa) + off, s, chunk);
+        s += chunk; udst += chunk; n -= chunk;
+    }
+    return 0;
+}
+
+int paging_user_ok(vmspace_t *vm, uint64_t addr, uint64_t n, int write) {
+    if (!user_range_ok(addr, n)) return 0;
+    if (n == 0) return 1;
+    uint64_t a = addr & ~PAGE_MASK;
+    uint64_t end = addr + n;
+    for (; a < end; a += PAGE_SIZE) {
+        uint64_t pa;
+        if (user_page_pa(vm, a, write, &pa) < 0) return 0;
+    }
+    return 1;
+}
+
+long strncpy_from_user(char *kdst, vmspace_t *vm, uint64_t usrc, uint64_t max) {
+    if (max == 0) return -2;
+    for (uint64_t i = 0; i < max; i++) {
+        if (usrc + i >= USER_ADDR_END) return -1;
+        uint64_t pa;
+        if (user_page_pa(vm, usrc + i, 0, &pa) < 0) return -1;
+        char c = *((char *)phys_to_virt(pa) + ((usrc + i) & PAGE_MASK));
+        kdst[i] = c;
+        if (c == '\0') return (long)i;
+    }
+    kdst[max - 1] = '\0';
+    return -2;                                       /* truncated */
+}
+
 /* ==== Per-process address spaces (ROADMAP §3 Milestone B) ================= */
 
 uint64_t paging_kernel_pml4(void) { return g_pml4_phys; }
@@ -251,8 +413,12 @@ void vmspace_unmap(vmspace_t *vm, uint64_t va, size_t pages) {
     unmap_at(vm->pml4_phys, va, pages);
 }
 
-/* Eager fork: deep-copy the parent's user half (4 KiB leaves only — user
-   mappings are never large pages) into a brand-new address space. */
+/* Copy-on-write fork: share the parent's user pages with the child read-only
+   instead of deep-copying. Every shared writable leaf is demoted to read-only
+   with PTE_COW set in BOTH address spaces and its refcount bumped; the first
+   write in either process triggers paging_cow_fault to make a private copy.
+   Read-only pages (e.g. text) are shared as-is — still refcounted so neither
+   destroy double-frees them. */
 vmspace_t *vmspace_fork(vmspace_t *parent) {
     vmspace_t *child = vmspace_create();
     if (!child) return nullptr;
@@ -269,21 +435,29 @@ vmspace_t *vmspace_fork(vmspace_t *parent) {
                 for (uint64_t l = 0; l < ENTRIES; l++) {
                     uint64_t pte = ppt[l];
                     if (!(pte & PTE_P)) continue;
-                    uint64_t va  = (i << 39) | (j << 30) | (k << 21) | (l << 12);
-                    uint64_t dst = pmm_alloc_page();
-                    if (!dst) panic("vmspace_fork: out of memory");
-                    kmemcpy(phys_to_virt(dst), phys_to_virt(pte & PTE_ADDR), PAGE_SIZE);
-                    map_at(child->pml4_phys, va, dst, 1, (pte & (PTE_W | PTE_U)) | PTE_P);
+                    uint64_t va = (i << 39) | (j << 30) | (k << 21) | (l << 12);
+                    uint64_t pa = pte & PTE_ADDR;
+                    if (pte & PTE_W) {                 /* demote writable -> COW */
+                        pte = (pte & ~PTE_W) | PTE_COW;
+                        ppt[l] = pte;                  /* parent now shares it RO */
+                    }
+                    map_at(child->pml4_phys, va, pa, 1, pte & ~PTE_ADDR);
+                    page_ref(pa);                      /* +1 sharer */
                 }
             }
         }
     }
+    /* Flush the parent's TLB: its writable pages just became read-only COW.
+       (Parent is the active address space during fork.) */
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
     return child;
 }
 
 /* Free the user half (data pages + low-half page tables) and the PML4 itself.
-   The kernel upper half is shared, so it is left untouched. The caller must
-   not be running on this address space. */
+   Leaf data pages are released through the refcount (so COW-shared pages held
+   by another address space survive); page-table pages are private and freed
+   outright. The kernel upper half is shared, so it is left untouched. The
+   caller must not be running on this address space. */
 void vmspace_destroy(vmspace_t *vm) {
     uint64_t *pml4 = table(vm->pml4_phys);
     for (uint64_t i = 0; i < 256; i++) {
@@ -296,7 +470,7 @@ void vmspace_destroy(vmspace_t *vm) {
                 if (!(pd[k] & PTE_P) || (pd[k] & PTE_PS)) continue;
                 uint64_t pt_pa = pd[k] & PTE_ADDR; uint64_t *pt = table(pt_pa);
                 for (uint64_t l = 0; l < ENTRIES; l++)
-                    if (pt[l] & PTE_P) pmm_free_page(pt[l] & PTE_ADDR);
+                    if (pt[l] & PTE_P) paging_unref_page(pt[l] & PTE_ADDR);
                 pmm_free_page(pt_pa);
             }
             pmm_free_page(pd_pa);

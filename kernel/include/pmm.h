@@ -37,6 +37,12 @@ void     pmm_free_page(uint64_t phys);
 uint64_t pmm_free_bytes(void);
 uint64_t pmm_total_bytes(void);
 
+/* Arena extent (the contiguous region the allocator hands pages from). Used by
+   the page-refcount table (paging.c) to size and index its array. All
+   allocatable pages — and therefore every user page — lie within this range. */
+uint64_t pmm_arena_base(void);
+uint64_t pmm_arena_pages(void);
+
 #ifdef __cplusplus
 }
 #endif

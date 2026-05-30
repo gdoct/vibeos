@@ -102,3 +102,6 @@ uint64_t pmm_free_bytes(void)  {
     return (pmm_end - pmm_cursor) + pmm_freed * PAGE_SIZE;
 }
 uint64_t pmm_total_bytes(void) { return pmm_total; }
+
+uint64_t pmm_arena_base(void)  { return pmm_base; }
+uint64_t pmm_arena_pages(void) { return (pmm_end - pmm_base) / PAGE_SIZE; }

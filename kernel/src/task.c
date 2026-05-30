@@ -95,10 +95,16 @@ static task_t *alloc_task_slot(const char *name) {
         if (g_tasks[i].state == TASK_NONE || g_tasks[i].state == TASK_DEAD) { slot = i; break; }
     if (slot < 0) panic("task: pool full");
 
-    uint64_t base;
-    uint64_t top = kstack_alloc(KSTACK_PAGES, &base);
-
     task_t *t = &g_tasks[slot];
+
+    /* Kernel-stack reclamation (ROADMAP §1.1): a reaped slot keeps its kernel
+       stack and the next task reuses it, so kstack_alloc's bump window only ever
+       advances MAX_TASKS times total — no per-fork leak. The synthetic stack is
+       rebuilt from the top by the caller, so stale contents below don't matter.
+       A never-used slot gets a fresh stack the first time. */
+    uint64_t base = t->stack_base, top = t->stack_top;
+    if (!top) top = kstack_alloc(KSTACK_PAGES, &base);
+
     kmemset(t, 0, sizeof(*t));
     t->id = slot; t->name = name;
     t->stack_base = base; t->stack_top = top;
