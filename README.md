@@ -1,11 +1,18 @@
 # VibeOS
 
 VibeOS is a small x86_64 operating system built around a UEFI boot
-chain, a higher-half kernel, a writable on-disk filesystem, and a
-serial-backed userspace. The current tree boots end-to-end in QEMU + OVMF, 
+chain, a higher-half kernel, an SMP scheduler that runs user processes on every
+core, a writable on-disk filesystem, an IPv4/TCP network stack, and a
+serial-backed userspace. The current tree boots end-to-end in QEMU + OVMF,
 mounts a VibeFS volume, loads `/bin/init` from disk, and runs a shell in userspace.
 
-VibeOS is implemented from scratch in C and assembly, with a .NET 8 host tool for creating and populating VibeFS disk images. The kernel is Linux-compatible at the syscall level, so it can run simple Linux applications that don't depend on specific hardware features or complex syscalls. The kernel and userspace are built with Clang targeting x86_64, and the bootloader is a UEFI application linked with LLD. 
+VibeOS is implemented from scratch in C++ (C-style, freestanding) and assembly,
+with a .NET 8 host tool for creating and populating VibeFS disk images. The
+kernel follows the Linux x86_64 syscall ABI, so it runs unmodified
+`x86_64-linux-musl` binaries — both static and dynamically linked (it ships
+`ld-musl.so` and loads PIEs via `PT_INTERP`) — as long as they don't depend on
+syscalls it hasn't implemented yet. The kernel, userspace, and bootloader are
+built with `g++` and GNU `ld` (the bootloader is a UEFI PE32+ application).
 
 All features were vibe coded, and the project is licensed under MIT.
 
@@ -18,26 +25,33 @@ project state. The major pieces that are available today are:
 	ACPI, and the UEFI memory map, then hands off a `BootInfo` struct.
 - Higher-half kernel with its own paging setup, direct map, and the low
 	half left free for userspace.
-- Core x86_64 plumbing: GDT, IDT, TSS, exception handling, SYSCALL /
+- Core x86_64 plumbing: per-CPU GDT/TSS, IDT, exception handling, SYSCALL /
 	SYSRET, and APIC-based interrupt handling.
-- SMP support is implemented.
-- Preemptive round-robin scheduler with blocking sleep, wait queues, and
-	an idle task.
-- Physical memory management and a slab-style `kmalloc` / `kfree`.
+- SMP with user tasks scheduled on every core — per-CPU TSS + GS base with
+	`swapgs` on kernel entry, cross-CPU IPIs, and TLB shootdown.
+- Preemptive scheduler with blocking sleep and wait queues.
+- Physical memory management and a slab-style `kmalloc` / `kfree`;
+	copy-on-write `fork` with per-page refcounts and validated user/kernel copies.
+- POSIX signals: handlers, blocked/pending masks, default actions,
+	`kill`/`sigaltstack`/`sigreturn`; CPU faults are turned into signals.
 - Framebuffer graphics, serial logging, and a basic text console.
-- RAM disk and virtio-blk drivers, plus PCI enumeration.
+- RAM disk and virtio-blk drivers, virtio-net, plus PCI enumeration.
+- A compact IPv4 network stack (ARP, IP, ICMP, UDP, TCP) with BSD sockets
+	(`socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`/`poll`) and a
+	ported `wget`.
 - VibeFS, a small writable filesystem with directories, files, and
 	crash-safe ordered updates.
-- Userspace loading from disk, per-process address spaces, `fork`,
-	`execve`, `wait4`, and an interactive `/bin/sh`.
+- Userspace loading from disk (static and dynamically-linked musl), per-process
+	address spaces, `fork`, `execve`, `wait4`, and an interactive `/bin/sh`.
 
 ## Repository Layout
 
 - [boot/](boot/) - UEFI bootloader and ESP image builder.
 - [kernel/](kernel/) - kernel, drivers, memory management, scheduler,
 	filesystem, and userspace support.
-- [user/](user/) - static userspace programs such as `init`, `hello`,
-	and `sh`.
+- [user/](user/) - userspace programs: the freestanding `init`/`sh`/`hello`,
+	plus static and dynamic musl test binaries under [user/musl/](user/musl/)
+	(`sigtest`, `cputest`, `nettest`, `wget`, `dynhello`, …).
 - [interop/tools/diskutil/](interop/tools/diskutil/) - host-side .NET
 	tooling for creating and populating VibeFS volumes.
 - [ROADMAP.md](ROADMAP.md) - feature status and planned follow-ups.
@@ -81,13 +95,16 @@ You can pass a custom volume size if you want a different VibeFS disk:
 
 ## Running
 
-Boot the image in QEMU with OVMF and the attached VibeFS data disk:
+Boot the image in QEMU with OVMF, the attached VibeFS data disk, and a
+virtio-net NIC (QEMU user/SLIRP networking):
 
 ```bash
 make run
 ```
 
-The kernel logs to serial, so QEMU's stdio is the primary console.
+The kernel logs to serial, so QEMU's stdio is the primary console. At the shell,
+try the bundled test binaries — e.g. `mhello`, `sigtest`, `nettest`, or
+`wget http://localhost/` (fetched over the in-guest TCP/IP stack).
 
 ## Notes
 
