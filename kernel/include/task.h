@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "signal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,7 +61,12 @@ typedef struct task {
     uint64_t      mmap_next;    /* bump pointer for anonymous mmap() in the user half */
     struct task  *parent;
     int           exit_code;
+    int           term_signal;  /* nonzero if killed by a signal (wait4 status) */
+    int           stopped;      /* job-control stop (SIGSTOP/SIGTSTP) in effect */
     wait_queue_t  child_wq;
+
+    /* Signal disposition table, masks, pending set, altstack (ROADMAP §3). */
+    task_sigstate_t sig;
 
     /* Per-process fd table (ROADMAP §4 rung 2). Indices 0/1/2 are the serial
        console implicitly; 3+ point at refcounted open-file objects. NULL == a
@@ -98,6 +104,19 @@ void    task_exit(void);
    ZOMBIE and wakes the parent's wait; otherwise reaps immediately. */
 __attribute__((noreturn))
 void    task_exit_user(int code);
+
+/* Terminate the current user task because of signal `sig` (ROADMAP §3): like
+   task_exit_user but the wait4 status reports WIFSIGNALED instead of an exit
+   code. Does not return. */
+__attribute__((noreturn))
+void    task_exit_signal(int sig);
+
+/* Signal-support helpers (used by signal.c). */
+task_t *task_by_id(int id);          /* live task with this pid, or NULL */
+int     task_running_cpu(task_t *t); /* CPU index if RUNNING, else -1 */
+void    task_signal_wake(task_t *t); /* nudge a blocked task so it can deliver */
+void    task_stop_current(void);     /* job-control stop until task_cont */
+void    task_cont(task_t *t);        /* undo a stop */
 
 /* Reap one ZOMBIE child of the current task, freeing its address space and
    slot and returning its pid (with *status set to the exit code). Blocks if

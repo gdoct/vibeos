@@ -2,6 +2,7 @@
 #include "regs.h"
 #include "task.h"
 #include "paging.h"
+#include "signal.h"
 
 static const char *exc_name(uint64_t v) {
     switch (v) {
@@ -44,16 +45,25 @@ void exception_handler(regs_t *r) {
             return;
     }
 
-    /* A fault that came from ring 3 (or otherwise belongs to a running user
-       task) is the process's bug, not the kernel's — kill it and reschedule
-       rather than taking the whole system down (ROADMAP §1.1: guarded user
-       stacks / bad user pointers must not panic). */
+    /* A fault from ring 3 is the process's bug, not the kernel's. Turn it into
+       the matching signal (ROADMAP §3): a handler (if installed) runs and the
+       faulting instruction is retried; otherwise the default action terminates
+       the process. Either way the kernel keeps running. */
     if ((r->cs & 3) == 3 && sched_active()) {
+        int sig;
+        switch (r->vector) {
+        case 6:  sig = SIGILL;  break;          /* #UD invalid opcode */
+        case 0:  sig = SIGFPE;  break;          /* #DE divide error  */
+        case 16: case 19: sig = SIGFPE; break;  /* x87 / SIMD FP     */
+        case 17: sig = SIGBUS;  break;          /* #AC alignment     */
+        default: sig = SIGSEGV; break;          /* #PF/#GP/#SS/...   */
+        }
         task_t *t = task_current();
-        kprintf("\n[fault] %s in user task %d \"%s\": err=%lx rip=%016lx cr2=%016lx -> SIGSEGV\n",
+        kprintf("\n[fault] %s in user task %d \"%s\": err=%lx rip=%016lx cr2=%016lx -> signal %d\n",
                 exc_name(r->vector), t ? t->id : -1, t ? t->name : "?",
-                r->error_code, r->rip, cr2);
-        task_exit_user(139);            /* 128 + SIGSEGV; reported via wait4 */
+                r->error_code, r->rip, cr2, sig);
+        signals_raise_fault(r, sig);    /* enters handler (returns) or terminates */
+        return;
     }
 
     kprintf("\n!! EXCEPTION %lu (%s) err=%lx\n",

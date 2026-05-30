@@ -10,6 +10,7 @@
 #include "tty.h"
 #include "usermode.h"
 #include "smp.h"
+#include "signal.h"
 
 /*
  * System calls (ROADMAP §3 + §4 Linux ABI).
@@ -353,6 +354,7 @@ static int64_t sys_execve(const char *upath, char *const uargv[], char *const ue
     }
     vmspace_destroy(oldvm);                     /* committed; old AS now idle */
     kfree(a);
+    signals_exec(t);                            /* reset caught handlers to default */
     t->fs_base = 0;                             /* fresh image: TLS reset until arch_prctl */
     kprintf("[syscall] exec '%s' -> entry=%lx\n", path, (unsigned long)entry);
     enter_user(entry, rsp);                     /* does not return */
@@ -738,18 +740,15 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
 static int64_t sys_wait4(int pid, int *ustatus, int options, void *rusage) {
     (void)pid; (void)options; (void)rusage;     /* wait for any child for now */
     int code = 0;
-    int got = task_wait(&code);
+    int got = task_wait(&code);                 /* code already encoded (exit/signal) */
     if (got < 0) return got;                    /* -ECHILD */
-    if (ustatus) {
-        int wstatus = (code & 0xff) << 8;       /* WEXITSTATUS-compatible */
-        if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)ustatus,
-                         &wstatus, sizeof wstatus) < 0)
-            return -EFAULT_;
-    }
+    if (ustatus &&
+        copy_to_user(cur_vm(), (uint64_t)(uintptr_t)ustatus, &code, sizeof code) < 0)
+        return -EFAULT_;
     return got;
 }
 
-extern "C" uint64_t syscall_dispatch(syscall_frame_t *f) {
+static uint64_t do_syscall(syscall_frame_t *f) {
     switch (f->rax) {
     case 0:   return (uint64_t)sys_read((int)f->rdi, (void *)f->rsi, f->rdx);
     case 1:   return (uint64_t)sys_write((int)f->rdi, (const void *)f->rsi, f->rdx);
@@ -766,8 +765,11 @@ extern "C" uint64_t syscall_dispatch(syscall_frame_t *f) {
     case 10:  return (uint64_t)sys_mprotect(f->rdi, f->rsi, (int)f->rdx);  /* mprotect */
     case 11:  return (uint64_t)sys_munmap(f->rdi, f->rsi);      /* munmap */
     case 12:  return sys_brk(f->rdi);
-    case 13:  return 0;                                        /* rt_sigaction (stub) */
-    case 14:  return 0;                                        /* rt_sigprocmask (stub) */
+    case 13:  return (uint64_t)sys_rt_sigaction((int)f->rdi, (const void *)f->rsi,
+                                                (void *)f->rdx, f->r10);  /* rt_sigaction */
+    case 14:  return (uint64_t)sys_rt_sigprocmask((int)f->rdi, (const void *)f->rsi,
+                                                  (void *)f->rdx, f->r10); /* rt_sigprocmask */
+    case 15:  return signals_sigreturn(f);                     /* rt_sigreturn */
     case 16:  return (uint64_t)(int64_t)-ENOTTY_;              /* ioctl: not a tty */
     case 20:  return (uint64_t)sys_writev((int)f->rdi, (const struct iovec *)f->rsi,
                                           (int)f->rdx);        /* writev */
@@ -776,6 +778,11 @@ extern "C" uint64_t syscall_dispatch(syscall_frame_t *f) {
     case 32:  return (uint64_t)sys_dup((int)f->rdi);           /* dup */
     case 33:  return (uint64_t)sys_dup2((int)f->rdi, (int)f->rsi);  /* dup2 */
     case 39:  return (uint64_t)task_current()->id;             /* getpid */
+    case 62:  return (uint64_t)sys_kill((int)f->rdi, (int)f->rsi);   /* kill */
+    case 200: return (uint64_t)sys_kill((int)f->rdi, (int)f->rsi);   /* tkill(tid,sig) */
+    case 234: return (uint64_t)sys_tgkill((int)f->rdi, (int)f->rsi, (int)f->rdx); /* tgkill */
+    case 127: return (uint64_t)sys_rt_sigpending((void *)f->rdi, f->rsi);  /* rt_sigpending */
+    case 131: return (uint64_t)sys_sigaltstack((const void *)f->rdi, (void *)f->rsi); /* sigaltstack */
     case 72:  return (uint64_t)sys_fcntl((int)f->rdi, (int)f->rsi, f->rdx);  /* fcntl */
     case 186: return (uint64_t)task_current()->id;             /* gettid (== pid, no threads) */
     case 79:  return (uint64_t)sys_getcwd((char *)f->rdi, f->rsi);  /* getcwd */
@@ -808,4 +815,14 @@ extern "C" uint64_t syscall_dispatch(syscall_frame_t *f) {
         kprintf("[syscall] unknown nr=%lu\n", (unsigned long)f->rax);
         return (uint64_t)-ENOSYS_;
     }
+}
+
+/* Syscall entry point (usermode.S). Run the call, record its result in the saved
+   frame, then deliver any pending signal on the way back to userspace — which
+   may rewrite the frame to enter a handler or terminate the task (ROADMAP §3). */
+extern "C" uint64_t syscall_dispatch(syscall_frame_t *f) {
+    uint64_t ret = do_syscall(f);
+    f->rax = ret;
+    signals_deliver_syscall(f);
+    return f->rax;
 }

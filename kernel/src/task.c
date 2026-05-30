@@ -154,6 +154,7 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     t->brk_max   = parent->brk_max;
     t->fs_base   = parent->fs_base;     /* child shares the TLS layout (AS copied) */
     t->mmap_next = parent->mmap_next;
+    signals_fork(t, parent);            /* inherit handlers + mask (not pending) */
 
     /* Dup the fd table: the child shares each open-file object (and thus its
        offset) with the parent, à la Linux fork. */
@@ -295,15 +296,17 @@ static void wq_wake_all_locked(wait_queue_t *wq) {
     wq->head = wq->tail = nullptr;
 }
 
-void task_exit_user(int code) {
+static void task_exit_common(int code, int sig) {
     task_t *t = task_current();
-    kprintf("[sched] task %d \"%s\" exit(%d)\n", t->id, t->name, code);
+    if (sig) kprintf("[sched] task %d \"%s\" killed by signal %d\n", t->id, t->name, sig);
+    else     kprintf("[sched] task %d \"%s\" exit(%d)\n", t->id, t->name, code);
     /* Release open files before becoming a zombie (the address space is reaped
        later by the parent's wait4). */
     for (int i = 0; i < VFS_MAX_FD; i++)
         if (t->fdt[i]) { file_unref(t->fdt[i]); t->fdt[i] = nullptr; }
     sched_lock();
-    t->exit_code = code;
+    t->exit_code   = code;
+    t->term_signal = sig;
     task_t *p = t->parent;
     if (p && p->state != TASK_NONE && p->state != TASK_DEAD) {
         t->state = TASK_ZOMBIE;       /* parent's wait4 reaps */
@@ -312,7 +315,53 @@ void task_exit_user(int code) {
         t->state = TASK_DEAD;
     }
     sched();
-    panic("task_exit_user: returned");
+    panic("task_exit: returned");
+}
+
+void task_exit_user(int code)  { task_exit_common(code, 0); __builtin_unreachable(); }
+void task_exit_signal(int sig) { task_exit_common(0, sig);  __builtin_unreachable(); }
+
+task_t *task_by_id(int id) {
+    if (id < 1 || id >= MAX_TASKS) return nullptr;
+    task_t *t = &g_tasks[id];
+    if (t->state == TASK_NONE || t->state == TASK_DEAD) return nullptr;
+    return t;
+}
+
+int task_running_cpu(task_t *t) {
+    for (int c = 0; c < SMP_MAX_CPUS; c++)
+        if (g_cpu_cur[c] == t) return c;
+    return -1;
+}
+
+/* Nudge a task that may be asleep so it returns to userspace and delivers a
+   freshly-raised signal. Waking a BLOCKED task makes it READY; the blocking
+   primitive re-checks and (for interruptible waits like tty_read) bails with
+   -EINTR, after which signal delivery runs on the syscall return. */
+void task_signal_wake(task_t *t) {
+    sched_lock();
+    if (t->stopped) { sched_unlock(); return; }   /* stopped: leave for SIGCONT */
+    make_ready_locked(t);
+    sched_unlock();
+}
+
+/* Job-control stop: park the current task until task_cont. */
+void task_stop_current(void) {
+    sched_lock();
+    task_t *t = g_cpu_cur[smp_cpu_index()];
+    t->stopped = 1;
+    t->state = TASK_BLOCKED;
+    sched();                          /* resumes here once continued */
+    sched_unlock();
+}
+
+void task_cont(task_t *t) {
+    sched_lock();
+    if (t->stopped) {
+        t->stopped = 0;
+        if (t->state == TASK_BLOCKED) t->state = TASK_READY;
+    }
+    sched_unlock();
 }
 
 int task_wait(int *status) {
@@ -324,12 +373,16 @@ int task_wait(int *status) {
             task_t *c = &g_tasks[i];
             if (c->parent != p) continue;
             if (c->state == TASK_ZOMBIE) {
-                int pid = c->id, code = c->exit_code;
+                int pid = c->id;
+                /* Encode a Linux wait status: WIFSIGNALED (low 7 bits = signal)
+                   if killed by a signal, else WIFEXITED ((code & 0xff) << 8). */
+                int wstatus = c->term_signal ? (c->term_signal & 0x7f)
+                                             : ((c->exit_code & 0xff) << 8);
                 struct vmspace *vm = c->vm;
                 c->state = TASK_DEAD; c->parent = nullptr; c->vm = nullptr;
                 sched_unlock();
                 if (vm) vmspace_destroy(vm);   /* zombie won't run again */
-                if (status) *status = code;
+                if (status) *status = wstatus;
                 return pid;
             }
             if (c->state != TASK_DEAD && c->state != TASK_NONE) have_child = 1;

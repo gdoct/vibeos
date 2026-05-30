@@ -2,6 +2,7 @@
 #include "irq.h"
 #include "task.h"
 #include "tty.h"
+#include "signal.h"
 
 /*
  * Canonical serial TTY (ROADMAP §3 B.4). See tty.h for the model.
@@ -87,8 +88,13 @@ int tty_read(char *buf, uint32_t n) {
        push+wake, so a commit on the BSP can't be missed by a reader on another
        core (ROADMAP §2). */
     sched_lock();
-    while (g_head == g_tail)             /* block until a line is committed */
+    while (g_head == g_tail) {           /* block until a line is committed */
+        if (signals_pending_current()) { /* interrupt the read so the signal lands */
+            sched_unlock();
+            return -4;                   /* -EINTR */
+        }
         wait_queue_sleep_locked(&g_tty_wq);
+    }
     uint32_t i = 0;
     while (i < n && g_head != g_tail) {
         char c = g_cooked[g_tail];

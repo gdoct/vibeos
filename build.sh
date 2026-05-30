@@ -47,6 +47,8 @@ rm -f "$VDISK"
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/faulttest.elf /bin/faulttest
 [ -f user/build/cputest.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/cputest.elf /bin/cputest
+[ -f user/build/sigtest.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/sigtest.elf /bin/sigtest
 
 step "Volume contents"
 "$DISKUTIL" --diskfile "$VDISK" --ls /

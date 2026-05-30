@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "irq.h"
 #include "apic.h"
+#include "signal.h"
 
 extern "C" void pic_remap(uint8_t off1, uint8_t off2);
 extern "C" void pic_eoi(uint8_t irq);
@@ -49,4 +50,9 @@ extern "C" void irq_dispatch(regs_t *r) {
     if (g_apic_mode) lapic_eoi();
     else             pic_eoi(irq);
     if (g_handlers[irq]) g_handlers[irq](irq, r);
+
+    /* On the way back to ring 3, deliver any pending signal to the interrupted
+       task (ROADMAP §3). This is how a signal reaches a process spinning in
+       userspace, including one running on another core (its next tick). */
+    signals_deliver_regs(r);
 }
