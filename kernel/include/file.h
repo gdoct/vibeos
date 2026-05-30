@@ -26,6 +26,7 @@ typedef enum {
     FD_DIR,         /* directory (offset is a dirent byte cursor) */
     FD_PIPE_RD,     /* read end of a pipe (uses `pipe`, not `ino`/`off`) */
     FD_PIPE_WR,     /* write end of a pipe */
+    FD_SOCKET,      /* network socket (uses `sock`); ROADMAP §5 */
 } fd_kind_t;
 
 struct pipe;            /* kernel/include/pipe.h */
@@ -37,6 +38,7 @@ typedef struct file {
     uint64_t  off;          /* file: byte offset; dir: dirent cursor */
     int       flags;        /* Linux open() flags */
     struct pipe *pipe;      /* pipe object (FD_PIPE_RD/WR) */
+    void     *sock;         /* socket object (FD_SOCKET) */
 } file_t;
 
 file_t *file_alloc(void);          /* refcount = 1, or NULL if the pool is full */

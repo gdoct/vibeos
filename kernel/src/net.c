@@ -596,17 +596,19 @@ static int tcp_read(tcp_pcb_t *t, uint8_t *buf, uint32_t len) {
 }
 
 static void tcp_close(tcp_pcb_t *t) {
+    /* Decide under the lock, but transmit the FIN *after* releasing it: tcp_close
+       runs in task context, and a loopback send re-enters net_rx (which takes
+       sched_lock), so emitting while holding it would self-deadlock. */
+    int send_fin = 0;
     sched_lock();
     if (t->used && (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT)) {
-        int passive = (t->state == T_CLOSE_WAIT);
-        tcp_xmit(t, TCP_FIN | TCP_ACK, nullptr, 0);
-        t->state = passive ? T_LAST_ACK : T_FIN_WAIT_1;
-        sched_unlock();
-        return;
+        t->state = (t->state == T_CLOSE_WAIT) ? T_LAST_ACK : T_FIN_WAIT_1;
+        send_fin = 1;
+    } else {
+        t->used = 0;                            /* LISTEN / already closing: drop */
     }
-    /* Not established (LISTEN, or already closing): drop it. */
-    t->used = 0;
     sched_unlock();
+    if (send_fin) tcp_xmit(t, TCP_FIN | TCP_ACK, nullptr, 0);
 }
 
 /* ---- TCP receive path (worker context) ---- */
@@ -721,6 +723,129 @@ static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
 
     wait_queue_wake_all_locked(&t->wq);
     sched_unlock();
+}
+
+/* ---- socket layer (wraps the UDP/TCP PCBs for the syscall interface) ---- */
+
+typedef struct ksocket {
+    int        used;
+    int        type;            /* SOCK_STREAM / SOCK_DGRAM */
+    uint16_t   bind_port;       /* requested local port (bind) */
+    udp_pcb_t *udp;
+    tcp_pcb_t *tcp;
+    uint32_t   peer_ip;         /* connected UDP peer */
+    uint16_t   peer_port;
+    int        connected;
+} ksocket_t;
+
+#define KSOCK_N 32
+static ksocket_t g_sock[KSOCK_N];
+
+static ksocket_t *sk_alloc(void) {
+    for (int i = 0; i < KSOCK_N; i++)
+        if (!g_sock[i].used) { kmemset(&g_sock[i], 0, sizeof g_sock[i]); g_sock[i].used = 1; return &g_sock[i]; }
+    return nullptr;
+}
+
+void *ksock_create(int type) {
+    if (type != SOCK_STREAM && type != SOCK_DGRAM) return nullptr;
+    ksocket_t *s = sk_alloc();
+    if (!s) return nullptr;
+    s->type = type;
+    if (type == SOCK_DGRAM) s->udp = udp_bind(0);   /* ephemeral until bind */
+    return s;
+}
+
+int ksock_bind(void *vp, uint32_t ip, uint16_t port) {
+    (void)ip;
+    ksocket_t *s = (ksocket_t *)vp;
+    s->bind_port = port;
+    if (s->type == SOCK_DGRAM) {
+        if (s->udp) udp_close(s->udp);
+        s->udp = udp_bind(port);
+        return s->udp ? 0 : -1;
+    }
+    return 0;                                        /* STREAM binds at listen */
+}
+
+int ksock_listen(void *vp, int backlog) {
+    (void)backlog;
+    ksocket_t *s = (ksocket_t *)vp;
+    if (s->type != SOCK_STREAM) return -1;
+    s->tcp = tcp_listen(s->bind_port);
+    return s->tcp ? 0 : -1;
+}
+
+void *ksock_accept(void *vp, uint32_t *pip, uint16_t *pport) {
+    ksocket_t *s = (ksocket_t *)vp;
+    if (s->type != SOCK_STREAM || !s->tcp) return nullptr;
+    tcp_pcb_t *c = tcp_accept(s->tcp);
+    if (!c) return nullptr;
+    ksocket_t *ns = sk_alloc();
+    if (!ns) { return nullptr; }
+    ns->type = SOCK_STREAM; ns->tcp = c; ns->connected = 1;
+    if (pip)   *pip = c->remote_ip;
+    if (pport) *pport = c->remote_port;
+    return ns;
+}
+
+int ksock_connect(void *vp, uint32_t ip, uint16_t port) {
+    ksocket_t *s = (ksocket_t *)vp;
+    if (s->type == SOCK_STREAM) {
+        s->tcp = tcp_connect(ip, port);
+        if (!s->tcp) return -1;
+        s->connected = 1;
+        return 0;
+    }
+    s->peer_ip = ip; s->peer_port = port; s->connected = 1;  /* UDP: just remember */
+    if (!s->udp) s->udp = udp_bind(0);
+    return 0;
+}
+
+int ksock_sendto(void *vp, const void *buf, uint32_t len, uint32_t ip, uint16_t port) {
+    ksocket_t *s = (ksocket_t *)vp;
+    if (s->type == SOCK_STREAM) return s->tcp ? tcp_write(s->tcp, (const uint8_t *)buf, len) : -1;
+    if (!s->udp) s->udp = udp_bind(0);
+    return udp_sendto(s->udp, ip, port, buf, len) < 0 ? -1 : (int)len;
+}
+
+int ksock_send(void *vp, const void *buf, uint32_t len) {
+    ksocket_t *s = (ksocket_t *)vp;
+    return ksock_sendto(vp, buf, len, s->peer_ip, s->peer_port);
+}
+
+int ksock_recvfrom(void *vp, void *buf, uint32_t len, uint32_t *ip, uint16_t *port) {
+    ksocket_t *s = (ksocket_t *)vp;
+    if (s->type == SOCK_STREAM) return s->tcp ? tcp_read(s->tcp, (uint8_t *)buf, len) : -1;
+    return udp_recvfrom(s->udp, buf, len, ip, port);
+}
+
+int ksock_recv(void *vp, void *buf, uint32_t len) { return ksock_recvfrom(vp, buf, len, nullptr, nullptr); }
+
+int ksock_poll(void *vp, int want) {
+    ksocket_t *s = (ksocket_t *)vp;
+    int r = 0;
+    sched_lock();
+    if (s->type == SOCK_STREAM && s->tcp) {
+        tcp_pcb_t *t = s->tcp;
+        if ((want & NET_POLLIN) &&
+            (tcp_rx_used(t) > 0 || t->peer_fin || t->aq_head != t->aq_tail || t->reset))
+            r |= NET_POLLIN;
+        if ((want & NET_POLLOUT) && t->state == T_ESTABLISHED) r |= NET_POLLOUT;
+    } else if (s->udp) {
+        if ((want & NET_POLLIN) && s->udp->qhead != s->udp->qtail) r |= NET_POLLIN;
+        if (want & NET_POLLOUT) r |= NET_POLLOUT;
+    }
+    sched_unlock();
+    return r;
+}
+
+void ksock_close(void *vp) {
+    ksocket_t *s = (ksocket_t *)vp;
+    if (!s || !s->used) return;
+    if (s->tcp) tcp_close(s->tcp);
+    if (s->udp) udp_close(s->udp);
+    s->used = 0;
 }
 
 static void net_input(const uint8_t *frame, uint32_t len) {

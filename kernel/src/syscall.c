@@ -11,6 +11,7 @@
 #include "usermode.h"
 #include "smp.h"
 #include "signal.h"
+#include "net.h"
 
 /*
  * System calls (ROADMAP §3 + §4 Linux ABI).
@@ -59,6 +60,7 @@ extern "C" void syscall_entry(void);
 #define E2BIG_      7
 #define ENOSYS_     38
 #define EFAULT_     14
+#define EPIPE_      32
 
 /* The current user task's address space — the target for all copy_*_user
    validation. Kernel threads have no vm and never reach the user-pointer paths. */
@@ -243,6 +245,7 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
     if (!f) return -EBADF_;
     if (f->kind == FD_PIPE_WR) return pipe_write(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_RD) return -EBADF_;  /* write to read end */
+    if (f->kind == FD_SOCKET) { int r = ksock_send(f->sock, buf, (uint32_t)n); return r < 0 ? -EPIPE_ : r; }
     if (f->kind != FD_FILE) return -EISDIR_;
     if (f->flags & O_APPEND) {                  /* append: write at EOF */
         fs_stat_t st;
@@ -264,6 +267,7 @@ static int64_t sys_read(int fd, void *buf, uint64_t n) {
     if (!f) return -EBADF_;
     if (f->kind == FD_PIPE_RD) return pipe_read(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_WR) return -EBADF_;  /* read from write end */
+    if (f->kind == FD_SOCKET) return ksock_recv(f->sock, buf, (uint32_t)n);
     if (f->kind != FD_FILE) return -EISDIR_;
     int r = fs_pread(f->ino, f->off, buf, (uint32_t)n);
     if (r < 0) return fs_to_errno(r);
@@ -557,6 +561,7 @@ static int64_t sys_close(int fd) {
     if (fd >= 0 && fd <= 2) return 0;           /* console: no-op */
     file_t *f = fd_get(fd);
     if (!f) return -EBADF_;
+    if (f->kind == FD_SOCKET && f->refcount == 1) ksock_close(f->sock);  /* last ref */
     task_current()->fdt[fd] = nullptr;
     file_unref(f);
     return 0;
@@ -776,6 +781,161 @@ static int64_t sys_wait4(int pid, int *ustatus, int options, void *rusage) {
     return got;
 }
 
+/* ---- §5 sockets (BSD socket API over the §4 fd table) ---- */
+
+struct sockaddr_in {
+    uint16_t sin_family;
+    uint16_t sin_port;       /* network order */
+    uint32_t sin_addr;       /* network order */
+    uint8_t  zero[8];
+};
+
+/* Resolve a socket fd to its kernel socket object. */
+static void *sock_get(int fd) {
+    file_t *f = fd_get(fd);
+    return (f && f->kind == FD_SOCKET) ? f->sock : nullptr;
+}
+
+/* Copy in a user sockaddr_in, returning ip/port in host byte order. */
+static int read_sockaddr(uint64_t uaddr, uint32_t ulen, uint32_t *ip, uint16_t *port) {
+    if (ulen < sizeof(struct sockaddr_in)) return -1;
+    struct sockaddr_in sa;
+    if (copy_from_user(&sa, cur_vm(), uaddr, sizeof sa) < 0) return -1;
+    *ip   = ntohl_(sa.sin_addr);
+    *port = ntohs_(sa.sin_port);
+    return 0;
+}
+
+/* Write a sockaddr_in back to user (for accept/recvfrom peer address). */
+static void write_sockaddr(uint64_t uaddr, uint64_t ulen_ptr, uint32_t ip, uint16_t port) {
+    if (!uaddr) return;
+    struct sockaddr_in sa;
+    kmemset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons_(port);
+    sa.sin_addr = htonl_(ip);
+    copy_to_user(cur_vm(), uaddr, &sa, sizeof sa);
+    if (ulen_ptr) { uint32_t l = sizeof sa; copy_to_user(cur_vm(), ulen_ptr, &l, sizeof l); }
+}
+
+static int install_socket(void *ks) {
+    file_t *f = file_alloc();
+    if (!f) return -ENFILE_;
+    f->kind = FD_SOCKET; f->sock = ks; f->flags = O_RDWR;
+    int fd = fd_install(f);
+    if (fd < 0) { f->kind = FD_NONE; file_unref(f); }
+    return fd;
+}
+
+static int64_t sys_socket(int domain, int type, int proto) {
+    (void)proto;
+    if (domain != AF_INET) return -EINVAL_;
+    void *ks = ksock_create(type & 0xFF);            /* mask SOCK_NONBLOCK/CLOEXEC */
+    if (!ks) return -EINVAL_;
+    int fd = install_socket(ks);
+    if (fd < 0) ksock_close(ks);
+    return fd;
+}
+
+static int64_t sys_bind(int fd, uint64_t uaddr, uint32_t ulen) {
+    void *ks = sock_get(fd); if (!ks) return -EBADF_;
+    uint32_t ip; uint16_t port;
+    if (read_sockaddr(uaddr, ulen, &ip, &port) < 0) return -EINVAL_;
+    return ksock_bind(ks, ip, port) == 0 ? 0 : -EINVAL_;
+}
+
+static int64_t sys_listen(int fd, int backlog) {
+    void *ks = sock_get(fd); if (!ks) return -EBADF_;
+    return ksock_listen(ks, backlog) == 0 ? 0 : -EINVAL_;
+}
+
+static int64_t sys_connect(int fd, uint64_t uaddr, uint32_t ulen) {
+    void *ks = sock_get(fd); if (!ks) return -EBADF_;
+    uint32_t ip; uint16_t port;
+    if (read_sockaddr(uaddr, ulen, &ip, &port) < 0) return -EINVAL_;
+    return ksock_connect(ks, ip, port) == 0 ? 0 : -111;   /* -ECONNREFUSED */
+}
+
+static int64_t sys_accept(int fd, uint64_t uaddr, uint64_t ulen_ptr) {
+    void *ks = sock_get(fd); if (!ks) return -EBADF_;
+    uint32_t pip = 0; uint16_t pport = 0;
+    void *ns = ksock_accept(ks, &pip, &pport);
+    if (!ns) return -EINVAL_;
+    int nfd = install_socket(ns);
+    if (nfd < 0) { ksock_close(ns); return nfd; }
+    write_sockaddr(uaddr, ulen_ptr, pip, pport);
+    return nfd;
+}
+
+static int64_t sys_sendto(int fd, uint64_t ubuf, uint64_t len, int flags,
+                          uint64_t uaddr, uint32_t ulen) {
+    (void)flags;
+    void *ks = sock_get(fd); if (!ks) return -EBADF_;
+    if (len && !paging_user_ok(cur_vm(), ubuf, len, 0)) return -EFAULT_;
+    uint8_t *kbuf = (uint8_t *)kmalloc(len ? len : 1);
+    if (!kbuf) return -ENOMEM_;
+    int r;
+    if (len && copy_from_user(kbuf, cur_vm(), ubuf, len) < 0) { kfree(kbuf); return -EFAULT_; }
+    if (uaddr) {
+        uint32_t ip; uint16_t port;
+        if (read_sockaddr(uaddr, ulen, &ip, &port) < 0) { kfree(kbuf); return -EINVAL_; }
+        r = ksock_sendto(ks, kbuf, (uint32_t)len, ip, port);
+    } else {
+        r = ksock_send(ks, kbuf, (uint32_t)len);
+    }
+    kfree(kbuf);
+    return r < 0 ? -EPIPE_ : r;
+}
+
+static int64_t sys_recvfrom(int fd, uint64_t ubuf, uint64_t len, int flags,
+                            uint64_t uaddr, uint64_t ulen_ptr) {
+    (void)flags;
+    void *ks = sock_get(fd); if (!ks) return -EBADF_;
+    if (len && !paging_user_ok(cur_vm(), ubuf, len, 1)) return -EFAULT_;
+    uint8_t *kbuf = (uint8_t *)kmalloc(len ? len : 1);
+    if (!kbuf) return -ENOMEM_;
+    uint32_t ip = 0; uint16_t port = 0;
+    int r = ksock_recvfrom(ks, kbuf, (uint32_t)len, &ip, &port);
+    if (r > 0 && copy_to_user(cur_vm(), ubuf, kbuf, (uint32_t)r) < 0) { kfree(kbuf); return -EFAULT_; }
+    kfree(kbuf);
+    if (r >= 0 && uaddr) write_sockaddr(uaddr, ulen_ptr, ip, port);
+    return r;
+}
+
+/* Minimal poll: report immediately-ready socket fds; one coarse retry on the
+   given timeout. Enough for simple readiness checks. */
+static int64_t sys_poll(uint64_t ufds, uint32_t nfds, int timeout_ms) {
+    struct pollfd { int fd; int16_t events; int16_t revents; };
+    if (nfds == 0) return 0;
+    if (nfds > 64) return -EINVAL_;
+    struct pollfd fds[64];
+    if (copy_from_user(fds, cur_vm(), ufds, nfds * sizeof(struct pollfd)) < 0) return -EFAULT_;
+    int waited = 0;
+    for (;;) {
+        int ready = 0;
+        for (uint32_t i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
+            void *ks = sock_get(fds[i].fd);
+            if (ks) {
+                int want = ((fds[i].events & 0x1) ? NET_POLLIN : 0) |
+                           ((fds[i].events & 0x4) ? NET_POLLOUT : 0);
+                int got = ksock_poll(ks, want);
+                if (got & NET_POLLIN)  fds[i].revents |= 0x1;
+                if (got & NET_POLLOUT) fds[i].revents |= 0x4;
+            } else if (fds[i].fd >= 1 && fds[i].fd <= 2) {
+                fds[i].revents |= (fds[i].events & 0x4);   /* console always writable */
+            }
+            if (fds[i].revents) ready++;
+        }
+        if (ready || timeout_ms == 0 || waited) {
+            copy_to_user(cur_vm(), ufds, fds, nfds * sizeof(struct pollfd));
+            return ready;
+        }
+        ksleep_ms(timeout_ms > 50 ? 50 : (uint64_t)timeout_ms);
+        waited = 1;
+    }
+}
+
 static uint64_t do_syscall(syscall_frame_t *f) {
     switch (f->rax) {
     case 0:   return (uint64_t)sys_read((int)f->rdi, (void *)f->rsi, f->rdx);
@@ -807,6 +967,22 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 32:  return (uint64_t)sys_dup((int)f->rdi);           /* dup */
     case 33:  return (uint64_t)sys_dup2((int)f->rdi, (int)f->rsi);  /* dup2 */
     case 39:  return (uint64_t)task_current()->id;             /* getpid */
+    case 7:   return (uint64_t)sys_poll(f->rdi, (uint32_t)f->rsi, (int)f->rdx);  /* poll */
+    case 41:  return (uint64_t)sys_socket((int)f->rdi, (int)f->rsi, (int)f->rdx); /* socket */
+    case 42:  return (uint64_t)sys_connect((int)f->rdi, f->rsi, (uint32_t)f->rdx); /* connect */
+    case 43:  return (uint64_t)sys_accept((int)f->rdi, f->rsi, f->rdx);  /* accept */
+    case 288: return (uint64_t)sys_accept((int)f->rdi, f->rsi, f->rdx);  /* accept4 */
+    case 44:  return (uint64_t)sys_sendto((int)f->rdi, f->rsi, f->rdx, (int)f->r10,
+                                          f->r8, (uint32_t)f->r9);       /* sendto */
+    case 45:  return (uint64_t)sys_recvfrom((int)f->rdi, f->rsi, f->rdx, (int)f->r10,
+                                            f->r8, f->r9);               /* recvfrom */
+    case 49:  return (uint64_t)sys_bind((int)f->rdi, f->rsi, (uint32_t)f->rdx);  /* bind */
+    case 50:  return (uint64_t)sys_listen((int)f->rdi, (int)f->rsi);    /* listen */
+    case 48:  return 0;                                        /* shutdown (stub) */
+    case 51:  return 0;                                        /* getsockname (stub) */
+    case 52:  return 0;                                        /* getpeername (stub) */
+    case 54:  return 0;                                        /* setsockopt (stub) */
+    case 55:  return 0;                                        /* getsockopt (stub) */
     case 62:  return (uint64_t)sys_kill((int)f->rdi, (int)f->rsi);   /* kill */
     case 200: return (uint64_t)sys_kill((int)f->rdi, (int)f->rsi);   /* tkill(tid,sig) */
     case 234: return (uint64_t)sys_tgkill((int)f->rdi, (int)f->rsi, (int)f->rdx); /* tgkill */
@@ -828,6 +1004,13 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 61:  return (uint64_t)sys_wait4((int)f->rdi, (int *)f->rsi,
                                          (int)f->rdx, (void *)f->r10);  /* wait4 */
     case 158: return (uint64_t)sys_arch_prctl((int)f->rdi, f->rsi);  /* arch_prctl */
+    case 35: {                                                 /* nanosleep */
+        struct timespec { int64_t sec; int64_t nsec; } ts;
+        if (copy_from_user(&ts, cur_vm(), f->rdi, sizeof ts) < 0) return (uint64_t)(int64_t)-EFAULT_;
+        uint64_t ms = (uint64_t)ts.sec * 1000 + (uint64_t)ts.nsec / 1000000;
+        ksleep_ms(ms);
+        return 0;
+    }
     case 218: return (uint64_t)task_current()->id;             /* set_tid_address -> tid */
     case 309: {                                                /* getcpu */
         unsigned cpu = (unsigned)smp_cpu_index();

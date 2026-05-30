@@ -62,6 +62,28 @@ uint32_t net_local_ip(void);
 /* Probe + initialise the virtio-net PCI device. Returns 1 if a NIC was found. */
 int virtio_net_init(void);
 
+/* ---- kernel socket API (wrapped by the socket syscalls; ROADMAP §5) ----
+ * Addresses are host byte order here; the syscall layer converts to/from the
+ * network-order sockaddr_in. A socket is an opaque handle stored in the fd
+ * table (file kind FD_SOCKET). */
+#define AF_INET      2
+#define SOCK_STREAM  1
+#define SOCK_DGRAM   2
+#define NET_POLLIN   0x1
+#define NET_POLLOUT  0x4
+
+void *ksock_create(int type);                     /* SOCK_STREAM/DGRAM; NULL on fail */
+int   ksock_bind(void *s, uint32_t ip, uint16_t port);
+int   ksock_listen(void *s, int backlog);
+void *ksock_accept(void *s, uint32_t *peer_ip, uint16_t *peer_port);
+int   ksock_connect(void *s, uint32_t ip, uint16_t port);
+int   ksock_send(void *s, const void *buf, uint32_t len);             /* connected */
+int   ksock_sendto(void *s, const void *buf, uint32_t len, uint32_t ip, uint16_t port);
+int   ksock_recv(void *s, void *buf, uint32_t len);                  /* connected */
+int   ksock_recvfrom(void *s, void *buf, uint32_t len, uint32_t *ip, uint16_t *port);
+int   ksock_poll(void *s, int want);              /* returns ready NET_POLL* bits */
+void  ksock_close(void *s);
+
 #ifdef __cplusplus
 }
 #endif
