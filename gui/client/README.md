@@ -1,21 +1,56 @@
-# gui/client — userspace GUI clients (phase 2, scaffold)
+# gui/client — userspace GUI (phase 2)
 
-Empty by design — this is where the **userspace** side of the windowing system
-will live once the GUI IPC protocol exists. Today the whole stack runs in the
-kernel as the `guiwm` worker ([../core/](../core/)); phase 2 moves rendering and
-input out to per-application processes.
+The windowing system, moved out of the kernel into userspace. The kernel now only
+exposes the framebuffer and input as devices; everything else — compositing,
+window management, widgets, apps — is ordinary musl programs.
 
-Planned shape (see [../../graphics/graphics.md](../../graphics/graphics.md) phase 2):
+```
+   /dev/fb0 (mmap)   /dev/input (read)        loopback TCP 127.0.0.1:7000
+        ▲                  ▲                          ▲
+        │                  │                          │
+   ┌────┴──────────────────┴────┐   GUI protocol   ┌──┴───────────┐
+   │  guiwm  (the WM server)    │◄────────────────►│  client app  │  ← one process
+   │  composites desktop+windows│   create/frame/  │ (gmandel,    │    per window
+   │  + cursor, routes input    │   input events   │  gclock, …)  │
+   └────────────────────────────┘                  └──────────────┘
+```
 
-- A shared client library (the `gui` namespace) that links `gui/core`'s libdraw +
-  libwin so a client draws into its own window surface with the same primitives.
-- **Process per window**: each app is its own process; the in-kernel compositor
-  becomes a server.
-- **Transport**: window surfaces shared via mmap'd `/dev/fb`; input delivered via
-  `/dev/input`; control messages (create/destroy/raise/focus, damage, events)
-  over a small message bus.
-- First demo client: a Mandelbrot renderer drawing into its own window.
+- **libgfx** ([src/libgfx.c](src/libgfx.c), [include/libgfx.h](include/libgfx.h)) —
+  the shared drawing library (surfaces + clipped primitives + bitmap font + the
+  VibeOS logo), linked by both the server and every client. A userspace port of
+  gui/core's libdraw.
+- **The protocol** ([include/gui_proto.h](include/gui_proto.h)) — a tiny binary
+  message bus over a loopback-TCP stream: a client sends `CREATE` (request a
+  window) and `FRAME` (window pixels); the server replies `CREATED` and streams
+  back `INPUT` events (mouse/keys, window-local). One window per connection.
+- **gui_client** ([src/gui_client.c](src/gui_client.c), [include/gui_client.h](include/gui_client.h)) —
+  the client side of the protocol: `gc_open` / `gc_commit` / `gc_poll` / `gc_close`.
+  A client is `gc_open(w,h,title)`, draw into a libgfx surface, `gc_commit`, react
+  to events. That's it.
 
-Prerequisites still missing in the kernel: mmap of `/dev/fb`, a `/dev/input`
-event source, and the message-bus syscalls. Until those land this directory stays
-a placeholder so the intended layout is discoverable.
+## Programs (in user/musl, built with the musl toolchain)
+
+- **guiwm** — the window-manager **server**: mmaps `/dev/fb0`, grabs `/dev/input`,
+  listens on `127.0.0.1:7000`, and composites the desktop (wallpaper + logo +
+  client windows with title-bar/border/close-box chrome + a taskbar) with a mouse
+  pointer that tracks the USB mouse. Title bars drag; the focused window gets the
+  keyboard. Started at boot by the service-managed init
+  ([config/services/guiwm.yaml](../../config/services/guiwm.yaml)).
+- **gmandel** — a demo **client**: renders the Mandelbrot set into its own window
+  (WASD pan, +/- zoom). Proves process-per-window: it's a plain musl program.
+- **gclock** — a second demo client: a live window (uptime counter + a bouncing
+  box), showing the compositor multiplexing several independent client processes.
+- **guiprobe** — a minimal smoke test of the kernel primitives (mmap `/dev/fb0`,
+  read `/dev/input`).
+
+## Running
+
+`guiwm` autostarts at boot. From the serial shell, launch a client:
+
+```
+vibe$ gmandel        # a Mandelbrot window appears on the desktop
+vibe$ gclock         # a live clock window
+```
+
+The kernel chooses the userspace WM by default; `gui.mode: kernel` in
+`/config/system.conf` falls back to the legacy in-kernel compositor ([gui/core/](../core/)).

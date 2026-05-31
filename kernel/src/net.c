@@ -481,6 +481,7 @@ typedef struct tcp_pcb {
     int          peer_fin;                     /* received a FIN (EOF) */
     int          reset;                        /* connection reset */
     int          delack; uint64_t delack_deadline;
+    int          need_ack;                     /* owe a window-update ACK (rx drained) */
 
     uint64_t     tw_deadline;                  /* TIME-WAIT expiry */
 
@@ -636,7 +637,12 @@ static void tcp_output(tcp_pcb_t *t) {
         t->snd_nxt += 1;
         sent_any = 1;
     }
-    (void)sent_any;
+    /* Window-update ACK: the app drained the rxbuf and reopened the receive
+       window, but we had no data/FIN to piggyback it on — send a bare ACK so a
+       blocked sender learns the window is open again (else large transfers that
+       fill RCVBUF stall forever). */
+    if (t->need_ack && !sent_any) tcp_send_seg(t, t->snd_nxt, TCP_ACK, nullptr, 0, 0);
+    t->need_ack = 0;
     tcp_set_rexmit(t);
 }
 
@@ -768,8 +774,12 @@ static int tcp_write(tcp_pcb_t *t, const uint8_t *data, uint32_t len) {
 }
 
 /* Blocking read of up to `len` bytes; returns 0 at EOF (peer FIN, buffer drained). */
-static int tcp_read(tcp_pcb_t *t, uint8_t *buf, uint32_t len) {
+static int tcp_read(tcp_pcb_t *t, uint8_t *buf, uint32_t len, int nonblock) {
     sched_lock();
+    if (nonblock && t->used && tcp_rx_used(t) == 0 && !t->peer_fin && !t->reset) {
+        sched_unlock();
+        return -11;                              /* -EAGAIN: nothing buffered */
+    }
     while (t->used && tcp_rx_used(t) == 0 && !t->peer_fin && !t->reset)
         wait_queue_sleep_locked(&t->wq);
     if (!t->used || t->reset) { sched_unlock(); return -1; }
@@ -781,7 +791,7 @@ static int tcp_read(tcp_pcb_t *t, uint8_t *buf, uint32_t len) {
         t->rxtail = (t->rxtail + 1) % TCP_RXBUF;
     }
     int eof = (n == 0 && t->peer_fin);
-    if (was_full && n > 0) tcp_kick(t);          /* window opened: advertise it */
+    if (was_full && n > 0) { t->need_ack = 1; tcp_kick(t); }   /* window opened: advertise it */
     sched_unlock();
     return eof ? 0 : (int)n;
 }
@@ -1227,13 +1237,15 @@ int ksock_send(void *vp, const void *buf, uint32_t len) {
     return ksock_sendto(vp, buf, len, s->peer_ip, s->peer_port);
 }
 
-int ksock_recvfrom(void *vp, void *buf, uint32_t len, uint32_t *ip, uint16_t *port) {
+int ksock_recvfrom(void *vp, void *buf, uint32_t len, uint32_t *ip, uint16_t *port, int nonblock) {
     ksocket_t *s = (ksocket_t *)vp;
-    if (s->type == SOCK_STREAM) return s->tcp ? tcp_read(s->tcp, (uint8_t *)buf, len) : -1;
+    if (s->type == SOCK_STREAM) return s->tcp ? tcp_read(s->tcp, (uint8_t *)buf, len, nonblock) : -1;
     return udp_recvfrom(s->udp, buf, len, ip, port);
 }
 
-int ksock_recv(void *vp, void *buf, uint32_t len) { return ksock_recvfrom(vp, buf, len, nullptr, nullptr); }
+int ksock_recv(void *vp, void *buf, uint32_t len, int nonblock) {
+    return ksock_recvfrom(vp, buf, len, nullptr, nullptr, nonblock);
+}
 
 int ksock_poll(void *vp, int want) {
     ksocket_t *s = (ksocket_t *)vp;
@@ -1394,7 +1406,7 @@ static void net_pinger(void *arg) {
     if (c) {
         tcp_write(c, (const uint8_t *)"hello-tcp", 9);
         uint8_t buf[256];
-        int n = tcp_read(c, buf, sizeof buf);
+        int n = tcp_read(c, buf, sizeof buf, 0);
         buf[n > 0 ? n : 0] = '\0';
         kprintf("[net] tcp client connected, got %d bytes: \"%s\"\n", n, buf);
         tcp_close(c);
@@ -1427,7 +1439,7 @@ static void net_http_server(void *arg) {
         tcp_pcb_t *c = tcp_accept(l);
         if (!c) continue;
         uint8_t req[512];
-        tcp_read(c, req, sizeof req);          /* consume the request line/headers */
+        tcp_read(c, req, sizeof req, 0);          /* consume the request line/headers */
         char resp[512];
         int blen = (int)sizeof(body) - 1;
         int hlen = 0;
@@ -1455,7 +1467,7 @@ static void net_tcp_server(void *arg) {
         tcp_pcb_t *c = tcp_accept(l);
         if (!c) continue;
         uint8_t req[256];
-        int n = tcp_read(c, req, sizeof req);
+        int n = tcp_read(c, req, sizeof req, 0);
         if (n > 0) {
             uint8_t rep[280];
             const char *pfx = "echo: ";
@@ -1464,7 +1476,7 @@ static void net_tcp_server(void *arg) {
             tcp_write(c, rep, k + n);
         }
         uint8_t drain[64];
-        while (tcp_read(c, drain, sizeof drain) > 0) { }   /* read to EOF */
+        while (tcp_read(c, drain, sizeof drain, 0) > 0) { }   /* read to EOF */
         tcp_close(c);
     }
 }
@@ -1481,7 +1493,7 @@ static void net_tcp_sink(void *arg) {
         uint8_t buf[1024];
         uint32_t total = 0;
         for (;;) {
-            int n = tcp_read(c, buf, sizeof buf);
+            int n = tcp_read(c, buf, sizeof buf, 0);
             if (n <= 0) break;
             total += (uint32_t)n;
         }

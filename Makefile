@@ -119,6 +119,7 @@ KERNEL_C_SRCS = \
 	kernel/src/random.c \
 	kernel/src/csprng.c \
 	kernel/src/config.c \
+	kernel/src/input.c \
 	kernel/src/file.c \
 	kernel/src/pipe.c \
 	kernel/src/synth.c \
@@ -189,6 +190,18 @@ USER_SYSCONF = user/build/sysconf.elf
 USER_SINIT  = user/build/sinit.elf
 USER_HEARTBEAT = user/build/heartbeat.elf
 
+# GUI phase 2 (gui/client): a userspace window-manager server + demo clients.
+# GUI_GFX is the shared drawing lib (surfaces/primitives/font/logo) linked by
+# both the server and the clients; GUI_CLI is the client-side connection helper
+# linked only by clients.
+USER_GUIPROBE = user/build/guiprobe.elf
+USER_GUIWM    = user/build/guiwm.elf
+USER_GMANDEL  = user/build/gmandel.elf
+USER_GCLOCK   = user/build/gclock.elf
+GUI_GFX = gui/client/src/libgfx.c gui/client/src/font8x8_u.c gui/client/src/gui_logo_u.c
+GUI_CLI = gui/client/src/gui_client.c
+GUI_INC = -Igui/client/include
+
 # VibeOS cross toolchain (ROADMAP §"Toolchain integration").
 VIBEOS_CC     = ./toolchain/x86_64-vibeos-musl-gcc
 SYSROOT_SPECS = toolchain/vibeos.specs
@@ -251,7 +264,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -310,6 +323,34 @@ ifeq ($(MUSL_CC),)
 	@echo "warning: musl-gcc not found; skipping $(USER_MNET)"
 else
 	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
+endif
+
+$(USER_GUIPROBE): user/musl/guiprobe.c | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found; skipping $(USER_GUIPROBE)"
+else
+	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
+endif
+
+$(USER_GUIWM): user/musl/guiwm.c $(GUI_GFX) | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found; skipping $(USER_GUIWM)"
+else
+	$(MUSL_CC) -static -no-pie -O2 $(GUI_INC) -o $@ $< $(GUI_GFX)
+endif
+
+$(USER_GMANDEL): user/musl/gmandel.c $(GUI_GFX) $(GUI_CLI) | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found; skipping $(USER_GMANDEL)"
+else
+	$(MUSL_CC) -static -no-pie -O2 $(GUI_INC) -o $@ $< $(GUI_GFX) $(GUI_CLI)
+endif
+
+$(USER_GCLOCK): user/musl/gclock.c $(GUI_GFX) $(GUI_CLI) | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found; skipping $(USER_GCLOCK)"
+else
+	$(MUSL_CC) -static -no-pie -O2 $(GUI_INC) -o $@ $< $(GUI_GFX) $(GUI_CLI)
 endif
 
 $(USER_MWGET): user/musl/wget.c | user/build

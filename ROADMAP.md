@@ -48,8 +48,27 @@ Detail lives in the code and git history; this file is the map, not the manual.
   framebuffer; serial TTY backing `read(0)`. **VibeFS** ([fs.c](kernel/src/fs.c)) —
   writable, crash-safe ordered writes + `fsck`, 4 KiB blocks, triple-indirect +
   64-bit size.
-- **GUI** (graphics/graphics.md, phase 1) — a strictly-layered framebuffer
-  windowing stack under [gui/core/](gui/core/): **libdraw**
+- **GUI — userspace windowing** (graphics/graphics.md phase 2, [gui/client/](gui/client/)) —
+  the window manager runs **in userspace** as an ordinary musl service. The kernel
+  exposes the framebuffer and input as devices — **`/dev/fb0`** (a device `mmap`
+  maps the scanout's physical pages straight into a process) and **`/dev/input`**
+  (a kernel event ring fed by the USB HID driver, grabbed on open) — and the
+  **`/bin/guiwm`** server ([guiwm.c](user/musl/guiwm.c)) mmaps the framebuffer,
+  reads input, and composites the desktop: wallpaper + the alpha-blended VibeOS
+  logo + client windows (title-bar/border/close-box chrome, Z-order, title-bar
+  drag, focus) + a taskbar + a mouse pointer tracking the USB mouse. **Clients are
+  separate processes — one per window** — that link the shared **libgfx**
+  ([gui/client/src/libgfx.c](gui/client/src/libgfx.c)) and talk to the server over
+  a small **loopback-TCP message bus** ([gui_proto.h](gui/client/include/gui_proto.h)):
+  `/bin/gmandel` renders the Mandelbrot set in its own window, `/bin/gclock` is a
+  live animated window. Started at boot by the service-managed init
+  ([guiwm.yaml](config/services/guiwm.yaml)); `gui.mode: kernel` selects the legacy
+  in-kernel compositor instead. Verified on QEMU: `screendump`s show the desktop,
+  the logo, the cursor, and client-rendered window content (a Mandelbrot fractal,
+  a ticking clock); serial confirms the server↔client protocol.
+- **GUI — in-kernel compositor** (graphics/graphics.md, phase 1) — a strictly-layered framebuffer
+  windowing stack under [gui/core/](gui/core/) (now the `gui.mode: kernel`
+  alternative to the userspace WM): **libdraw**
   ([gui_draw.c](gui/core/src/gui_draw.c)) — surfaces +
   clipped primitives (rects, lines, blit, color-keyed blit, bitmap text);
   **libwin** ([gui_win.c](gui/core/src/gui_win.c)) — windows with chrome (title
@@ -84,9 +103,13 @@ Detail lives in the code and git history; this file is the map, not the manual.
   reassembly, delayed ACKs, MSS-option negotiation, a zero-window persist probe,
   and a 2*MSL TIME-WAIT — all driven by a worker-context timer. Plus a loopback
   netif. **BSD sockets** on the fd table —
-  `socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`/`poll`. Static
-  SLIRP addressing (10.0.2.15/24). Ported `/bin/wget` fetches over the stack;
-  a loopback self-test pushes 6 KB through the send buffer multi-segment.
+  `socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`/`poll`, with
+  **`O_NONBLOCK`/`MSG_DONTWAIT`** recv (so a single-threaded server can multiplex).
+  Static SLIRP addressing (10.0.2.15/24). Ported `/bin/wget` fetches over the
+  stack; a loopback self-test pushes 6 KB multi-segment, and the userspace GUI
+  pushes **hundreds of KB** of window pixels per frame over loopback TCP — which
+  flushed out a real bug: a receiver draining a full `RCVBUF` now emits a
+  **window-update ACK** so large transfers don't stall.
 - **Userspace / Linux ABI** — ring 3 via SYSCALL/SYSRET; ELF loader with real
   auxv + argv/envp ([elf64.c](kernel/src/elf64.c)). **Runs unmodified static and
   dynamically-linked musl binaries** — `ET_DYN`/PIE + `PT_INTERP` load
@@ -110,7 +133,8 @@ Detail lives in the code and git history; this file is the map, not the manual.
   `getcwd`, `./`–`../`–normalizing path resolution); **`FD_CLOEXEC`** tracked
   per-descriptor and enforced by `execve`; **symlinks** in VibeFS (new
   `FT_SYMLINK` inode, followed during path resolution, fsck-safe);
-  synthetic **`/dev`** (`null`/`zero`/`full`/`random`/`urandom`/`tty`) and a
+  synthetic **`/dev`** (`null`/`zero`/`full`/`random`/`urandom`/`tty`, plus
+  `fb0`/`input` for the userspace GUI) and a
   tiny **`/proc`** (a dir per live task + `self`, each with a `stat` file)
   ([synth.c](kernel/src/synth.c)); a real **init** (PID 1) that forks + respawns
   the shell; and a **package tool** ([user/musl/pkg.c](user/musl/pkg.c)) that
@@ -183,19 +207,16 @@ What remains:
   per-service file logging, and a `sysconf services` view) are shipped. What's
   left of this theme is socket-/timer-activated services and shell I/O redirection
   (`>`/`<`/`2>` — the kernel now supports it; the shell doesn't parse it yet).
-- **Graphical stack (phase 2).** Phase 1 is up (libdraw + libwin + libwm, with a
-  mouse pointer, keyboard-to-focused-field, and the desktop logo), and the code
-  now lives in [gui/](gui/) — split into the kernel-side lib [gui/core/](gui/core/)
-  and a [gui/client/](gui/client/) scaffold for the userspace side. The remaining
-  work is the **client/server split itself**: move rendering + input out to
-  **userspace GUI clients** over mmap'd `/dev/fb` + `/dev/input`, which first needs
-  the kernel to grow those primitives (mmap of `/dev/fb`, a `/dev/input` event
-  source).
-- **Mature windowing model.** Standardize GUI IPC around a message bus + shared
-  C library (`gui` namespace), run a **process per window**, and ship a demo GUI
-  client that renders the Mandelbrot set in its own window. Add more widgets
-  (menus/scrollbars beyond the existing button/label/textbox); add a taskbar +
-  launcher (graphics/graphics.md phase 2).
+- **Graphical stack — phase 2 shipped.** The client/server split is done: rendering
+  and input moved to userspace over mmap'd `/dev/fb0` + `/dev/input`, a `guiwm`
+  **server** composites, **clients are one process per window** over a loopback-TCP
+  message bus, and a Mandelbrot demo client renders in its own window (see "What
+  works today"). What's left to *mature* it: more widgets (menus/scrollbars/list
+  boxes — clients currently push raw pixel surfaces), a graphical **launcher**
+  (apps start from the serial shell today), window **resize**, and shared-memory
+  window buffers (frames stream over TCP for now — fine for a demo, a copy per
+  frame at scale). A future cleanup: collapse `gui/core`'s libdraw and
+  `gui/client`'s libgfx into one source built for both kernel and userspace.
 - **USB follow-on for GUI.** Optional xHCI/EHCI + USB hub support (UHCI already
   drives the HID devices).
 - **Audio.** An audio subsystem + virtio-sound.
@@ -223,7 +244,8 @@ UEFI/OVMF → BOOTX64.EFI → kernel.elf → start.S (bootstrap tables, jump hig
   (virtio-net + worker + tcp timer) → usb_init (UHCI + HID worker)
   → create init+workers → smp_init (APs join:
   percpu+SYSCALL+SSE) → scheduler() [every CPU]
-  → /bin/init (service manager) → /config/services/* → /bin/sh
+  → /bin/init (service manager) → /config/services/* → /bin/guiwm (userspace WM)
+  + /bin/sh
 ```
 
 ---

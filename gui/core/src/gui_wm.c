@@ -7,6 +7,7 @@
 #include "gui.h"
 #include "gui_draw.h"
 #include "gui_win.h"
+#include "config.h"
 
 /*
  * libwm — layer 3: the desktop + window manager (graphics/graphics.md). Owns the
@@ -301,6 +302,16 @@ static void wm_worker(void *arg) {
 void gui_init(void) {
     fb_device_t *fb = fb_get();
     if (!fb) { kprintf("[gui] no framebuffer; GUI disabled\n"); return; }
+
+    /* Phase 2: the window manager runs in userspace (/bin/guiwm) by default, so
+       the kernel leaves the framebuffer alone — /dev/fb0 + /dev/input let the
+       server own the screen. Set `gui.mode: kernel` in /config/system.conf to
+       run the legacy in-kernel compositor instead. */
+    const char *mode = config_get_def("gui.mode", "userspace");
+    if (mode[0] != 'k') {
+        kprintf("[gui] userspace mode: /dev/fb0 + /dev/input ready for /bin/guiwm\n");
+        return;
+    }
 
     g_screen.pixels = (uint32_t *)fb->base;
     g_screen.w = (int)fb->width;

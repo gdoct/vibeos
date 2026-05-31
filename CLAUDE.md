@@ -37,9 +37,10 @@ make clean        # NB: does not cover user/build — build.sh removes it explic
 - [kernel/](kernel/) — kernel, drivers, paging, scheduler, VibeFS, userspace
   support. Sources in [kernel/src/](kernel/src/), headers in
   [kernel/include/](kernel/include/).
-- [gui/](gui/) — the graphical stack. [gui/core/](gui/core/) is the kernel-side
-  windowing lib (libdraw/libwin/libwm, compiled into the kernel); [gui/client/](gui/client/)
-  is the userspace-client side (phase 2, scaffold).
+- [gui/](gui/) — the graphical stack. [gui/client/](gui/client/) is the **userspace
+  windowing system** (default): a `guiwm` server over mmap'd `/dev/fb0` + `/dev/input`,
+  client apps one-process-per-window over loopback TCP (`gmandel`, `gclock`).
+  [gui/core/](gui/core/) is the legacy in-kernel compositor (`gui.mode: kernel`).
 - [user/](user/) — static userspace programs (`init`, `sh`, `hello`) + musl
   test binaries; [user/musl/](user/musl/).
 - [interop/tools/diskutil/](interop/tools/diskutil/) — .NET `disktool-cli` host

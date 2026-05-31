@@ -3,6 +3,8 @@
 #include "task.h"
 #include "tty.h"
 #include "csprng.h"
+#include "fb.h"
+#include "input.h"
 
 /*
  * Synthetic /dev and /proc (ROADMAP §4). See synth.h.
@@ -13,8 +15,10 @@
  * by VibeFS — the syscall layer routes synthetic paths to these helpers.
  */
 
-/* /dev device subtypes (stored in file_t.dev). */
-enum { DEV_NULL = 1, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_URANDOM, DEV_TTY };
+/* /dev device subtypes (stored in file_t.dev). FB0/INPUT live in synth.h since
+   the syscall + GUI layers reference them. */
+enum { DEV_NULL = 1, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_URANDOM, DEV_TTY,
+       DEV_FB0 = SYNTH_DEV_FB0, DEV_INPUT = SYNTH_DEV_INPUT };
 /* /proc per-pid file subtypes. */
 enum { PROC_STAT = 1 };
 /* Directory subtypes (file_t.dev for FD_DEVDIR). */
@@ -23,6 +27,7 @@ enum { DIR_DEV = 1, DIR_PROC, DIR_PROCPID };
 static const struct { const char *name; int dev; } g_devs[] = {
     { "null", DEV_NULL }, { "zero", DEV_ZERO }, { "full", DEV_FULL },
     { "random", DEV_RANDOM }, { "urandom", DEV_URANDOM }, { "tty", DEV_TTY },
+    { "fb0", DEV_FB0 }, { "input", DEV_INPUT },
 };
 #define N_DEVS ((int)(sizeof g_devs / sizeof g_devs[0]))
 
@@ -121,7 +126,9 @@ int synth_open(const char *path, file_t *f) {
         if (n == 2) {
             for (int k = 0; k < N_DEVS; k++)
                 if (streq(comp[1], g_devs[k].name)) {
-                    f->kind = FD_DEV; f->dev = g_devs[k].dev; f->off = 0; return 0;
+                    f->kind = FD_DEV; f->dev = g_devs[k].dev; f->off = 0;
+                    if (f->dev == DEV_INPUT) input_set_grab(1);  /* GUI takes input */
+                    return 0;
                 }
             return -2;
         }
@@ -158,6 +165,18 @@ int synth_read(file_t *f, void *buf, uint32_t n) {
         case DEV_RANDOM:
         case DEV_URANDOM: csprng_bytes(p, n); return (int)n;
         case DEV_TTY:     return tty_read((char *)buf, n);
+        case DEV_FB0: {                                  /* geometry header */
+            synth_fbinfo_t fi;
+            fb_device_t *fb = fb_get();
+            if (!fb) return -1;
+            fi.width = fb->width; fi.height = fb->height;
+            fi.pitch = fb->pitch; fi.bpp = 32;
+            fi.size  = fb_size_bytes();
+            uint32_t c = n < sizeof fi ? n : (uint32_t)sizeof fi;
+            for (uint32_t i = 0; i < c; i++) p[i] = ((uint8_t *)&fi)[i];
+            return (int)c;
+        }
+        case DEV_INPUT:   return input_read(buf, n);     /* event ring (non-blocking) */
         }
         return -1;
     }

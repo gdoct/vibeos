@@ -80,6 +80,15 @@ fi
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/sysconf.elf /bin/sysconf
 [ -f user/build/heartbeat.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/heartbeat.elf /bin/heartbeat
+# GUI phase 2 (gui/client): the userspace window manager + demo clients.
+[ -f user/build/guiwm.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/guiwm.elf /bin/guiwm
+[ -f user/build/gmandel.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/gmandel.elf /bin/gmandel
+[ -f user/build/gclock.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/gclock.elf /bin/gclock
+[ -f user/build/guiprobe.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/guiprobe.elf /bin/guiprobe
 
 # Dynamic linking (ROADMAP §4): ship the musl dynamic linker as
 # /lib/ld-musl-x86_64.so.1 (the host's musl libc.so doubles as the loader) and a

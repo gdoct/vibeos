@@ -15,6 +15,7 @@
 #include "synth.h"
 #include "csprng.h"
 #include "config.h"
+#include "fb.h"
 
 /*
  * System calls (ROADMAP §3 + §4 Linux ABI).
@@ -66,6 +67,7 @@ extern "C" void syscall_entry(void);
 #define EPIPE_      32
 #define EACCES_     13
 #define EEXIST_     17
+#define ENODEV_     19
 
 /* The current user task's address space — the target for all copy_*_user
    validation. Kernel threads have no vm and never reach the user-pointer paths. */
@@ -361,7 +363,7 @@ static int64_t sys_read(int fd, void *buf, uint64_t n) {
     }
     if (f->kind == FD_PIPE_RD) return pipe_read(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_WR) return -EBADF_;  /* read from write end */
-    if (f->kind == FD_SOCKET) return ksock_recv(f->sock, buf, (uint32_t)n);
+    if (f->kind == FD_SOCKET) return ksock_recv(f->sock, buf, (uint32_t)n, (f->flags & 04000) ? 1 : 0);
     if (f->kind == FD_DEV || f->kind == FD_PROC) return synth_read(f, buf, (uint32_t)n);
     if (f->kind == FD_DEVDIR) return -EISDIR_;
     if (f->kind != FD_FILE) return -EISDIR_;
@@ -519,7 +521,20 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
     file_t *fl = nullptr;
     if (!anon) {
         fl = fd_get(fd);
-        if (!fl || fl->kind != FD_FILE) return -EBADF_;
+        if (!fl) return -EBADF_;
+        /* Device mmap: /dev/fb0 maps the linear framebuffer's physical pages
+           straight into the user address space (GUI phase 2). MAP_SHARED — the
+           server writes pixels the scanout reads. */
+        if (fl->kind == FD_DEV && fl->dev == SYNTH_DEV_FB0) {
+            uint64_t fbp = fb_phys_base();
+            uint64_t fbsz = PAGE_ALIGN_UP(fb_size_bytes());
+            if (!fbp || !fbsz) return -ENODEV_;
+            if (mlen > fbsz) mlen = fbsz;
+            for (uint64_t o = 0; o < mlen; o += PAGE_SIZE)
+                vmspace_map(t->vm, base + o, fbp + o, 1, PTE_P | PTE_W | PTE_U);
+            return (int64_t)base;
+        }
+        if (fl->kind != FD_FILE) return -EBADF_;
     }
 
     /* Map the pages writable first so we can load file content; the requested
@@ -1284,13 +1299,14 @@ static int64_t sys_sendto(int fd, uint64_t ubuf, uint64_t len, int flags,
 
 static int64_t sys_recvfrom(int fd, uint64_t ubuf, uint64_t len, int flags,
                             uint64_t uaddr, uint64_t ulen_ptr) {
-    (void)flags;
     void *ks = sock_get(fd); if (!ks) return -EBADF_;
     if (len && !paging_user_ok(cur_vm(), ubuf, len, 1)) return -EFAULT_;
     uint8_t *kbuf = (uint8_t *)kmalloc(len ? len : 1);
     if (!kbuf) return -ENOMEM_;
+    file_t *ff = fd_get(fd);
+    int nb = (flags & 0x40) || (ff && (ff->flags & 04000)) ? 1 : 0;   /* MSG_DONTWAIT | O_NONBLOCK */
     uint32_t ip = 0; uint16_t port = 0;
-    int r = ksock_recvfrom(ks, kbuf, (uint32_t)len, &ip, &port);
+    int r = ksock_recvfrom(ks, kbuf, (uint32_t)len, &ip, &port, nb);
     if (r > 0 && copy_to_user(cur_vm(), ubuf, kbuf, (uint32_t)r) < 0) { kfree(kbuf); return -EFAULT_; }
     kfree(kbuf);
     if (r >= 0 && uaddr) write_sockaddr(uaddr, ulen_ptr, ip, port);

@@ -8,6 +8,8 @@ extern "C" const uint8_t font8x8[128][8];
 
 /* Storage for the primary framebuffer. One per system today. */
 static fb_device_t g_fb;
+static uint64_t g_fb_phys;       /* physical base, for /dev/fb0 mmap */
+static uint64_t g_fb_size;       /* pitch * height, page-rounded by callers */
 
 uint32_t fb_rgb(const fb_device_t *fb, uint8_t r, uint8_t g, uint8_t b) {
     if (fb->format == FB_FORMAT_RGB8) {
@@ -74,6 +76,8 @@ fb_device_t *fb_init(const FramebufferInfo *info) {
     g_fb.height   = info->height;
     g_fb.pitch    = info->pitch;
     g_fb.format   = info->format;
+    g_fb_phys     = info->base;
+    g_fb_size     = (uint64_t)info->pitch * info->height;
 
     g_fb.put_pixel = fb_put_pixel;
     g_fb.fill_rect = fb_fill_rect;
@@ -86,3 +90,6 @@ fb_device_t *fb_init(const FramebufferInfo *info) {
 
 /* The primary framebuffer, or NULL before fb_init (used by the GUI). */
 fb_device_t *fb_get(void) { return g_fb.base ? &g_fb : (fb_device_t *)0; }
+
+uint64_t fb_phys_base(void)  { return g_fb_phys; }
+uint64_t fb_size_bytes(void) { return g_fb_size; }

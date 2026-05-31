@@ -19,6 +19,18 @@ extern "C" {
 #define SYNTH_DIR   1      /* a synthetic directory (/dev, /proc, /proc/<pid>) */
 #define SYNTH_NODE  2      /* a synthetic file (/dev/null, /proc/<pid>/stat, ...) */
 
+/* Device subtypes that other subsystems need to recognise (stored in file_t.dev
+   for FD_DEV). The GUI server mmaps /dev/fb0 and reads /dev/input. */
+#define SYNTH_DEV_FB0    100
+#define SYNTH_DEV_INPUT  101
+
+/* Header returned by read() on /dev/fb0 — the geometry the GUI server needs
+   before it mmaps the pixels. */
+typedef struct synth_fbinfo {
+    uint32_t width, height, pitch, bpp;
+    uint64_t size;
+} synth_fbinfo_t;
+
 /* Classify `path`; for a node/dir, optionally returns size (0 for devices). */
 int  synth_classify(const char *path, uint64_t *size_out);
 

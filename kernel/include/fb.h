@@ -32,6 +32,11 @@ fb_device_t *fb_init(const FramebufferInfo *info);
 /* The primary framebuffer, or NULL before fb_init. */
 fb_device_t *fb_get(void);
 
+/* Physical base + byte size of the linear framebuffer, for mapping it into a
+   userspace GUI server (/dev/fb0 mmap). Zero before fb_init. */
+uint64_t fb_phys_base(void);
+uint64_t fb_size_bytes(void);
+
 /* Pack an RGB triple into the format of the given device. */
 uint32_t fb_rgb(const fb_device_t *fb, uint8_t r, uint8_t g, uint8_t b);
 

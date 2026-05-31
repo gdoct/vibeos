@@ -8,6 +8,7 @@
 #include "tty.h"
 #include "fb.h"
 #include "gui.h"
+#include "input.h"
 
 /*
  * UHCI (USB 1.1) host controller + USB HID boot-protocol driver (ROADMAP:
@@ -218,7 +219,8 @@ static void kbd_report(hid_dev_t *h, const uint8_t *r) {
         if (was) continue;                     /* still held: not a fresh press */
         if (k < 0x40 && kmap[shift][k]) {
             char c = kmap[shift][k];
-            if (gui_wants_keyboard()) gui_input_key(c);  /* a GUI textbox is focused */
+            if (input_grabbed())      input_push_key(c); /* userspace GUI server */
+            else if (gui_wants_keyboard()) gui_input_key(c);  /* in-kernel WM textbox */
             else                      tty_input(c);      /* otherwise the console */
         }
     }
@@ -227,7 +229,7 @@ static void kbd_report(hid_dev_t *h, const uint8_t *r) {
 
 /* Accumulated mouse state, exported for a future GUI (usb_mouse_get). The
    pointer is clamped to a virtual screen; a GUI consumer can rebind the bounds. */
-static volatile int g_mx = 512, g_my = 384, g_mbtn;
+static volatile int g_mx = 512, g_my = 384, g_mbtn, g_last_btn;
 
 static void mouse_report(const uint8_t *r) {
     int8_t dx = (int8_t)r[1], dy = (int8_t)r[2];
@@ -238,11 +240,11 @@ static void mouse_report(const uint8_t *r) {
     if (g_mx < 0) g_mx = 0; else if (g_mx >= mw) g_mx = mw - 1;
     if (g_my < 0) g_my = 0; else if (g_my >= mh) g_my = mh - 1;
     int btn = r[0] & 7;
-    if (btn != g_mbtn) {                         /* log button transitions only */
-        kprintf("[mouse] x=%d y=%d buttons=%c%c%c\n", g_mx, g_my,
-                (btn & 1) ? 'L' : '-', (btn & 2) ? 'R' : '-', (btn & 4) ? 'M' : '-');
-        g_mbtn = btn;
-    }
+    g_mbtn = btn;
+    /* Feed the userspace GUI server's input ring on any motion or button change. */
+    if (input_grabbed() && (dx || dy || btn != g_last_btn))
+        input_push_mouse(g_mx, g_my, btn);
+    g_last_btn = btn;
 }
 
 /* Current pointer position + button bitmask (bit0=L,1=R,2=M). For the GUI. */

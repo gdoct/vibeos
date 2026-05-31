@@ -1,0 +1,9 @@
+# /config/services/guiwm.yaml — the userspace window manager (GUI phase 2).
+# Owns the framebuffer (/dev/fb0) + input (/dev/input) and serves window clients
+# over loopback TCP. Respawned if it exits. Window create/close events go to the
+# console (drop the comment on `log:` to send them to a file instead).
+description: userspace window manager
+exec:        /bin/guiwm
+respawn:     yes
+enabled:     yes
+# log:       /config/logs/guiwm.log

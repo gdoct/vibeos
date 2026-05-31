@@ -10,14 +10,17 @@ system (see [../graphics/graphics.md](../graphics/graphics.md)):
   `guiwm` worker — the framebuffer and input devices live in the kernel, so the
   compositor does too. The split into `core/` is what lets phase 2 lift the same
   code into userspace without a rewrite.
-- **[client/](client/)** — the **userspace GUI client** side (phase 2, scaffold).
-  Each app will be its own process talking to the compositor over an IPC message
-  bus and rendering into a window surface shared via mmap'd `/dev/fb` +
-  `/dev/input`. See [client/README.md](client/README.md) for the planned shape.
+- **[client/](client/)** — the **userspace GUI** (phase 2, shipped). A userspace
+  window-manager **server** (`guiwm`) mmaps `/dev/fb0`, grabs `/dev/input`, and
+  composites the desktop; **client** apps (`gmandel`, `gclock`) are ordinary musl
+  programs, one process per window, talking to the server over a loopback-TCP
+  message bus. Rendering and input now live in userspace; the kernel just exposes
+  the framebuffer + input as devices. See [client/README.md](client/README.md).
 
-Why `core` vs `client`: `core` is the shared library + the in-kernel compositor;
-`client` is per-application userspace code. The boundary between them is the
-future GUI IPC protocol. Keeping them as sibling trees now makes that protocol
-the only thing left to introduce, rather than a directory shuffle on top of it.
+By default the kernel runs the **userspace** WM (`gui/client`) and `gui/core` is
+the legacy in-kernel compositor, selectable with `gui.mode: kernel` in
+`/config/system.conf`. `core` and `client` share the same layered design (and a
+near-identical libdraw/libgfx); the split is the client/server boundary the GUI
+protocol now crosses.
 
 The logo asset pipeline lives in [core/tools/genlogo.py](core/tools/genlogo.py).
