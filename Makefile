@@ -121,6 +121,7 @@ KERNEL_C_SRCS = \
 	kernel/src/gui_draw.c \
 	kernel/src/gui_win.c \
 	kernel/src/gui_wm.c \
+	kernel/src/gui_logo.c \
 	kernel/src/file.c \
 	kernel/src/pipe.c \
 	kernel/src/synth.c \

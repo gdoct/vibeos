@@ -17,6 +17,8 @@
  */
 
 extern "C" void usb_mouse_get(int *x, int *y, int *buttons);
+extern "C" const uint32_t vibeos_logo[];
+extern "C" const int vibeos_logo_w, vibeos_logo_h;
 
 #define C_DESKTOP   RGB(0x20,0x60,0x80)
 #define CURSOR_KEY  RGB(0xFF,0x00,0xFF)     /* magenta = transparent */
@@ -52,6 +54,7 @@ static int       g_scene_dirty = 1;
 /* demo state */
 static window_t *g_demo;
 static widget_t *g_counter_label;
+static widget_t *g_textbox;
 static int       g_clicks;
 static char      g_counter_text[24];
 
@@ -95,6 +98,9 @@ static void raise_window(window_t *w) {
    only done when the scene actually changes (window moved / raised / dirty). */
 static void scene_compose(void) {
     draw_clear(&g_scene, C_DESKTOP);
+    /* project logo, centered in the upper third of the desktop */
+    draw_blit_alpha(&g_scene, vibeos_logo, vibeos_logo_w, vibeos_logo_h,
+                    (g_scene.w - vibeos_logo_w) / 2, g_scene.h / 4 - vibeos_logo_h / 2);
     draw_text(&g_scene, 8, 8, "VIBEOS DESKTOP", RGB(0xFF,0xFF,0xFF), 0, 1);
     for (int i = 0; i < g_nwin; i++) {
         window_t *w = g_zorder[i];
@@ -129,6 +135,46 @@ static void on_click_button(widget_t *wd, window_t *w) {
 static int       g_pb;
 static window_t *g_dragging; static int g_gx, g_gy;
 static widget_t *g_pressed;  static window_t *g_pressed_win;
+static widget_t *g_focus_text; static window_t *g_focus_win;   /* focused textbox */
+
+/* Keyboard queue: the USB keyboard driver pushes characters here (any CPU) when
+   a textbox is focused; the WM worker drains them. SPSC ring. */
+#define KEYQ_N 64
+static char              g_keyq[KEYQ_N];
+static volatile uint32_t g_kq_head, g_kq_tail;
+
+extern "C" int gui_wants_keyboard(void) { return g_focus_text != nullptr; }
+
+extern "C" void gui_input_key(char c) {
+    uint32_t n = (g_kq_head + 1) % KEYQ_N;
+    if (n == g_kq_tail) return;
+    g_keyq[g_kq_head] = c;
+    __asm__ volatile("" ::: "memory");
+    g_kq_head = n;
+}
+
+/* Deliver queued keystrokes to the focused textbox (WM-worker context). */
+static void wm_drain_keys(void) {
+    while (g_kq_tail != g_kq_head) {
+        char c = g_keyq[g_kq_tail];
+        g_kq_tail = (g_kq_tail + 1) % KEYQ_N;
+        widget_t *t = g_focus_text;
+        if (!t) continue;
+        if (c == '\b' || c == 0x7F) { if (t->len > 0) t->label[--t->len] = '\0'; }
+        else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7F && t->len < 38) {
+            t->label[t->len++] = c; t->label[t->len] = '\0';
+        }
+        if (g_focus_win) g_focus_win->dirty = 1;
+        g_scene_dirty = 1;
+    }
+}
+
+static void set_focus(widget_t *t, window_t *w) {
+    if (g_focus_text == t) return;
+    if (g_focus_text) { g_focus_text->focused = 0; if (g_focus_win) g_focus_win->dirty = 1; }
+    g_focus_text = t; g_focus_win = w;
+    if (t) { t->focused = 1; if (w) w->dirty = 1; }
+}
 
 /* Process one (x, y, buttons) sample: routing (raise/focus), drag, and clicks.
    Sets g_scene_dirty when the scene changes. The single source of WM input
@@ -139,13 +185,16 @@ static void wm_input(int x, int y, int b) {
 
     if (down) {
         window_t *w = window_at(x, y);
+        widget_t *newfocus = nullptr;
         if (w) {
             raise_window(w); g_scene_dirty = 1;
             int lx = x - w->frame.x, ly = y - w->frame.y;
             widget_t *wd = win_widget_at(w, lx, ly);
-            if (wd) { wd->pressed = 1; w->dirty = 1; g_pressed = wd; g_pressed_win = w; }
+            if (wd && wd->type == W_TEXTBOX) { newfocus = wd; }
+            else if (wd && wd->type == W_BUTTON) { wd->pressed = 1; w->dirty = 1; g_pressed = wd; g_pressed_win = w; }
             else if (win_titlebar_hit(w, lx, ly)) { g_dragging = w; g_gx = lx; g_gy = ly; }
         }
+        set_focus(newfocus, w);                  /* clicking elsewhere unfocuses the textbox */
     }
     if (g_dragging && (b & 1)) { g_dragging->frame.x = x - g_gx; g_dragging->frame.y = y - g_gy; g_scene_dirty = 1; }
     if (up) {
@@ -182,6 +231,21 @@ static void wm_selftest(void) {
     wm_input(bx, by, 0);                           /* release -> click */
     kprintf("[gui] selftest: button click %s (count %d -> %d)\n",
             g_clicks == before + 1 ? "OK" : "FAILED", before, g_clicks);
+
+    /* focus the textbox and type into it (the keyboard path) */
+    if (g_textbox) {
+        int kx = f.x + BORDER + 12 + 4, ky = f.y + TITLEBAR_H + 28 + 4;
+        wm_input(kx, ky, 1); wm_input(kx, ky, 0);  /* click the textbox -> focus */
+        const char *typed = "hello";
+        for (const char *p = typed; *p; p++) gui_input_key(*p);
+        wm_drain_keys();
+        kprintf("[gui] selftest: typed into textbox -> \"%s\" (%s)\n",
+                g_textbox->label,
+                (g_textbox->len == 5 && g_textbox->label[0] == 'h') ? "OK" : "FAILED");
+        set_focus(nullptr, nullptr);
+        g_textbox->label[0] = '\0'; g_textbox->len = 0;
+    }
+
     g_demo->frame = f0;                              /* restore for interactive use */
     g_scene_dirty = 1;
 }
@@ -196,6 +260,18 @@ static void wm_worker(void *arg) {
     draw_blit(&g_screen, &g_scene, 0, 0);           /* one full present at startup */
     draw_blit_key(&g_screen, &g_cursor, mx, my, CURSOR_KEY);
 
+    /* verify the logo blitted into the scene (read back composited pixels) */
+    {
+        int lx0 = (g_scene.w - vibeos_logo_w) / 2, ly0 = g_scene.h / 4 - vibeos_logo_h / 2;
+        int nonbg = 0;
+        for (int y = 0; y < vibeos_logo_h; y += 4)
+            for (int x = 0; x < vibeos_logo_w; x += 4)
+                if (g_scene.pixels[(uint32_t)(ly0 + y) * g_scene.stride + (lx0 + x)] != C_DESKTOP)
+                    nonbg++;
+        kprintf("[gui] selftest: logo rendered (%d non-desktop px in logo region) %s\n",
+                nonbg, nonbg > 100 ? "OK" : "FAILED");
+    }
+
     for (;;) {
         int x, y, b;
         usb_mouse_get(&x, &y, &b);
@@ -205,6 +281,7 @@ static void wm_worker(void *arg) {
         if (y >= g_screen.h) y = g_screen.h - 1;
 
         wm_input(x, y, b);
+        wm_drain_keys();                             /* deliver typed keys to the focused textbox */
 
         int moved = (x != mx || y != my);
         if (g_scene_dirty) {                         /* scene changed: recompose + full present */
@@ -235,12 +312,12 @@ void gui_init(void) {
     build_cursor();
 
     /* a demo window: a label + a button that counts clicks */
-    g_demo = win_create(g_screen.w / 2 - 110, g_screen.h / 2 - 70, 220, 130, "VibeOS Window");
+    g_demo = win_create(g_screen.w / 2 - 130, g_screen.h / 2 - 80, 260, 150, "VibeOS Window");
     if (g_demo) {
-        win_add_label(g_demo, 12, 12, "DRAG MY TITLE BAR");
-        win_add_label(g_demo, 12, 30, "CLICK THE BUTTON:");
-        g_counter_label = win_add_label(g_demo, 12, 78, "CLICKS: 0");
-        win_add_button(g_demo, 12, 48, 110, 22, "CLICK ME", on_click_button);
+        win_add_label(g_demo, 12, 10, "DRAG TITLE BAR. CLICK BOX + TYPE:");
+        g_textbox = win_add_textbox(g_demo, 12, 28, 230, 18);
+        win_add_button(g_demo, 12, 56, 110, 22, "CLICK ME", on_click_button);
+        g_counter_label = win_add_label(g_demo, 130, 62, "CLICKS: 0");
         g_zorder[g_nwin++] = g_demo;
     }
 

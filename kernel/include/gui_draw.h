@@ -40,6 +40,8 @@ void draw_line(surface_t *s, int x0, int y0, int x1, int y1, uint32_t color);
    transparency — used for the cursor sprite). */
 void draw_blit(surface_t *dst, const surface_t *src, int dx, int dy);
 void draw_blit_key(surface_t *dst, const surface_t *src, int dx, int dy, uint32_t key);
+/* Alpha-blend `src` (0xAARRGGBB pixels) over `dst`, at (dx,dy), w x h pixels. */
+void draw_blit_alpha(surface_t *dst, const uint32_t *src, int sw, int sh, int dx, int dy);
 /* Copy a sub-rect of dst into another dst region (for cursor save/restore). */
 void draw_copy_rect(surface_t *dst, const surface_t *src,
                     int sx, int sy, int w, int h, int dx, int dy);

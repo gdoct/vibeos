@@ -19,14 +19,16 @@ extern "C" {
 
 struct window;
 typedef struct widget {
-    int      type;                 /* W_LABEL / W_BUTTON */
+    int      type;                 /* W_LABEL / W_BUTTON / W_TEXTBOX */
     rect_t   bounds;               /* relative to the window content origin */
-    char     label[32];
+    char     label[40];            /* button/label text, or textbox contents */
+    int      len;                  /* textbox: current text length */
     int      pressed;              /* button visual state */
+    int      focused;              /* textbox has keyboard focus (caret shown) */
     void   (*on_click)(struct widget *, struct window *);
 } widget_t;
 
-enum { W_LABEL = 0, W_BUTTON = 1 };
+enum { W_LABEL = 0, W_BUTTON = 1, W_TEXTBOX = 2 };
 
 typedef struct window {
     surface_t surface;             /* backing store (owns pixels) */
@@ -42,6 +44,7 @@ window_t *win_create(int x, int y, int w, int h, const char *title);
 widget_t *win_add_button(window_t *w, int x, int y, int bw, int bh, const char *label,
                          void (*cb)(widget_t *, window_t *));
 widget_t *win_add_label(window_t *w, int x, int y, const char *text);
+widget_t *win_add_textbox(window_t *w, int x, int y, int bw, int bh);
 
 void      win_paint(window_t *w);                 /* render chrome + widgets into surface */
 int       win_titlebar_hit(window_t *w, int lx, int ly);   /* window-local point in title bar? */

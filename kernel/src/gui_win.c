@@ -64,7 +64,16 @@ widget_t *win_add_label(window_t *w, int x, int y, const char *text) {
     widget_t *wd = add_widget(w, W_LABEL);
     if (!wd) return nullptr;
     wd->bounds = (rect_t){ x, y, 0, 0 };
-    int i = 0; for (; text[i] && i < 31; i++) wd->label[i] = text[i]; wd->label[i] = '\0';
+    int i = 0; for (; text[i] && i < 39; i++) wd->label[i] = text[i]; wd->label[i] = '\0';
+    w->dirty = 1;
+    return wd;
+}
+
+widget_t *win_add_textbox(window_t *w, int x, int y, int bw, int bh) {
+    widget_t *wd = add_widget(w, W_TEXTBOX);
+    if (!wd) return nullptr;
+    wd->bounds = (rect_t){ x, y, bw, bh };
+    wd->label[0] = '\0'; wd->len = 0;
     w->dirty = 1;
     return wd;
 }
@@ -88,6 +97,20 @@ static void paint_button(surface_t *s, widget_t *b) {
     draw_text(s, tx, ty, b->label, C_TEXT, 0, 1);
 }
 
+static void paint_textbox(surface_t *s, widget_t *t) {
+    int x = content_x() + t->bounds.x, y = content_y() + t->bounds.y;
+    int w = t->bounds.w, h = t->bounds.h;
+    draw_fill_rect(s, x, y, w, h, RGB(0xFF,0xFF,0xFF));        /* white field */
+    draw_hline(s, x, y, w, C_BTN_LO); draw_vline(s, x, y, h, C_BTN_LO);   /* sunken */
+    draw_hline(s, x, y + h - 1, w, C_BTN_HI); draw_vline(s, x + w - 1, y, h, C_BTN_HI);
+    int tx = x + 4, ty = y + (h - GLYPH_H) / 2;
+    draw_text(s, tx, ty, t->label, C_TEXT, 0, 1);
+    if (t->focused) {                                          /* caret after the text */
+        int cx = tx + t->len * GLYPH_W;
+        draw_vline(s, cx, ty - 1, GLYPH_H + 2, C_TEXT);
+    }
+}
+
 void win_paint(window_t *w) {
     surface_t *s = &w->surface;
     draw_clear(s, C_FACE);
@@ -100,6 +123,7 @@ void win_paint(window_t *w) {
     for (int i = 0; i < w->nwidgets; i++) {
         widget_t *wd = &w->widgets[i];
         if (wd->type == W_BUTTON) paint_button(s, wd);
+        else if (wd->type == W_TEXTBOX) paint_textbox(s, wd);
         else draw_text(s, content_x() + wd->bounds.x, content_y() + wd->bounds.y,
                        wd->label, C_TEXT, 0, 1);
     }
@@ -114,7 +138,7 @@ widget_t *win_widget_at(window_t *w, int lx, int ly) {
     int cx = lx - content_x(), cy = ly - content_y();
     for (int i = w->nwidgets - 1; i >= 0; i--) {
         widget_t *wd = &w->widgets[i];
-        if (wd->type != W_BUTTON) continue;
+        if (wd->type != W_BUTTON && wd->type != W_TEXTBOX) continue;  /* interactive only */
         if (cx >= wd->bounds.x && cx < wd->bounds.x + wd->bounds.w &&
             cy >= wd->bounds.y && cy < wd->bounds.y + wd->bounds.h)
             return wd;

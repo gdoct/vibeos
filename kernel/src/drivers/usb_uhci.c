@@ -7,6 +7,7 @@
 #include "timer.h"
 #include "tty.h"
 #include "fb.h"
+#include "gui.h"
 
 /*
  * UHCI (USB 1.1) host controller + USB HID boot-protocol driver (ROADMAP:
@@ -215,7 +216,11 @@ static void kbd_report(hid_dev_t *h, const uint8_t *r) {
         int was = 0;
         for (int j = 2; j < 8; j++) if (h->prev[j] == k) { was = 1; break; }
         if (was) continue;                     /* still held: not a fresh press */
-        if (k < 0x40 && kmap[shift][k]) tty_input(kmap[shift][k]);
+        if (k < 0x40 && kmap[shift][k]) {
+            char c = kmap[shift][k];
+            if (gui_wants_keyboard()) gui_input_key(c);  /* a GUI textbox is focused */
+            else                      tty_input(c);      /* otherwise the console */
+        }
     }
     kmemcpy(h->prev, r, 8);
 }

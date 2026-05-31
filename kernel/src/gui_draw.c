@@ -83,6 +83,25 @@ void draw_blit_key(surface_t *dst, const surface_t *src, int dx, int dy, uint32_
     }
 }
 
+void draw_blit_alpha(surface_t *dst, const uint32_t *src, int sw, int sh, int dx, int dy) {
+    for (int j = 0; j < sh; j++) {
+        int y = dy + j; if (y < 0 || y >= dst->h) continue;
+        for (int i = 0; i < sw; i++) {
+            int x = dx + i; if (x < 0 || x >= dst->w) continue;
+            uint32_t s = src[(uint32_t)j * sw + i];
+            uint32_t a = s >> 24;
+            if (a == 0) continue;
+            uint32_t *d = &dst->pixels[(uint32_t)y * dst->stride + x];
+            if (a == 255) { *d = s & 0xFFFFFF; continue; }
+            uint32_t dv = *d, ia = 255 - a;
+            uint32_t r = (((s >> 16) & 0xFF) * a + ((dv >> 16) & 0xFF) * ia) / 255;
+            uint32_t g = (((s >> 8)  & 0xFF) * a + ((dv >> 8)  & 0xFF) * ia) / 255;
+            uint32_t b = ((s & 0xFF) * a + (dv & 0xFF) * ia) / 255;
+            *d = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
 void draw_copy_rect(surface_t *dst, const surface_t *src,
                     int sx, int sy, int w, int h, int dx, int dy) {
     for (int j = 0; j < h; j++) {
