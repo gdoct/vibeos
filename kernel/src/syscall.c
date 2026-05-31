@@ -14,6 +14,7 @@
 #include "net.h"
 #include "synth.h"
 #include "csprng.h"
+#include "config.h"
 
 /*
  * System calls (ROADMAP §3 + §4 Linux ABI).
@@ -751,6 +752,41 @@ static int64_t sys_lseek(int fd, int64_t off, int whence) {
     return n;
 }
 
+/* sysconfig(op, a, buf, len) — VibeOS-private access to the /config service
+   (ROADMAP: config service). A high, non-Linux number so musl never calls it;
+   /bin/sysconf drives it. ops: 0=RELOAD (re-read /config), 1=GET (value of key
+   `a`), 2=COUNT, 3=ENTRY (i-th "key=value" where i=`a`). */
+static int64_t sys_sysconfig(int op, uint64_t a, uint64_t ubuf, uint64_t len) {
+    enum { CFG_RELOAD = 0, CFG_GET = 1, CFG_COUNT = 2, CFG_ENTRY = 3 };
+    char out[256];
+    switch (op) {
+    case CFG_RELOAD: return config_reload();
+    case CFG_COUNT:  return config_count();
+    case CFG_GET: {
+        char key[64]; copy_user_str(key, (const char *)a, sizeof key);
+        const char *v = config_get(key);
+        if (!v) return -ENOENT_;
+        unsigned n = 0; for (; v[n] && n < sizeof out - 1; n++) out[n] = v[n]; out[n] = '\0';
+        uint64_t c = n < len ? n : len;
+        if (c && copy_to_user(cur_vm(), ubuf, out, c) < 0) return -EFAULT_;
+        return (int64_t)n;
+    }
+    case CFG_ENTRY: {
+        const char *k, *v;
+        if (!config_entry((int)a, &k, &v)) return -ENOENT_;
+        unsigned n = 0;
+        for (unsigned i = 0; k[i] && n < sizeof out - 2; i++) out[n++] = k[i];
+        out[n++] = '=';
+        for (unsigned i = 0; v[i] && n < sizeof out - 1; i++) out[n++] = v[i];
+        out[n] = '\0';
+        uint64_t c = n < len ? n : len;
+        if (c && copy_to_user(cur_vm(), ubuf, out, c) < 0) return -EFAULT_;
+        return (int64_t)n;
+    }
+    default: return -EINVAL_;
+    }
+}
+
 /* Stat a synthetic /dev or /proc object (ROADMAP §4). */
 static void fill_stat_synth(struct linux_stat *st, int is_dir, int is_char) {
     kmemset(st, 0, sizeof *st);
@@ -1362,6 +1398,7 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 280: return 0;                                        /* utimensat (no mtime store) */
     case 273: return 0;                                        /* set_robust_list (accept) */
     case 324: return 0;                                        /* membarrier (BSP-pinned: a no-op) */
+    case 1000: return (uint64_t)sys_sysconfig((int)f->rdi, f->rsi, f->rdx, f->r10); /* sysconfig (VibeOS) */
     case 88:  return (uint64_t)sys_symlink((const char *)f->rdi, (const char *)f->rsi); /* symlink */
     case 89:  return (uint64_t)sys_readlink((const char *)f->rdi, (char *)f->rsi, f->rdx); /* readlink */
     case 267: return (uint64_t)sys_readlink((const char *)f->rsi, (char *)f->rdx, f->r10); /* readlinkat */
@@ -1400,7 +1437,10 @@ static uint64_t do_syscall(syscall_frame_t *f) {
         struct utsname { char sysname[65], nodename[65], release[65],
                               version[65], machine[65], domainname[65]; } u;
         kmemset(&u, 0, sizeof u);
-        const char *vals[6] = { "VibeOS", "vibeos", "0.9", "VibeOS x86_64 SMP", "x86_64", "(none)" };
+        const char *vals[6] = { "VibeOS",
+                                config_get_def("hostname", "vibeos"),   /* /config */
+                                "0.9", "VibeOS x86_64 SMP", "x86_64",
+                                config_get_def("domainname", "(none)") };
         char *flds[6] = { u.sysname, u.nodename, u.release, u.version, u.machine, u.domainname };
         for (int i = 0; i < 6; i++)
             for (int j = 0; vals[i][j] && j < 64; j++) flds[i][j] = vals[i][j];

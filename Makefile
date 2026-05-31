@@ -113,6 +113,7 @@ KERNEL_C_SRCS = \
 	kernel/src/elf64.c \
 	kernel/src/random.c \
 	kernel/src/csprng.c \
+	kernel/src/config.c \
 	kernel/src/file.c \
 	kernel/src/pipe.c \
 	kernel/src/synth.c \
@@ -168,6 +169,7 @@ USER_MPKG   = user/build/pkg.elf
 USER_VHELLO = user/build/vibehello.elf
 USER_ABITEST = user/build/abitest.elf
 USER_THREAD = user/build/threadtest.elf
+USER_SYSCONF = user/build/sysconf.elf
 
 # VibeOS cross toolchain (ROADMAP §"Toolchain integration").
 VIBEOS_CC     = ./toolchain/x86_64-vibeos-musl-gcc
@@ -223,7 +225,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -319,6 +321,13 @@ ifeq ($(MUSL_CC),)
 	@echo "warning: musl-tools not found; skipping $(USER_THREAD)"
 else
 	$(VIBEOS_CC) -static -no-pie -O2 -pthread -o $@ $<
+endif
+
+$(USER_SYSCONF): user/musl/sysconf.c $(SYSROOT_SPECS) | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-tools not found; skipping $(USER_SYSCONF)"
+else
+	$(VIBEOS_CC) -static -no-pie -O2 -o $@ $<
 endif
 
 user/build:

@@ -14,6 +14,7 @@
 #include "fs.h"
 #include "net.h"
 #include "csprng.h"
+#include "config.h"
 #include "usermode.h"
 #include "percpu.h"
 #include "../../boot/include/bootinfo.h"
@@ -262,6 +263,11 @@ extern "C" void kmain(BootInfo *bi) {
     int mr = fs_mount(root_dev);
     if (mr != FS_OK) panic("fs: failed to mount root volume (%d)", mr);
     kprintf("[fs] root volume '%s' mounted\n", root_dev->dev.name);
+
+    /* System configuration (ROADMAP: config service). Read /config/system.conf
+       now that the fs is mounted, so subsystems below can consult it. */
+    config_init();
+    { const char *motd = config_get("motd"); if (motd) kprintf("[motd] %s\n", motd); }
 
     /* Now take interrupts. From here virtio completions arrive via IRQ
        and the timer drives preemption + sleeper wakeups. */

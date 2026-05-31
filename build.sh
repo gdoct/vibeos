@@ -34,6 +34,8 @@ step "Bootstrap $VDISK ($VDISK_SIZE) with /bin"
 rm -f "$VDISK"
 "$DISKUTIL" --create-volume "$VDISK_SIZE" "$VDISK"
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /bin
+"$DISKUTIL" --diskfile "$VDISK" --mkdir /config
+"$DISKUTIL" --diskfile "$VDISK" --import config/system.conf /config/system.conf
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/init.elf  /bin/init
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/sh.elf    /bin/sh
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/hello.elf /bin/hello
@@ -61,6 +63,8 @@ rm -f "$VDISK"
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/abitest.elf /bin/abitest
 [ -f user/build/threadtest.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/threadtest.elf /bin/threadtest
+[ -f user/build/sysconf.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/sysconf.elf /bin/sysconf
 
 # Dynamic linking (ROADMAP §4): ship the musl dynamic linker as
 # /lib/ld-musl-x86_64.so.1 (the host's musl libc.so doubles as the loader) and a
