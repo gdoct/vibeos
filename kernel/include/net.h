@@ -82,6 +82,7 @@ int   ksock_sendto(void *s, const void *buf, uint32_t len, uint32_t ip, uint16_t
 int   ksock_recv(void *s, void *buf, uint32_t len);                  /* connected */
 int   ksock_recvfrom(void *s, void *buf, uint32_t len, uint32_t *ip, uint16_t *port);
 int   ksock_poll(void *s, int want);              /* returns ready NET_POLL* bits */
+int   ksock_getname(void *s, int peer, uint32_t *ip, uint16_t *port);  /* local/peer addr */
 void  ksock_close(void *s);
 
 #ifdef __cplusplus

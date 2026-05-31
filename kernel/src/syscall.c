@@ -1043,6 +1043,30 @@ static int64_t sys_connect(int fd, uint64_t uaddr, uint32_t ulen) {
     return ksock_connect(ks, ip, port) == 0 ? 0 : -111;   /* -ECONNREFUSED */
 }
 
+/* getsockname (peer=0) / getpeername (peer=1) (ROADMAP ABI widening). */
+static int64_t sys_getsockname(int fd, uint64_t uaddr, uint64_t ulen_ptr, int peer) {
+    void *ks = sock_get(fd); if (!ks) return -EBADF_;
+    uint32_t ip; uint16_t port;
+    if (ksock_getname(ks, peer, &ip, &port) < 0) return -EINVAL_;
+    write_sockaddr(uaddr, ulen_ptr, ip, port);
+    return 0;
+}
+
+/* getsockopt: zero the option value (covers SO_ERROR after connect, etc.). */
+static int64_t sys_getsockopt(int fd, int level, int optname, uint64_t uval, uint64_t ulen_ptr) {
+    (void)level; (void)optname;
+    void *ks = sock_get(fd); if (!ks) return -EBADF_;
+    uint32_t ulen = 0;
+    if (ulen_ptr) copy_from_user(&ulen, cur_vm(), ulen_ptr, sizeof ulen);
+    if (uval && ulen >= sizeof(int)) {
+        int zero = 0;
+        copy_to_user(cur_vm(), uval, &zero, sizeof zero);
+        uint32_t four = sizeof(int);
+        if (ulen_ptr) copy_to_user(cur_vm(), ulen_ptr, &four, sizeof four);
+    }
+    return 0;
+}
+
 static int64_t sys_accept(int fd, uint64_t uaddr, uint64_t ulen_ptr) {
     void *ks = sock_get(fd); if (!ks) return -EBADF_;
     uint32_t pip = 0; uint16_t pport = 0;
@@ -1166,10 +1190,11 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 49:  return (uint64_t)sys_bind((int)f->rdi, f->rsi, (uint32_t)f->rdx);  /* bind */
     case 50:  return (uint64_t)sys_listen((int)f->rdi, (int)f->rsi);    /* listen */
     case 48:  return 0;                                        /* shutdown (stub) */
-    case 51:  return 0;                                        /* getsockname (stub) */
-    case 52:  return 0;                                        /* getpeername (stub) */
-    case 54:  return 0;                                        /* setsockopt (stub) */
-    case 55:  return 0;                                        /* getsockopt (stub) */
+    case 51:  return (uint64_t)sys_getsockname((int)f->rdi, f->rsi, f->rdx, 0); /* getsockname */
+    case 52:  return (uint64_t)sys_getsockname((int)f->rdi, f->rsi, f->rdx, 1); /* getpeername */
+    case 54:  return 0;                                        /* setsockopt (accept all) */
+    case 55:  return (uint64_t)sys_getsockopt((int)f->rdi, (int)f->rsi, (int)f->rdx,
+                                              f->r10, f->r8);  /* getsockopt */
     case 62:  return (uint64_t)sys_kill((int)f->rdi, (int)f->rsi);   /* kill */
     case 200: return (uint64_t)sys_kill((int)f->rdi, (int)f->rsi);   /* tkill(tid,sig) */
     case 234: return (uint64_t)sys_tgkill((int)f->rdi, (int)f->rsi, (int)f->rdx); /* tgkill */
@@ -1212,6 +1237,42 @@ static uint64_t do_syscall(syscall_frame_t *f) {
         if (f->rsi && copy_to_user(cur_vm(), f->rsi, &node, sizeof node) < 0)
             return (uint64_t)(int64_t)-EFAULT_;
         return 0;
+    }
+    case 63: {                                                 /* uname */
+        struct utsname { char sysname[65], nodename[65], release[65],
+                              version[65], machine[65], domainname[65]; } u;
+        kmemset(&u, 0, sizeof u);
+        const char *vals[6] = { "VibeOS", "vibeos", "0.9", "VibeOS x86_64 SMP", "x86_64", "(none)" };
+        char *flds[6] = { u.sysname, u.nodename, u.release, u.version, u.machine, u.domainname };
+        for (int i = 0; i < 6; i++)
+            for (int j = 0; vals[i][j] && j < 64; j++) flds[i][j] = vals[i][j];
+        if (copy_to_user(cur_vm(), f->rdi, &u, sizeof u) < 0) return (uint64_t)(int64_t)-EFAULT_;
+        return 0;
+    }
+    case 228: {                                                /* clock_gettime */
+        uint64_t t = timer_ticks();                            /* 100 Hz */
+        struct { int64_t sec, nsec; } ts = { (int64_t)(t / 100), (int64_t)((t % 100) * 10000000) };
+        if (copy_to_user(cur_vm(), f->rsi, &ts, sizeof ts) < 0) return (uint64_t)(int64_t)-EFAULT_;
+        return 0;
+    }
+    case 96: {                                                 /* gettimeofday */
+        uint64_t t = timer_ticks();
+        struct { int64_t sec, usec; } tv = { (int64_t)(t / 100), (int64_t)((t % 100) * 10000) };
+        if (f->rdi && copy_to_user(cur_vm(), f->rdi, &tv, sizeof tv) < 0) return (uint64_t)(int64_t)-EFAULT_;
+        return 0;
+    }
+    case 318: {                                                /* getrandom(buf, len, flags) */
+        uint64_t ubuf = f->rdi, len = f->rsi;
+        if (len && !paging_user_ok(cur_vm(), ubuf, len, 1)) return (uint64_t)(int64_t)-EFAULT_;
+        uint8_t tmp[256];
+        uint64_t done = 0;
+        while (done < len) {
+            uint32_t c = (uint32_t)((len - done) < sizeof tmp ? (len - done) : sizeof tmp);
+            csprng_bytes(tmp, c);
+            if (copy_to_user(cur_vm(), ubuf + done, tmp, c) < 0) return (uint64_t)(int64_t)-EFAULT_;
+            done += c;
+        }
+        return (uint64_t)len;
     }
     case 60:                                                   /* exit */
     case 231: sys_exit((int)f->rdi);                           /* exit_group */

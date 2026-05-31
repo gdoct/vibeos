@@ -1256,6 +1256,27 @@ int ksock_poll(void *vp, int want) {
     return r;
 }
 
+/* Report a socket's local (peer=0) or remote (peer=1) address in host order. */
+int ksock_getname(void *vp, int peer, uint32_t *ip, uint16_t *port) {
+    ksocket_t *s = (ksocket_t *)vp;
+    if (!s || !s->used) return -1;
+    if (s->type == SOCK_STREAM && s->tcp) {
+        if (peer) { *ip = s->tcp->remote_ip; *port = s->tcp->remote_port; }
+        else      { *ip = s->tcp->local_ip;  *port = s->tcp->local_port;  }
+        return 0;
+    }
+    if (s->type == SOCK_DGRAM) {
+        if (peer) {
+            if (!s->connected) return -1;
+            *ip = s->peer_ip; *port = s->peer_port;
+        } else {
+            *ip = LOCAL_IP; *port = s->udp ? s->udp->local_port : 0;
+        }
+        return 0;
+    }
+    return -1;
+}
+
 void ksock_close(void *vp) {
     ksocket_t *s = (ksocket_t *)vp;
     if (!s || !s->used) return;

@@ -117,11 +117,17 @@ stolen across cores, user tasks BSP-pinned), **(9) userspace quality-of-life**
 tar package tool), and **(10) a cross toolchain** — `x86_64-vibeos-musl-gcc` +
 a VibeOS sysroot ([toolchain/](toolchain/)) that builds binaries for VibeOS
 directly (its loader, `__vibeos__`, `<vibeos.h>`); `make sysroot` assembles it
-and `/bin/vibehello` is built with it. See "What works today". What remains:
+and `/bin/vibehello` is built with it.
 
-**Widening the ABI toward busybox/binutils** as opportunity allows (more
-`stat`/`fcntl` variants, `clock_gettime`, `getrandom`, `uname`, `getsockname`/
-`setsockopt` beyond stubs); PIE load base is fixed (no ASLR yet).
+The original backlog is now cleared. **ABI widened** since: `uname`,
+`clock_gettime`, `gettimeofday`, `getrandom` (from the CSPRNG), real
+`getsockname`/`getpeername`/`getsockopt`, `mkdir`/`mkdirat`, `lstat`,
+`symlink`/`readlink`, `chdir`, and `fcntl` `F_GETFD`/`F_SETFD`/
+`F_DUPFD_CLOEXEC` — exercised by `/bin/abitest` (itself cross-built). See "What
+works today".
+
+**Still open, as opportunity allows:** more `stat`/`fcntl` variants for
+busybox/binutils; threads (`clone`/futex); PIE load base is fixed (no ASLR yet).
 
 *Known issue:* unclean-`fsck` drops `/bin/init` on diskutil volumes (workaround =
 clean image per build); root-cause before relying on crash persistence. Other
