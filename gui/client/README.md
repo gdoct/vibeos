@@ -34,15 +34,21 @@ window management, widgets, apps — is ordinary musl programs.
   listens on `127.0.0.1:7000`, and composites the desktop (wallpaper + logo +
   client windows with title-bar/border/close-box chrome + a taskbar whose
   launcher buttons start apps on click) with a mouse
-  pointer that tracks the USB mouse. Title bars drag; the focused window gets the
-  keyboard. Started at boot by the service-managed init
+  pointer that tracks the USB mouse. Title bars drag; the **bottom-right grip
+  resizes** (the WM sends the client a `GE_RESIZE` with the new size); the focused
+  window gets the keyboard. Started at boot by the service-managed init
   ([config/services/guiwm.yaml](../../config/services/guiwm.yaml)).
 - **gmandel** — a demo **client**: renders the Mandelbrot set into its own window
-  (WASD pan, +/- zoom). Proves process-per-window: it's a plain musl program.
-- **gclock** — a second demo client: a live window (uptime counter + a bouncing
-  box), showing the compositor multiplexing several independent client processes.
+  (WASD pan, +/- zoom; re-renders on resize). Proves process-per-window.
+- **gclock** — a live window (uptime counter + a bouncing box), showing the
+  compositor multiplexing several independent client processes.
+- **gterm** — a terminal: runs `/bin/sh` in a window (line-edited input, output
+  scrollback, draggable scrollbar).
 - **guiprobe** — a minimal smoke test of the kernel primitives (mmap `/dev/fb0`,
   read `/dev/input`).
+
+A client handles resize by reallocating its surface on `GE_RESIZE` — see
+[docs/examples/guihello.c](../../docs/examples/guihello.c).
 
 ## Running
 

@@ -1,4 +1,4 @@
-/* gmandel — a VibeOS GUI client (phase 2): renders the Mandelbrot set into its
+/* gmandel — a VibeOS GUI client: renders the Mandelbrot set into its
  * own window. Connects to /bin/guiwm over loopback TCP, creates a window, draws
  * the fractal into a libgfx surface, and commits it. Arrow-ish keys pan/zoom and
  * re-render; the WM's close box (or 'q') ends it. Proves process-per-window:
@@ -23,11 +23,11 @@ static uint32_t color(int it, int maxit) {
 
 static void render(gfx_surface_t *s) {
     const int maxit = 90;
-    double half = scale * 0.5;
-    for (int py = 0; py < H; py++) {
-        double y0 = cy + (py - H/2) * (scale / W);
-        for (int px = 0; px < W; px++) {
-            double x0 = cx + (px - W/2) * (scale / W);
+    int w = s->w, h = s->h;
+    for (int py = 0; py < h; py++) {
+        double y0 = cy + (py - h/2) * (scale / w);
+        for (int px = 0; px < w; px++) {
+            double x0 = cx + (px - w/2) * (scale / w);
             double x = 0, y = 0; int it = 0;
             while (x*x + y*y <= 4.0 && it < maxit) {
                 double xt = x*x - y*y + x0;
@@ -36,7 +36,6 @@ static void render(gfx_surface_t *s) {
             s->px[(size_t)py * s->stride + px] = color(it, maxit);
         }
     }
-    (void)half;
 }
 
 int main(void) {
@@ -60,6 +59,10 @@ int main(void) {
         gevt_input_t ev;
         int r = gc_poll(c, &ev);
         if (r < 0) { printf("gmandel: window closed\n"); break; }
+        if (r > 0 && ev.ev == GE_RESIZE) {       /* re-render at the new size */
+            gfx_free(&s); s = gfx_alloc(c->w, c->h);
+            if (s.px) { render(&s); gc_commit(c, &s); }
+        }
         if (r > 0 && ev.ev == GE_KEY) {
             int redraw = 1;
             switch (ev.key) {

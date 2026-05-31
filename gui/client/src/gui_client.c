@@ -84,6 +84,7 @@ int gc_poll(gui_conn_t *c, gevt_input_t *ev) {
     if (hdr.type == GEVT_CLOSE) return -1;
     if (hdr.type == GEVT_INPUT) {
         if (read_full(c->fd, ev, sizeof *ev)) return -1;
+        if (ev->ev == GE_RESIZE) { c->w = ev->x; c->h = ev->y; }  /* track new size */
         return 1;
     }
     /* unknown body: drain it */

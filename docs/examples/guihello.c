@@ -45,7 +45,7 @@ static void redraw(gfx_surface_t *s, int clicks, char last_key) {
     snprintf(line, sizeof line, "LAST KEY: %c", last_key ? last_key : ' ');
     gfx_text(s, 12, 112, line, GFX_RGB(0xc0, 0xc0, 0xc0));
 
-    gfx_text(s, 12, H - 20, "PRESS Q TO QUIT", GFX_RGB(0x80, 0x90, 0xa0));
+    gfx_text(s, 12, s->h - 20, "PRESS Q TO QUIT", GFX_RGB(0x80, 0x90, 0xa0));
 }
 
 /* Is (x,y) inside the button rect drawn above? */
@@ -84,6 +84,11 @@ int main(void) {
             case GE_KEY:
                 if (ev.key == 'q') { gfx_free(&s); gc_close(c); return 0; }
                 last_key = (char)ev.key; dirty = 1;
+                break;
+            case GE_RESIZE:                 /* WM resized us: re-make the surface */
+                gfx_free(&s);
+                s = gfx_alloc(c->w, c->h);  /* gc_poll already updated c->w/c->h */
+                dirty = 1;
                 break;
             default:                        /* GE_MOUSE_MOVE/UP/FOCUS/... ignored */
                 break;

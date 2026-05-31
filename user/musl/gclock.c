@@ -24,6 +24,10 @@ int main(void) {
         int r = gc_poll(c, &ev);
         if (r < 0) break;
         if (r > 0 && ev.ev == GE_KEY && ev.key == 'q') break;
+        if (r > 0 && ev.ev == GE_RESIZE) {       /* re-make the surface */
+            gfx_free(&s); s = gfx_alloc(c->w, c->h);
+            if (!s.px) break;
+        }
 
         gfx_clear(&s, GFX_RGB(0x12,0x16,0x22));
         char buf[32];
@@ -33,8 +37,8 @@ int main(void) {
         gfx_rect(&s, bx, by, 24, 24, GFX_RGB(0xf0,0xd0,0x40));
         gfx_fill_rect(&s, bx+4, by+4, 16, 16, GFX_RGB(0xc0,0x60,0x30));
         bx += vx; by += vy;
-        if (bx < 2 || bx > W-26) vx = -vx;
-        if (by < 26 || by > H-26) vy = -vy;
+        if (bx < 2 || bx > s.w-26) vx = -vx;
+        if (by < 26 || by > s.h-26) vy = -vy;
         gc_commit(c, &s);
         ticks++;
         usleep(200000);   /* ~5 fps */

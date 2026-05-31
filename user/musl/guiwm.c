@@ -38,6 +38,9 @@ extern const int vibeos_logo_w, vibeos_logo_h;
 #define TITLEBAR_H 22
 #define BORDER     2
 #define TASKBAR_H  24
+#define GRIP       16           /* resize handle in the bottom-right corner */
+#define MIN_W      120          /* minimum window content size */
+#define MIN_H      80
 
 #define C_DESKTOP   GFX_RGB(0x20,0x60,0x80)
 #define C_TITLE     GFX_RGB(0x2a,0x52,0x86)
@@ -65,6 +68,7 @@ typedef struct {
        never blocks on a slow client. */
     uint8_t obuf[64];
     int olen, ooff;
+    int rz_pending;             /* owe the client a GE_RESIZE for the current w/h */
 } win_t;
 
 static win_t      g_win[MAXWIN];
@@ -78,8 +82,9 @@ static int        g_mx, g_my;            /* cursor position */
 static int        g_buttons;             /* last button bitmask */
 static int        g_dirty = 1;           /* scene needs a recompose */
 
-/* drag state */
+/* drag / resize state (window index, or -1) */
 static int        g_drag = -1, g_drag_dx, g_drag_dy;
+static int        g_resize = -1;
 
 /* ---- launcher ---- */
 /* Apps the taskbar can start. The server must NOT fork() itself once it has
@@ -88,6 +93,7 @@ static int        g_drag = -1, g_drag_dx, g_drag_dy;
    fork/exec on our behalf. The server just writes the binary path down a pipe. */
 typedef struct { const char *label; const char *path; } app_t;
 static const app_t g_apps[] = {
+    { "TERMINAL",   "/bin/gterm"    },
     { "MANDELBROT", "/bin/gmandel"  },
     { "CLOCK",      "/bin/gclock"   },
     { "HELLO",      "/bin/guihello" },
@@ -210,6 +216,36 @@ static void remove_window(int idx) {
     g_dirty = 1;
 }
 
+/* Resize a window's content to nw x nh. Grows the server-side pixel + receive
+   buffers (preserving the old content top-left and any in-flight frame bytes —
+   the rbuf state machine must stay aligned, so we never shrink it), and flags the
+   client to re-render at the new size. Stale frames at the old size are dropped
+   by apply_message's size check. */
+static void do_resize(int idx, int nw, int nh) {
+    win_t *w = &g_win[idx];
+    if (nw < MIN_W) nw = MIN_W;
+    if (nh < MIN_H) nh = MIN_H;
+    if (nw == w->w && nh == w->h) return;
+
+    uint32_t *np = (uint32_t *)calloc((size_t)nw * nh, 4);
+    if (!np) return;
+    if (w->pix) {
+        int cw = nw < w->w ? nw : w->w, ch = nh < w->h ? nh : w->h;
+        for (int y = 0; y < ch; y++)
+            memcpy(np + (size_t)y * nw, w->pix + (size_t)y * w->w, (size_t)cw * 4);
+        free(w->pix);
+    }
+    w->pix = np;
+    int need = nw * nh * 4 + 64;
+    if (need > w->rcap) {                          /* grow only — keep alignment */
+        uint8_t *nb = (uint8_t *)realloc(w->rbuf, need);
+        if (nb) { w->rbuf = nb; w->rcap = need; }
+    }
+    w->w = nw; w->h = nh;
+    w->rz_pending = 1;                             /* delivered from the main loop */
+    g_dirty = 1;
+}
+
 /* ---- compositing ---- */
 static void draw_window(win_t *w, int focused) {
     int ox,oy,ow,oh; outer_rect(w,&ox,&oy,&ow,&oh);
@@ -221,6 +257,12 @@ static void draw_window(win_t *w, int focused) {
     gfx_fill_rect(&g_back, w->x + w->w - 16, w->y - TITLEBAR_H + 4, 12, 12, C_CLOSE);
     gfx_text(&g_back, w->x + w->w - 14, w->y - TITLEBAR_H + 6, "X", C_TITLE_FG);
     if (w->pix) gfx_blit(&g_back, w->pix, w->w, w->h, w->x, w->y);   /* content */
+    /* resize grip: a few diagonal lines in the bottom-right corner */
+    int gx = w->x + w->w, gy = w->y + w->h;
+    for (int d = 4; d < GRIP; d += 4)
+        for (int t = 0; t < 2; t++)
+            gfx_pixel(&g_back, gx - d + t, gy - 2, GFX_RGB(0xc0,0xc8,0xd0)),
+            gfx_pixel(&g_back, gx - 2, gy - d + t, GFX_RGB(0xc0,0xc8,0xd0));
 }
 
 static void compose(void) {
@@ -357,7 +399,13 @@ static void on_mouse(int x, int y, int buttons) {
     int released = g_buttons & ~buttons;
     g_buttons = buttons;
 
-    if (g_drag >= 0) {
+    if (g_resize >= 0) {
+        if (released & 1) { g_resize = -1; }  /* drop */
+        else {
+            win_t *w = &g_win[g_resize];
+            do_resize(g_resize, x - w->x, y - w->y);
+        }
+    } else if (g_drag >= 0) {
         if (released & 1) { g_drag = -1; }   /* drop */
         else {
             win_t *w = &g_win[g_drag];
@@ -386,7 +434,9 @@ static void on_mouse(int x, int y, int buttons) {
                 remove_window(idx);
                 return;
             }
-            if (y < w->y) {                  /* title bar: start drag */
+            if (x >= w->x + w->w - GRIP && y >= w->y + w->h - GRIP) {
+                g_resize = idx;              /* bottom-right grip: start resize */
+            } else if (y < w->y) {           /* title bar: start drag */
                 g_drag = idx; g_drag_dx = x - w->x; g_drag_dy = y - w->y;
             } else {                          /* content: forward */
                 send_input(w, GE_MOUSE_DOWN, x - w->x, y - w->y, buttons, 0);
@@ -494,6 +544,12 @@ int main(void) {
         for (int i = 0; i < MAXWIN; i++) {
             if (!g_win[i].used) continue;
             flush_out(&g_win[i]);                  /* drain any pending event */
+            /* deliver an owed resize once the channel is free, so the client
+               always converges on the current size even if drags dropped some */
+            if (g_win[i].rz_pending && g_win[i].olen == 0) {
+                send_input(&g_win[i], GE_RESIZE, g_win[i].w, g_win[i].h, 0, 0);
+                if (g_win[i].olen == 0) g_win[i].rz_pending = 0;   /* sent */
+            }
             if (pump_client(i) < 0) {
                 printf("[guiwm] window %u closed\n", g_win[i].wid);
                 remove_window(i);

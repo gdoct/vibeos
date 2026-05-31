@@ -72,6 +72,7 @@ enum {
     GE_KEY        = 4,
     GE_FOCUS      = 5,
     GE_UNFOCUS    = 6,
+    GE_RESIZE     = 7,      /* the WM resized the window; x=new width, y=new height */
 };
 typedef struct gevt_input {
     uint32_t ev;            /* GE_* */

@@ -198,6 +198,7 @@ USER_GUIPROBE = user/build/guiprobe.elf
 USER_GUIWM    = user/build/guiwm.elf
 USER_GMANDEL  = user/build/gmandel.elf
 USER_GCLOCK   = user/build/gclock.elf
+USER_GTERM    = user/build/gterm.elf      # graphical terminal over /bin/sh
 USER_GUIHELLO = user/build/guihello.elf   # skeleton example (docs/examples)
 GUI_GFX = gui/client/src/libgfx.c gui/client/src/font8x8_u.c gui/client/src/gui_logo_u.c
 GUI_CLI = gui/client/src/gui_client.c
@@ -265,7 +266,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK) $(USER_GUIHELLO)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK) $(USER_GTERM) $(USER_GUIHELLO)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -350,6 +351,13 @@ endif
 $(USER_GCLOCK): user/musl/gclock.c $(GUI_GFX) $(GUI_CLI) | user/build
 ifeq ($(MUSL_CC),)
 	@echo "warning: musl-gcc not found; skipping $(USER_GCLOCK)"
+else
+	$(MUSL_CC) -static -no-pie -O2 $(GUI_INC) -o $@ $< $(GUI_GFX) $(GUI_CLI)
+endif
+
+$(USER_GTERM): user/musl/gterm.c $(GUI_GFX) $(GUI_CLI) | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found; skipping $(USER_GTERM)"
 else
 	$(MUSL_CC) -static -no-pie -O2 $(GUI_INC) -o $@ $< $(GUI_GFX) $(GUI_CLI)
 endif

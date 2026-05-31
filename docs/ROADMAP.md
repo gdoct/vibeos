@@ -56,13 +56,16 @@ Detail lives in the code and git history; this file is the map, not the manual.
   **`/bin/guiwm`** server ([guiwm.c](user/musl/guiwm.c)) mmaps the framebuffer,
   reads input, and composites the desktop: wallpaper + the alpha-blended VibeOS
   logo + client windows (title-bar/border/close-box chrome, Z-order, title-bar
-  drag, focus) + a **taskbar with a launcher** (click an app button to start it) +
-  a mouse pointer tracking the USB mouse. **Clients are
-  separate processes — one per window** — that link the shared **libgfx**
-  ([gui/client/src/libgfx.c](gui/client/src/libgfx.c)) and talk to the server over
-  a small **loopback-TCP message bus** ([gui_proto.h](gui/client/include/gui_proto.h)):
-  `/bin/gmandel` renders the Mandelbrot set in its own window, `/bin/gclock` is a
-  live animated window. (The launcher spawns apps via a helper process forked
+  drag, focus, **bottom-right-grip resize**) + a **taskbar with a launcher**
+  (click an app button to start it) + a mouse pointer tracking the USB mouse.
+  **Clients are separate processes — one per window** — that link the shared
+  **libgfx** ([gui/client/src/libgfx.c](gui/client/src/libgfx.c)) and talk to the
+  server over a small **loopback-TCP message bus**
+  ([gui_proto.h](gui/client/include/gui_proto.h)): `/bin/gmandel` renders the
+  Mandelbrot set, `/bin/gclock` is a live animated window, and **`/bin/gterm` is a
+  terminal** that runs `/bin/sh` in a window. Windows are **resizable** — the WM
+  sends a `GE_RESIZE`, the client reallocates its surface and re-renders at the
+  new size. (The launcher spawns apps via a helper process forked
   before the framebuffer is mapped — the compositor never `fork`s with a device
   mapping live.) Started at boot by the service-managed init
   ([guiwm.yaml](config/services/guiwm.yaml)); `gui.mode: kernel` selects the legacy
@@ -213,11 +216,12 @@ What remains:
 - **Graphical stack — phase 2 shipped.** The client/server split is done: rendering
   and input moved to userspace over mmap'd `/dev/fb0` + `/dev/input`, a `guiwm`
   **server** composites, **clients are one process per window** over a loopback-TCP
-  message bus, a Mandelbrot demo client renders in its own window, and a **taskbar
-  launcher** starts apps with a click (see "What works today"). What's left to
-  *mature* it: more widgets (menus/scrollbars/list boxes — clients currently push
-  raw pixel surfaces), window **resize**, and shared-memory window buffers (frames
-  stream over TCP for now — fine for a demo, a copy per frame at scale). A future
+  message bus, demo clients (a Mandelbrot fractal, a clock, a **terminal** running
+  `/bin/sh`) render in their own **resizable** windows, and a **taskbar launcher**
+  starts apps with a click (see "What works today"). What's left to *mature* it:
+  more widgets (menus/scrollbars/list boxes — clients currently push raw pixel
+  surfaces), and shared-memory window buffers (frames stream over TCP for now —
+  fine for a demo, a copy per frame at scale). A future
   cleanup: collapse `gui/core`'s libdraw and `gui/client`'s libgfx into one source
   built for both kernel and userspace.
 - **USB follow-on for GUI.** Optional xHCI/EHCI + USB hub support (UHCI already
