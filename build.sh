@@ -87,6 +87,8 @@ fi
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/gmandel.elf /bin/gmandel
 [ -f user/build/gclock.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/gclock.elf /bin/gclock
+[ -f user/build/guihello.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/guihello.elf /bin/guihello
 [ -f user/build/guiprobe.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/guiprobe.elf /bin/guiprobe
 

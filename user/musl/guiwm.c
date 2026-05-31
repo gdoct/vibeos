@@ -88,8 +88,9 @@ static int        g_drag = -1, g_drag_dx, g_drag_dy;
    fork/exec on our behalf. The server just writes the binary path down a pipe. */
 typedef struct { const char *label; const char *path; } app_t;
 static const app_t g_apps[] = {
-    { "MANDELBROT", "/bin/gmandel" },
-    { "CLOCK",      "/bin/gclock"  },
+    { "MANDELBROT", "/bin/gmandel"  },
+    { "CLOCK",      "/bin/gclock"   },
+    { "HELLO",      "/bin/guihello" },
 };
 #define N_APPS ((int)(sizeof g_apps / sizeof g_apps[0]))
 static int g_app_x[N_APPS], g_app_w[N_APPS];   /* taskbar hit rects */
