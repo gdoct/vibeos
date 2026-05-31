@@ -22,11 +22,14 @@
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 #include "libgfx.h"
 #include "gui_proto.h"
+
+extern char **environ;
 
 extern const uint32_t vibeos_logo[];
 extern const int vibeos_logo_w, vibeos_logo_h;
@@ -77,6 +80,58 @@ static int        g_dirty = 1;           /* scene needs a recompose */
 
 /* drag state */
 static int        g_drag = -1, g_drag_dx, g_drag_dy;
+
+/* ---- launcher ---- */
+/* Apps the taskbar can start. The server must NOT fork() itself once it has
+   mmap'd the framebuffer (forking a device mapping would corrupt the PMM), so a
+   tiny helper process — forked BEFORE the framebuffer is mapped — does the
+   fork/exec on our behalf. The server just writes the binary path down a pipe. */
+typedef struct { const char *label; const char *path; } app_t;
+static const app_t g_apps[] = {
+    { "MANDELBROT", "/bin/gmandel" },
+    { "CLOCK",      "/bin/gclock"  },
+};
+#define N_APPS ((int)(sizeof g_apps / sizeof g_apps[0]))
+static int g_app_x[N_APPS], g_app_w[N_APPS];   /* taskbar hit rects */
+static int g_taskbar_winx;                      /* where the window list starts */
+static int g_launch_fd = -1;                    /* write end of the helper pipe */
+
+#define C_LAUNCH    GFX_RGB(0x2c,0x6e,0x4a)     /* launcher button (green) */
+#define C_LAUNCH_FG GFX_RGB(0xe0,0xff,0xe8)
+
+/* The helper loop: never maps the framebuffer, so its fork/exec is clean. Reads
+   newline-terminated binary paths from `rfd` and spawns each. */
+static void run_launcher_helper(int rfd) {
+    char buf[128]; int len = 0;
+    for (;;) {
+        char c; int r = read(rfd, &c, 1);
+        if (r <= 0) { if (r == 0) _exit(0); else continue; }
+        if (c == '\n') {
+            buf[len] = 0;
+            if (len > 0) {
+                pid_t pid = fork();
+                if (pid == 0) {
+                    close(rfd);
+                    char *av[] = { buf, 0 };
+                    execve(buf, av, environ);
+                    _exit(127);
+                }
+                while (waitpid(-1, 0, WNOHANG) > 0) { }   /* reap finished apps */
+            }
+            len = 0;
+        } else if (len < (int)sizeof buf - 1) {
+            buf[len++] = c;
+        }
+    }
+}
+
+static void launch(const char *path) {
+    if (g_launch_fd < 0) return;
+    char line[128]; int n = 0;
+    for (const char *p = path; *p && n < (int)sizeof line - 2; p++) line[n++] = *p;
+    line[n++] = '\n';
+    (void)!write(g_launch_fd, line, n);
+}
 
 /* ---- cursor sprite (11x17), '#'=black '.'=white ' '=transparent ---- */
 #define CUR_W 11
@@ -177,14 +232,27 @@ static void compose(void) {
     for (int i = 0; i < g_nz; i++)
         draw_window(&g_win[g_z[i]], g_z[i] == g_focus);
     /* taskbar */
-    gfx_fill_rect(&g_back, 0, g_back.h - TASKBAR_H, g_back.w, TASKBAR_H, C_TASKBAR);
+    int ty = g_back.h - TASKBAR_H;
+    gfx_fill_rect(&g_back, 0, ty, g_back.w, TASKBAR_H, C_TASKBAR);
     int tx = 8;
+    /* launcher buttons (start apps) */
+    for (int i = 0; i < N_APPS; i++) {
+        int bw = gfx_text_w(g_apps[i].label) + 16;
+        gfx_fill_rect(&g_back, tx, ty + 3, bw, TASKBAR_H - 6, C_LAUNCH);
+        gfx_rect(&g_back, tx, ty + 3, bw, TASKBAR_H - 6, C_LAUNCH_FG);
+        gfx_text(&g_back, tx + 8, ty + 8, g_apps[i].label, C_LAUNCH_FG);
+        g_app_x[i] = tx; g_app_w[i] = bw;
+        tx += bw + 6;
+    }
+    /* separator, then the open-window list */
+    tx += 6; gfx_vline(&g_back, tx - 8, ty + 3, TASKBAR_H - 6, GFX_RGB(0x40,0x50,0x60));
+    g_taskbar_winx = tx;
     for (int i = 0; i < g_nz; i++) {
         win_t *w = &g_win[g_z[i]];
         int bw = gfx_text_w(w->title) + 16;
-        gfx_fill_rect(&g_back, tx, g_back.h - TASKBAR_H + 3, bw, TASKBAR_H - 6,
+        gfx_fill_rect(&g_back, tx, ty + 3, bw, TASKBAR_H - 6,
                       g_z[i] == g_focus ? C_TITLE : C_TITLE_BLUR);
-        gfx_text(&g_back, tx + 8, g_back.h - TASKBAR_H + 8, w->title, C_TASK_FG);
+        gfx_text(&g_back, tx + 8, ty + 8, w->title, C_TASK_FG);
         tx += bw + 8;
     }
 }
@@ -296,6 +364,16 @@ static void on_mouse(int x, int y, int buttons) {
             g_dirty = 1;
         }
     } else if (pressed & 1) {
+        /* taskbar launcher: a click on an app button starts it */
+        int ty = g_screen.h - TASKBAR_H;
+        if (y >= ty) {
+            for (int i = 0; i < N_APPS; i++)
+                if (x >= g_app_x[i] && x < g_app_x[i] + g_app_w[i]) {
+                    printf("[guiwm] launch %s\n", g_apps[i].path);
+                    launch(g_apps[i].path);
+                    return;
+                }
+        }
         int idx = win_at(x, y);
         if (idx >= 0) {
             raise_win(idx); g_dirty = 1;
@@ -340,6 +418,15 @@ static void on_key(int code) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("[guiwm] starting userspace window manager\n");
+
+    /* Spawn the launcher helper BEFORE we map the framebuffer — it forks/execs
+       apps so the compositor never has to fork() with a device mapping live. */
+    int lp[2];
+    if (pipe(lp) == 0) {
+        pid_t pid = fork();
+        if (pid == 0) { close(lp[1]); run_launcher_helper(lp[0]); _exit(0); }
+        close(lp[0]); g_launch_fd = lp[1];
+    }
 
     int fb = open("/dev/fb0", O_RDWR);
     if (fb < 0) { printf("[guiwm] cannot open /dev/fb0\n"); return 1; }

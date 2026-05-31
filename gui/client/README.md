@@ -32,7 +32,8 @@ window management, widgets, apps — is ordinary musl programs.
 
 - **guiwm** — the window-manager **server**: mmaps `/dev/fb0`, grabs `/dev/input`,
   listens on `127.0.0.1:7000`, and composites the desktop (wallpaper + logo +
-  client windows with title-bar/border/close-box chrome + a taskbar) with a mouse
+  client windows with title-bar/border/close-box chrome + a taskbar whose
+  launcher buttons start apps on click) with a mouse
   pointer that tracks the USB mouse. Title bars drag; the focused window gets the
   keyboard. Started at boot by the service-managed init
   ([config/services/guiwm.yaml](../../config/services/guiwm.yaml)).
@@ -45,7 +46,9 @@ window management, widgets, apps — is ordinary musl programs.
 
 ## Running
 
-`guiwm` autostarts at boot. From the serial shell, launch a client:
+`guiwm` autostarts at boot. **Click a launcher button in the taskbar** (bottom of
+the screen) to start an app — `MANDELBROT` or `CLOCK`. Or launch one from the
+serial shell:
 
 ```
 vibe$ gmandel        # a Mandelbrot window appears on the desktop
