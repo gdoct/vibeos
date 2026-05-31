@@ -26,16 +26,6 @@ The boot phase does only the minimum required to start the kernel:
 - pull together the boot info the kernel needs (framebuffer, memory map, ACPI RSDP)
 - call `ExitBootServices` and jump to the kernel entry point
 
-## What Boot Does Not Do
-
-- launch user programs
-- start services or sessions
-- run the shell or any UI
-- set up paging beyond what UEFI already provides (identity-mapped low memory)
-- set up its own IDT/GDT (the kernel will replace them)
-
-Those responsibilities belong to later kernel and userspace stages.
-
 ## Kernel Handoff Contract
 
 Before jumping to the kernel, the bootloader guarantees:
@@ -67,42 +57,6 @@ The `BootInfo` struct is versioned with a magic value and `version` field so ker
     ├── mmap.c         (memory map + ExitBootServices)
     └── util.c         (print, memset, memcpy, panic)
 ```
-
-## Implementation Plan
-
-### Phase 1 — Skeleton UEFI application
-
-Stand up the build and a do-nothing `efi_main` that prints "VibeOS boot" and waits for a key. This proves the toolchain (`clang -target x86_64-unknown-windows` + `lld-link /subsystem:efi_application`), the ESP layout, and the QEMU+OVMF run loop.
-
-### Phase 2 — Read the kernel from the ESP
-
-Use `EFI_LOADED_IMAGE_PROTOCOL` → `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` to open `\vibeos\kernel.elf`. Read it into a transient `AllocatePool` buffer. Confirm the file is reachable and the size is sane.
-
-### Phase 3 — Parse and load the ELF
-
-Validate `e_ident` (magic, ELFCLASS64, ELFDATA2LSB, EM_X86_64, ET_EXEC). Walk the program headers; for each `PT_LOAD` segment, `AllocatePages(AllocateAddress, …)` at `p_paddr`, copy `p_filesz` bytes from the file image, and zero the BSS tail (`p_memsz - p_filesz`). Record the lowest/highest physical pages used so we can hand the range to the kernel.
-
-### Phase 4 — Boot info: framebuffer + ACPI + memory map
-
-- **GOP**: `LocateProtocol(EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, …)`, prefer a 32-bit BGR/RGB linear mode at the highest available resolution within reason, record base+pitch+width+height+format.
-- **RSDP**: scan the EFI configuration table for `ACPI_20_TABLE_GUID` (fall back to `ACPI_TABLE_GUID`).
-- **Memory map**: `GetMemoryMap` twice — once to size the buffer, once for real — write the descriptors into a page allocation that survives `ExitBootServices`.
-
-### Phase 5 — ExitBootServices and jump
-
-Call `ExitBootServices(ImageHandle, MapKey)`. If it fails with `EFI_INVALID_PARAMETER`, refresh the memory map once and retry (UEFI spec mandates this dance). After success, disable interrupts, switch to the bootloader-allocated stack, and `call` the ELF entry point with `rdi = &BootInfo`.
-
-### Phase 6 — Reliability
-
-Once the happy path works, add:
-
-- error reporting through `ConOut` with file:line context before any `return EFI_*`
-- a serial log fallback (`0x3F8` 16550 UART) for headless debugging — useful even before `ExitBootServices`
-- sanity checks on the ELF: entry inside a loaded segment, no segments overlapping bootloader memory, BootInfo magic verified
-
-### Phase 7 — Done
-
-At this point the bootloader is "frozen": further startup work moves into the kernel. The only future changes to the bootloader should be additions to the `BootInfo` struct (with a `version` bump) when the kernel needs new firmware-time information.
 
 ## Building and Running
 

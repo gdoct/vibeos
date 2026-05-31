@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for working in this repo. **[ROADMAP.md](ROADMAP.md) is the source of
+Guidance for working in this repo. **[ROADMAP.md](docs/ROADMAP.md) is the source of
 truth** for what works, what's next (ordered), and the design choices worth
 remembering — read it first. This file covers only how to build/run and the
 conventions to respect when changing code.
@@ -29,7 +29,7 @@ make clean        # NB: does not cover user/build — build.sh removes it explic
 - Artifacts: `boot/build/vibeos.img` (FAT ESP), `boot/build/vdisk.img`
   (virtio-blk VibeFS volume).
 - *Known issue:* unclean-`fsck` can drop `/bin/init` on diskutil volumes —
-  workaround is a clean image per build (`./build.sh`). See ROADMAP.
+  workaround is a clean image per build (`./build.sh`). See [ROADMAP.md](docs/ROADMAP.md).
 
 ## Layout
 

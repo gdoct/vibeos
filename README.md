@@ -58,7 +58,7 @@ project state. The major pieces that are available today are:
 	(`sigtest`, `cputest`, `nettest`, `wget`, `dynhello`, …).
 - [interop/tools/diskutil/](interop/tools/diskutil/) - host-side .NET
 	tooling for creating and populating VibeFS volumes.
-- [ROADMAP.md](ROADMAP.md) - feature status and planned follow-ups.
+- [ROADMAP.md](docs/ROADMAP.md) - feature status and planned follow-ups.
 
 ## Boot Flow
 

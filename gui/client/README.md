@@ -1,4 +1,4 @@
-# gui/client — userspace GUI (phase 2)
+# gui/client — userspace GUI
 
 The windowing system, moved out of the kernel into userspace. The kernel now only
 exposes the framebuffer and input as devices; everything else — compositing,
