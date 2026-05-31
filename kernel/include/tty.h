@@ -22,6 +22,11 @@ extern "C" {
 void tty_poll(void);
 int  tty_read(char *buf, uint32_t n);
 
+/* Inject a character into the console input stream (e.g. from a USB keyboard).
+   Safe to call from any CPU; the BSP's tty_poll drains it through the line
+   discipline. */
+void tty_input(char c);
+
 #ifdef __cplusplus
 }
 #endif

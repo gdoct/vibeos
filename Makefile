@@ -125,6 +125,7 @@ KERNEL_C_SRCS = \
 	kernel/src/drivers/pci.c \
 	kernel/src/drivers/virtio_blk.c \
 	kernel/src/drivers/virtio_rng.c \
+	kernel/src/drivers/usb_uhci.c \
 	kernel/src/drivers/timer.c
 KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S kernel/src/usermode.S kernel/src/ap_boot.S
 
@@ -406,6 +407,9 @@ run: $(IMG) $(VDISK)
 	  -device virtio-blk-pci,drive=vd0 \
 	  -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 	  -device virtio-rng-pci \
+	  -device piix3-usb-uhci,id=uhci \
+	  -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 \
+	  -monitor unix:/tmp/vibeos-mon.sock,server,nowait \
 	  -serial stdio
 
 clean:

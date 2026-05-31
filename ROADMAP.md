@@ -48,6 +48,15 @@ Detail lives in the code and git history; this file is the map, not the manual.
   framebuffer; serial TTY backing `read(0)`. **VibeFS** ([fs.c](kernel/src/fs.c)) —
   writable, crash-safe ordered writes + `fsck`, 4 KiB blocks, triple-indirect +
   64-bit size.
+- **USB input** (ROADMAP) — a **UHCI** host-controller driver
+  ([usb_uhci.c](kernel/src/drivers/usb_uhci.c)): frame-list schedule of queue
+  heads + transfer descriptors in DMA memory, device enumeration over endpoint 0
+  (control transfers: `GET_DESCRIPTOR` / `SET_ADDRESS` / `SET_CONFIGURATION` /
+  HID `SET_PROTOCOL`(boot)/`SET_IDLE`), and per-frame polling of the HID
+  interrupt-IN endpoints (no IRQ). A **USB keyboard** feeds the console
+  (`tty_input`, US keymap with shift) and a **USB mouse** accumulates a pointer +
+  button state (exported via `usb_mouse_get` for a future GUI). Both are
+  enumerated and driven over `piix3-usb-uhci` in QEMU.
 - **Networking** — virtio-net driver ([virtio_net.c](kernel/src/drivers/virtio_net.c))
   sharing PCI INTx with virtio-blk; a compact IPv4 stack ([net.c](kernel/src/net.c)):
   ARP, IPv4, ICMP (`ping`), UDP, and a **WAN-grade TCP** — 3-way handshake, a
@@ -156,8 +165,11 @@ What remains:
   per-service file logging, and a `sysconf services` view) are shipped. What's
   left of this theme is socket-/timer-activated services and shell I/O redirection
   (`>`/`<`/`2>` — the kernel now supports it; the shell doesn't parse it yet).
-- **Graphical stack.** A simple windowing system over the framebuffer (`/gui`);
-  USB (EHCI/xHCI) + keyboard/mouse input to drive it.
+- **Graphical stack.** USB **keyboard + mouse input are done** (UHCI HID, see
+  "What works today"); what remains here is the GUI itself — a 2D draw library
+  and a simple windowing system over the framebuffer (`/gui`), consuming
+  `usb_mouse_get` + the keyboard. (A modern xHCI/EHCI controller and USB hub
+  support are optional follow-ons; UHCI already drives the HID devices.)
 - **Audio.** An audio subsystem + virtio-sound.
 
 *Known issue:* unclean-`fsck` drops `/bin/init` on diskutil volumes (workaround =
@@ -173,7 +185,8 @@ UEFI/OVMF → BOOTX64.EFI → kernel.elf → start.S (bootstrap tables, jump hig
   → gdt/idt/percpu(TSS+GS)/syscall → pmm → paging (drop identity) → page refcounts
   → csprng → apic+timer → virtio-blk → virtio-rng (seed CSPRNG) → fs_mount
   → config (/config/system.conf) → irq_enable → sched_init → net_init
-  (virtio-net + worker + tcp timer) → create init+workers → smp_init (APs join:
+  (virtio-net + worker + tcp timer) → usb_init (UHCI + HID worker)
+  → create init+workers → smp_init (APs join:
   percpu+SYSCALL+SSE) → scheduler() [every CPU]
   → /bin/init (service manager) → /config/services/* → /bin/sh
 ```

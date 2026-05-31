@@ -22,6 +22,7 @@
 extern "C" block_device_t *ramdisk_init(uint64_t num_blocks);
 extern "C" block_device_t *virtio_blk_init(void);
 extern "C" int virtio_rng_seed(void);
+extern "C" void usb_init(void);
 
 /* Load /bin/init from the mounted root filesystem and drop to ring 3. Runs as
    a task, so it owns a kernel stack for syscalls/IRQs; on exit() it dies and
@@ -278,6 +279,7 @@ extern "C" void kmain(BootInfo *bi) {
        initial tasks exist first so the APs have work the moment they're up. */
     sched_init();
     net_init();           /* probe virtio-net + start the net worker (ROADMAP §5) */
+    usb_init();           /* probe UHCI + start the USB HID worker (keyboard/mouse) */
     create_initial_tasks();
     smp_init();
     smp_ipi_selftest();   /* verify the cross-CPU IPI path (ROADMAP §2) */

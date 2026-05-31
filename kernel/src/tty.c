@@ -77,9 +77,28 @@ static void input_char(char c) {
     }
 }
 
+/* Characters injected by another source (the USB keyboard driver, ROADMAP).
+   tty_input() runs in the USB worker (possibly an AP); tty_poll() drains it on
+   the BSP so the line-discipline state (g_line) stays single-CPU. SPSC ring. */
+#define INJ_N 64
+static char              g_inject[INJ_N];
+static volatile uint32_t g_inj_head, g_inj_tail;
+
+void tty_input(char c) {
+    uint32_t next = (g_inj_head + 1) % INJ_N;
+    if (next == g_inj_tail) return;          /* full: drop */
+    g_inject[g_inj_head] = c;
+    __asm__ volatile("" ::: "memory");
+    g_inj_head = next;
+}
+
 void tty_poll(void) {
     while (serial_rx_ready())
         input_char(serial_getc());
+    while (g_inj_tail != g_inj_head) {        /* drain injected (USB) keystrokes */
+        input_char(g_inject[g_inj_tail]);
+        g_inj_tail = (g_inj_tail + 1) % INJ_N;
+    }
 }
 
 int tty_read(char *buf, uint32_t n) {
