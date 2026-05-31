@@ -165,9 +165,23 @@ USER_MDYN   = user/build/dynhello.elf
 USER_MNET   = user/build/nettest.elf
 USER_MWGET  = user/build/wget.elf
 USER_MPKG   = user/build/pkg.elf
+USER_VHELLO = user/build/vibehello.elf
 
-.PHONY: all clean run image kernel user
+# VibeOS cross toolchain (ROADMAP §"Toolchain integration").
+VIBEOS_CC     = ./toolchain/x86_64-vibeos-musl-gcc
+SYSROOT_SPECS = toolchain/vibeos.specs
+
+.PHONY: all clean run image kernel user sysroot
 all: $(EFI) $(KERNEL_ELF) user
+
+# Build (or rebuild) the x86_64-vibeos-musl sysroot + specs from host musl.
+sysroot: $(SYSROOT_SPECS)
+$(SYSROOT_SPECS): toolchain/mksysroot.sh
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-tools not found; skipping VibeOS sysroot"
+else
+	./toolchain/mksysroot.sh
+endif
 
 # --- Bootloader rules ---
 
@@ -207,7 +221,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -280,6 +294,14 @@ ifeq ($(MUSL_CC),)
 	@echo "warning: musl-gcc not found; skipping $(USER_MPKG)"
 else
 	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
+endif
+
+# Built with the VibeOS *cross* compiler against the sysroot, not host musl-gcc.
+$(USER_VHELLO): user/musl/vibehello.c $(SYSROOT_SPECS) | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-tools not found; skipping $(USER_VHELLO)"
+else
+	$(VIBEOS_CC) -static -no-pie -O2 -o $@ $<
 endif
 
 user/build:

@@ -87,7 +87,10 @@ Detail lives in the code and git history; this file is the map, not the manual.
   variety.
 - **Shell + tooling** — `/bin/init` → `/bin/sh` over serial; host `disktool-cli`
   ([interop/tools/diskutil](interop/tools/diskutil/)) builds/populates VibeFS
-  images; `./build.sh` + `make run` (`-smp 4`, virtio-blk + virtio-net).
+  images; `./build.sh` + `make run` (`-smp 4`, virtio-blk + virtio-net). A
+  **cross toolchain** ([toolchain/](toolchain/)): `x86_64-vibeos-musl-gcc` + a
+  generated VibeOS sysroot compiles binaries for the target directly
+  (`make sysroot`; `/bin/vibehello` is built with it).
 
 **ABI simplifications still open:** dirs open read-only; no hard links / rename;
 no file permissions (mode bits are cosmetic); `fchdir` unsupported (no
@@ -109,14 +112,14 @@ serial-verified, as are **(6) WAN-grade TCP** (send buffer, RTO/RTT, congestion
 control, reassembly, delayed/dup ACKs, TIME-WAIT), **(7) a ChaCha20 CSPRNG**
 (RDRAND + jitter + virtio-rng entropy, RFC 6528 TCP ISNs, `AT_RANDOM`), and
 **(8) per-CPU run queues with work-stealing** (home-CPU affinity; kernel tasks
-stolen across cores, user tasks BSP-pinned), and **(9) userspace quality-of-life**
+stolen across cores, user tasks BSP-pinned), **(9) userspace quality-of-life**
 (`chdir`/cwd, `FD_CLOEXEC`, symlinks, `/dev` + `/proc`, a respawning init, and a
-tar package tool). See "What works today". What remains, ordered:
+tar package tool), and **(10) a cross toolchain** — `x86_64-vibeos-musl-gcc` +
+a VibeOS sysroot ([toolchain/](toolchain/)) that builds binaries for VibeOS
+directly (its loader, `__vibeos__`, `<vibeos.h>`); `make sysroot` assembles it
+and `/bin/vibehello` is built with it. See "What works today". What remains:
 
-**1. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
-`gcc`/`clang` build for VibeOS directly instead of repurposing host musl.
-
-**Also widening the ABI toward busybox/binutils** as opportunity allows (more
+**Widening the ABI toward busybox/binutils** as opportunity allows (more
 `stat`/`fcntl` variants, `clock_gettime`, `getrandom`, `uname`, `getsockname`/
 `setsockopt` beyond stubs); PIE load base is fixed (no ASLR yet).
 
