@@ -221,13 +221,99 @@ static int64_t sys_fork(syscall_frame_t *f) {
     return child->id;                            /* parent gets child's pid */
 }
 
+/* clone(2) flag bits we recognize (musl's pthread_create set, ROADMAP). */
+#define CLONE_VM             0x00000100
+#define CLONE_FILES          0x00000400
+#define CLONE_THREAD         0x00010000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
+
+/* clone(flags, stack, ptid, ctid, tls) — enough for musl pthreads: a CLONE_VM
+   thread sharing the address space + fd table + thread group, with its own
+   stack + TLS, plus the parent/child TID and CHILD_CLEARTID plumbing
+   pthread_join relies on. Without CLONE_VM it degrades to a fork. */
+static int64_t sys_clone(syscall_frame_t *f) {
+    task_t *parent = task_current();
+    if (!parent->vm) return -38;
+    uint64_t flags = f->rdi, ustack = f->rsi;
+    uint64_t ptid = f->rdx, ctid = f->r10, tls = f->r8;
+
+    vmspace_t *vm;
+    if (flags & CLONE_VM) { vm = parent->vm; vmspace_ref(vm); }   /* shared AS */
+    else { vm = vmspace_fork(parent->vm); if (!vm) return -12; }  /* fork-like */
+
+    int is_thread = (flags & CLONE_THREAD) != 0;
+    task_t *c = task_clone(is_thread ? "thread" : "user", vm, f, ustack,
+                           (flags & CLONE_SETTLS) ? tls : 0,
+                           (flags & CLONE_FILES) != 0, is_thread);
+    if (!c) { vmspace_destroy(vm); return -11; }
+
+    if (flags & CLONE_PARENT_SETTID)
+        copy_to_user(cur_vm(), ptid, &c->id, sizeof(int));
+    if (flags & CLONE_CHILD_SETTID)             /* shared AS -> visible to child */
+        copy_to_user(cur_vm(), ctid, &c->id, sizeof(int));
+    if (flags & CLONE_CHILD_CLEARTID)
+        c->clear_child_tid = ctid;              /* cleared + futex-woken at exit */
+    return c->id;
+}
+
+/* A futex word's key: the process's PML4 phys (shared by its threads) mixed with
+   the user address. Threads in one process collide on the same word; distinct
+   processes don't (a collision would only cause a harmless spurious wake). */
+static uint64_t futex_key(uint64_t uaddr) {
+    return cur_vm()->pml4_phys ^ uaddr;
+}
+
+/* futex(uaddr, op, val, timeout, uaddr2, val3) — FUTEX_WAIT / FUTEX_WAKE (and
+   their _BITSET aliases). Private/realtime flag bits are ignored. */
+static int64_t sys_futex(uint64_t uaddr, int op, int val) {
+    enum { FUTEX_WAIT=0, FUTEX_WAKE=1, FUTEX_WAIT_BITSET=9, FUTEX_WAKE_BITSET=10 };
+    int cmd = op & 0x7f;                        /* drop FUTEX_PRIVATE/CLOCK bits */
+    if (!paging_user_ok(cur_vm(), uaddr, sizeof(int), 0)) return -EFAULT_;
+    uint64_t key = futex_key(uaddr);
+
+    if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
+        sched_lock();
+        int cur = 0;
+        if (copy_from_user(&cur, cur_vm(), uaddr, sizeof cur) < 0) { sched_unlock(); return -EFAULT_; }
+        if (cur != val) { sched_unlock(); return -11; }   /* -EAGAIN: value changed */
+        futex_sleep_on(key);                    /* sleeps under the lock; rechecks in musl */
+        sched_unlock();
+        return 0;
+    }
+    if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
+        sched_lock();
+        int woke = futex_wake_key(key, val);
+        sched_unlock();
+        return woke;
+    }
+    return -38;                                  /* -ENOSYS for other ops */
+}
+
+/* Thread exit (CLONE_CHILD_CLEARTID): zero the tid word and futex-wake any
+   joiner, then release this thread's resources (no zombie). */
+__attribute__((noreturn))
+static void sys_exit_thread(void) {
+    task_t *t = task_current();
+    if (t->clear_child_tid) {
+        int zero = 0;
+        copy_to_user(cur_vm(), t->clear_child_tid, &zero, sizeof zero);
+        uint64_t key = futex_key(t->clear_child_tid);
+        sched_lock(); futex_wake_key(key, 1); sched_unlock();
+    }
+    task_exit_thread();
+    __builtin_unreachable();
+}
+
 /* ---- per-process fd helpers ---- */
 
 /* Resolve a user fd to its open-file object, or NULL if it is out of range,
    closed, or one of the implicit console fds (0/1/2). */
 static file_t *fd_get(int fd) {
     if (fd < 0 || fd >= VFS_MAX_FD) return nullptr;
-    return task_current()->fdt[fd];
+    return task_current()->files->fd[fd];
 }
 
 /* Install `f` at the lowest free descriptor >= 3 (0/1/2 are the console).
@@ -235,7 +321,7 @@ static file_t *fd_get(int fd) {
 static int fd_install(file_t *f) {
     task_t *t = task_current();
     for (int i = 3; i < VFS_MAX_FD; i++)
-        if (!t->fdt[i]) { t->fdt[i] = f; t->fd_cloexec[i] = 0; return i; }
+        if (!t->files->fd[i]) { t->files->fd[i] = f; t->files->cloexec[i] = 0; return i; }
     return -EMFILE_;
 }
 
@@ -371,13 +457,13 @@ static int64_t sys_execve(const char *upath, char *const uargv[], char *const ue
     kfree(a);
     /* Close descriptors marked FD_CLOEXEC (ROADMAP §4). */
     for (int i = 3; i < VFS_MAX_FD; i++) {
-        if (t->fd_cloexec[i] && t->fdt[i]) {
-            file_t *cf = t->fdt[i];
+        if (t->files->cloexec[i] && t->files->fd[i]) {
+            file_t *cf = t->files->fd[i];
             if (cf->kind == FD_SOCKET && cf->refcount == 1) ksock_close(cf->sock);
-            t->fdt[i] = nullptr;
+            t->files->fd[i] = nullptr;
             file_unref(cf);
         }
-        t->fd_cloexec[i] = 0;
+        t->files->cloexec[i] = 0;
     }
     signals_exec(t);                            /* reset caught handlers to default */
     t->fs_base = 0;                             /* fresh image: TLS reset until arch_prctl */
@@ -487,7 +573,17 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot) {
     task_t *t = task_current();
     for (uint64_t va = addr; va < addr + len; va += PAGE_SIZE) {
         uint64_t pa;
-        if (!vmspace_query(t->vm, va, &pa)) continue;
+        if (!vmspace_query(t->vm, va, &pa)) {
+            /* Unmapped: musl reserves regions with mmap(PROT_NONE) then mprotect()s
+               the usable part RW (e.g. thread stacks). Lazily back it with a fresh
+               zero page when it becomes accessible; leave PROT_NONE reserved. */
+            if (prot == 0) continue;
+            pa = pmm_alloc_page();
+            if (!pa) return -ENOMEM_;
+            uint64_t fl = PTE_P | PTE_U | ((prot & PROT_WRITE) ? PTE_W : 0);
+            vmspace_map(t->vm, va, pa, 1, fl);
+            continue;
+        }
         if (prot & PROT_WRITE) {
             paging_cow_fault(t->vm, va);            /* privatise if COW-shared */
             if (!vmspace_query(t->vm, va, &pa)) continue;  /* pa may have moved */
@@ -585,7 +681,7 @@ static int64_t sys_openat(int dirfd, const char *upath, int flags, int mode) {
         sf->flags = flags;
         int sfd = fd_install(sf);
         if (sfd < 0) { file_unref(sf); return sfd; }
-        if (flags & O_CLOEXEC) task_current()->fd_cloexec[sfd] = 1;
+        if (flags & O_CLOEXEC) task_current()->files->cloexec[sfd] = 1;
         return sfd;
     }
 
@@ -623,7 +719,7 @@ static int64_t sys_openat(int dirfd, const char *upath, int flags, int mode) {
     f->kind = kind; f->ino = (uint32_t)ino; f->off = 0; f->flags = flags;
     int fd = fd_install(f);
     if (fd < 0) { file_unref(f); return fd; }
-    if (flags & O_CLOEXEC) task_current()->fd_cloexec[fd] = 1;
+    if (flags & O_CLOEXEC) task_current()->files->cloexec[fd] = 1;
     return fd;
 }
 
@@ -632,8 +728,8 @@ static int64_t sys_close(int fd) {
     file_t *f = fd_get(fd);
     if (!f) return -EBADF_;
     if (f->kind == FD_SOCKET && f->refcount == 1) ksock_close(f->sock);  /* last ref */
-    task_current()->fdt[fd] = nullptr;
-    task_current()->fd_cloexec[fd] = 0;
+    task_current()->files->fd[fd] = nullptr;
+    task_current()->files->cloexec[fd] = 0;
     file_unref(f);
     return 0;
 }
@@ -938,7 +1034,7 @@ static int64_t sys_pipe2(int *ufds, int flags) {
     if (rfd < 0) { file_unref(rf); file_unref(wf); return rfd; }
     int wfd = fd_install(wf);
     if (wfd < 0) {
-        task_current()->fdt[rfd] = nullptr; file_unref(rf);
+        task_current()->files->fd[rfd] = nullptr; file_unref(rf);
         file_unref(wf);
         return wfd;
     }
@@ -968,10 +1064,10 @@ static int64_t sys_dup2(int oldfd, int newfd) {
     if (newfd < 0 || newfd >= VFS_MAX_FD || newfd <= 2) return -EBADF_;
     if (oldfd == newfd) return newfd;
     task_t *t = task_current();
-    if (t->fdt[newfd]) file_unref(t->fdt[newfd]);
+    if (t->files->fd[newfd]) file_unref(t->files->fd[newfd]);
     file_ref(f);
-    t->fdt[newfd] = f;
-    t->fd_cloexec[newfd] = 0;                     /* dup2 clears CLOEXEC (POSIX) */
+    t->files->fd[newfd] = f;
+    t->files->cloexec[newfd] = 0;                     /* dup2 clears CLOEXEC (POSIX) */
     return newfd;
 }
 
@@ -989,12 +1085,12 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
     case F_DUPFD: return sys_dup(fd);
     case F_DUPFD_CLOEXEC: {
         int64_t nfd = sys_dup(fd);
-        if (nfd >= 0) t->fd_cloexec[nfd] = 1;
+        if (nfd >= 0) t->files->cloexec[nfd] = 1;
         return nfd;
     }
-    case F_GETFD: return (fd >= 0 && fd < VFS_MAX_FD && t->fd_cloexec[fd]) ? FD_CLOEXEC_BIT : 0;
+    case F_GETFD: return (fd >= 0 && fd < VFS_MAX_FD && t->files->cloexec[fd]) ? FD_CLOEXEC_BIT : 0;
     case F_SETFD:
-        if (fd >= 0 && fd < VFS_MAX_FD) t->fd_cloexec[fd] = (arg & FD_CLOEXEC_BIT) ? 1 : 0;
+        if (fd >= 0 && fd < VFS_MAX_FD) t->files->cloexec[fd] = (arg & FD_CLOEXEC_BIT) ? 1 : 0;
         return 0;
     case F_GETFL: return f ? f->flags : O_RDWR;
     case F_SETFL: if (f) f->flags = (int)arg; return 0;
@@ -1227,7 +1323,9 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 28:  return 0;                                        /* madvise (stub) */
     case 32:  return (uint64_t)sys_dup((int)f->rdi);           /* dup */
     case 33:  return (uint64_t)sys_dup2((int)f->rdi, (int)f->rsi);  /* dup2 */
-    case 39:  return (uint64_t)task_current()->id;             /* getpid */
+    case 39:  return (uint64_t)task_tgid(task_current());      /* getpid (== tgid) */
+    case 56:  return (uint64_t)sys_clone(f);                   /* clone */
+    case 202: return (uint64_t)sys_futex(f->rdi, (int)f->rsi, (int)f->rdx);  /* futex */
     case 7:   return (uint64_t)sys_poll(f->rdi, (uint32_t)f->rsi, (int)f->rdx);  /* poll */
     case 41:  return (uint64_t)sys_socket((int)f->rdi, (int)f->rsi, (int)f->rdx); /* socket */
     case 42:  return (uint64_t)sys_connect((int)f->rdi, f->rsi, (uint32_t)f->rdx); /* connect */
@@ -1262,6 +1360,8 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 332: return (uint64_t)sys_statx((int)f->rdi, (const char *)f->rsi, (int)f->rdx,
                                          (unsigned)f->r10, f->r8);              /* statx */
     case 280: return 0;                                        /* utimensat (no mtime store) */
+    case 273: return 0;                                        /* set_robust_list (accept) */
+    case 324: return 0;                                        /* membarrier (BSP-pinned: a no-op) */
     case 88:  return (uint64_t)sys_symlink((const char *)f->rdi, (const char *)f->rsi); /* symlink */
     case 89:  return (uint64_t)sys_readlink((const char *)f->rdi, (char *)f->rsi, f->rdx); /* readlink */
     case 267: return (uint64_t)sys_readlink((const char *)f->rsi, (char *)f->rdx, f->r10); /* readlinkat */
@@ -1284,7 +1384,9 @@ static uint64_t do_syscall(syscall_frame_t *f) {
         ksleep_ms(ms);
         return 0;
     }
-    case 218: return (uint64_t)task_current()->id;             /* set_tid_address -> tid */
+    case 218:                                                  /* set_tid_address */
+        task_current()->clear_child_tid = f->rdi;
+        return (uint64_t)task_current()->id;
     case 309: {                                                /* getcpu */
         unsigned cpu = (unsigned)smp_cpu_index();
         unsigned node = 0;
@@ -1331,7 +1433,9 @@ static uint64_t do_syscall(syscall_frame_t *f) {
         return (uint64_t)len;
     }
     case 60:                                                   /* exit */
-    case 231: sys_exit((int)f->rdi);                           /* exit_group */
+        if (task_current()->is_thread) sys_exit_thread();      /* thread: no zombie */
+        sys_exit((int)f->rdi);
+    case 231: sys_exit((int)f->rdi);                           /* exit_group: tear down */
     default:
         kprintf("[syscall] unknown nr=%lu\n", (unsigned long)f->rax);
         return (uint64_t)-ENOSYS_;

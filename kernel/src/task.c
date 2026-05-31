@@ -8,6 +8,7 @@
 #include "percpu.h"
 #include "timer.h"
 #include "smp.h"
+#include "kmalloc.h"
 
 /*
  * SMP scheduler (ROADMAP §1, stage B), xv6-style.
@@ -149,6 +150,23 @@ void sched_init(void) {
     kprintf("[sched] SMP scheduler initialized\n");
 }
 
+/* ---- descriptor tables (refcounted so threads can share one) ---- */
+
+static fdtable_t *fdtable_alloc(void) {
+    fdtable_t *ft = (fdtable_t *)kmalloc(sizeof *ft);
+    if (!ft) panic("fdtable: out of memory");
+    kmemset(ft, 0, sizeof *ft);
+    ft->ref = 1;
+    return ft;
+}
+static void fdtable_unref(fdtable_t *ft) {
+    if (!ft) return;
+    if (--ft->ref > 0) return;              /* still shared by another thread */
+    for (int i = 0; i < VFS_MAX_FD; i++)
+        if (ft->fd[i]) file_unref(ft->fd[i]);
+    kfree(ft);
+}
+
 /* ---- task creation ---- */
 
 static task_t *alloc_task_slot(const char *name) {
@@ -171,6 +189,7 @@ static task_t *alloc_task_slot(const char *name) {
     t->id = slot; t->name = name;
     t->stack_base = base; t->stack_top = top;
     t->cwd[0] = '/'; t->cwd[1] = '\0';     /* default cwd (§4) */
+    t->files = fdtable_alloc();            /* fresh, empty; fork copies, clone shares */
     return t;
 }
 
@@ -221,9 +240,9 @@ task_t *task_fork(const char *name, struct vmspace *vm,
        offset) with the parent, à la Linux fork. The per-fd FD_CLOEXEC bit is a
        descriptor property, so it is copied too. */
     for (int i = 0; i < VFS_MAX_FD; i++) {
-        t->fdt[i] = parent->fdt[i];
-        t->fd_cloexec[i] = parent->fd_cloexec[i];
-        if (t->fdt[i]) file_ref(t->fdt[i]);
+        t->files->fd[i] = parent->files->fd[i];
+        t->files->cloexec[i] = parent->files->cloexec[i];
+        if (t->files->fd[i]) file_ref(t->files->fd[i]);
     }
     for (unsigned i = 0; i < sizeof t->cwd; i++) t->cwd[i] = parent->cwd[i];  /* inherit cwd */
 
@@ -254,10 +273,67 @@ task_t *task_fork(const char *name, struct vmspace *vm,
 
     t->bsp_only = (vm != nullptr);    /* user process: BSP-pinned (§3) */
     t->home_cpu = 0;
+    t->tgid = 0;                      /* a new process: tgid == its own id */
     enqueue_ready(t);
     int id = t->id, pid = parent->id;
     sched_unlock();
     kprintf("[sched] fork: %d \"%s\" -> child %d\n", pid, parent->name, id);
+    return t;
+}
+
+int task_tgid(task_t *t) { return t->tgid ? t->tgid : t->id; }
+
+task_t *task_clone(const char *name, struct vmspace *vm,
+                   const struct syscall_frame *frame, uint64_t user_stack,
+                   uint64_t tls, int share_files, int is_thread) {
+    task_t *parent = task_current();
+    sched_lock();
+    task_t *t = alloc_task_slot(name);
+    t->vm        = vm;                          /* caller ref'd it for CLONE_VM */
+    t->parent    = parent;
+    t->brk_start = parent->brk_start;
+    t->brk_cur   = parent->brk_cur;
+    t->brk_max   = parent->brk_max;
+    t->fs_base   = tls ? tls : parent->fs_base; /* CLONE_SETTLS */
+    t->mmap_next = parent->mmap_next;
+    t->is_thread = is_thread;
+    t->tgid      = is_thread ? task_tgid(parent) : 0;
+    signals_fork(t, parent);
+
+    if (share_files) {                          /* CLONE_FILES: share the fdtable */
+        fdtable_unref(t->files);                /* drop the fresh empty one */
+        t->files = parent->files;
+        t->files->ref++;
+    } else {
+        for (int i = 0; i < VFS_MAX_FD; i++) {
+            t->files->fd[i] = parent->files->fd[i];
+            t->files->cloexec[i] = parent->files->cloexec[i];
+            if (t->files->fd[i]) file_ref(t->files->fd[i]);
+        }
+    }
+    for (unsigned i = 0; i < sizeof t->cwd; i++) t->cwd[i] = parent->cwd[i];
+
+    /* Same fork_child_return frame as fork, but the child resumes on its own
+       stack (user_stack) with rax=0. */
+    uint64_t *sp = (uint64_t *)t->stack_top;
+    *--sp = frame->r15; *--sp = frame->r14; *--sp = frame->r13; *--sp = frame->r12;
+    *--sp = frame->rbp; *--sp = frame->rbx;
+    *--sp = user_stack;                         /* <-- child's user rsp */
+    *--sp = frame->r11; *--sp = frame->rcx;
+    *--sp = frame->r9;  *--sp = frame->r8;  *--sp = frame->r10;
+    *--sp = frame->rdx; *--sp = frame->rsi; *--sp = frame->rdi;
+    *--sp = 0;                                  /* child sees clone() == 0 */
+    *--sp = (uint64_t)fork_child_return;
+    for (int j = 0; j < 6; j++) *--sp = 0;
+    t->saved_rsp = (uint64_t)sp;
+
+    t->bsp_only = 1;                            /* user task: BSP-pinned (§3) */
+    t->home_cpu = 0;
+    enqueue_ready(t);
+    int id = t->id;
+    sched_unlock();
+    kprintf("[sched] clone: %d \"%s\" -> %s %d\n",
+            parent->id, parent->name, is_thread ? "thread" : "child", id);
     return t;
 }
 
@@ -365,15 +441,17 @@ static void wq_wake_all_locked(wait_queue_t *wq) {
     while (t) { task_t *n = t->wq_next; t->wq_next = nullptr; make_ready_locked(t); t = n; }
     wq->head = wq->tail = nullptr;
 }
+static void wq_wake_one_locked(wait_queue_t *wq);   /* defined below; used by futex */
 
 static void task_exit_common(int code, int sig) {
     task_t *t = task_current();
     if (sig) kprintf("[sched] task %d \"%s\" killed by signal %d\n", t->id, t->name, sig);
     else     kprintf("[sched] task %d \"%s\" exit(%d)\n", t->id, t->name, code);
-    /* Release open files before becoming a zombie (the address space is reaped
-       later by the parent's wait4). */
-    for (int i = 0; i < VFS_MAX_FD; i++)
-        if (t->fdt[i]) { file_unref(t->fdt[i]); t->fdt[i] = nullptr; }
+    /* Release this task's reference to its descriptor table before becoming a
+       zombie (the address space is reaped later by the parent's wait4). With a
+       shared table (threads), the files stay open until the last reference. */
+    fdtable_unref(t->files);
+    t->files = nullptr;
     sched_lock();
     t->exit_code   = code;
     t->term_signal = sig;
@@ -390,6 +468,61 @@ static void task_exit_common(int code, int sig) {
 
 void task_exit_user(int code)  { task_exit_common(code, 0); __builtin_unreachable(); }
 void task_exit_signal(int sig) { task_exit_common(0, sig);  __builtin_unreachable(); }
+
+/* A CLONE_THREAD task exiting: it has no waiter (pthread_join uses the futex on
+   clear_child_tid, handled by the caller), so it does not become a zombie — it
+   releases its descriptor table + address-space reference and dies. Because it
+   may be dropping the last AS reference while running on it, switch CR3 to the
+   kernel master tables first so vmspace_destroy can free the page tables. */
+void task_exit_thread(void) {
+    task_t *t = task_current();
+    kprintf("[sched] thread %d (tgid %d) exited\n", t->id, task_tgid(t));
+    fdtable_unref(t->files);
+    t->files = nullptr;
+    struct vmspace *vm = t->vm;
+    vmspace_switch(nullptr);          /* CR3 -> kernel master; AS no longer active */
+    t->vm = nullptr;
+    vmspace_destroy(vm);              /* drop this thread's ref; frees at 0 */
+    sched_lock();
+    t->state = TASK_DEAD;
+    sched();
+    panic("task_exit_thread: returned");
+}
+
+/* ---- futex (ROADMAP): wait/wake keyed on a word's physical address ---- */
+
+#define FUTEX_BUCKETS 32
+static struct { uint64_t key; wait_queue_t wq; } g_futex[FUTEX_BUCKETS];
+
+/* Find the bucket for `key` (an empty wq means the slot is reusable). Lock held. */
+static wait_queue_t *futex_bucket(uint64_t key) {
+    int free_slot = -1;
+    for (int i = 0; i < FUTEX_BUCKETS; i++) {
+        if (g_futex[i].wq.head && g_futex[i].key == key) return &g_futex[i].wq;
+        if (free_slot < 0 && !g_futex[i].wq.head) free_slot = i;
+    }
+    if (free_slot < 0) return nullptr;
+    g_futex[free_slot].key = key;
+    return &g_futex[free_slot].wq;
+}
+
+/* Sleep the current task on `key` (caller holds sched_lock). */
+void futex_sleep_on(uint64_t key) {
+    wait_queue_t *wq = futex_bucket(key);
+    if (!wq) return;                  /* table full: treat as a spurious wake */
+    wq_sleep_locked(wq);
+}
+
+/* Wake up to `n` waiters on `key` (caller holds sched_lock). Returns count hint. */
+int futex_wake_key(uint64_t key, int n) {
+    for (int i = 0; i < FUTEX_BUCKETS; i++)
+        if (g_futex[i].wq.head && g_futex[i].key == key) {
+            int woke = 0;
+            while (g_futex[i].wq.head && woke < n) { wq_wake_one_locked(&g_futex[i].wq); woke++; }
+            return woke;
+        }
+    return 0;
+}
 
 task_t *task_by_id(int id) {
     if (id < 1 || id >= MAX_TASKS) return nullptr;

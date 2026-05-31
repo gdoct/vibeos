@@ -393,8 +393,11 @@ vmspace_t *vmspace_create(void) {
     uint64_t *kpml4 = table(g_pml4_phys);
     for (int i = 256; i < ENTRIES; i++) npml4[i] = kpml4[i];   /* share kernel half */
     vm->pml4_phys = p;
+    vm->ref = 1;
     return vm;
 }
+
+void vmspace_ref(vmspace_t *vm) { if (vm) vm->ref++; }
 
 void vmspace_switch(vmspace_t *vm) {
     uint64_t cr3 = vm ? vm->pml4_phys : g_pml4_phys;
@@ -459,6 +462,8 @@ vmspace_t *vmspace_fork(vmspace_t *parent) {
    outright. The kernel upper half is shared, so it is left untouched. The
    caller must not be running on this address space. */
 void vmspace_destroy(vmspace_t *vm) {
+    if (!vm) return;
+    if (--vm->ref > 0) return;          /* still shared by another thread */
     uint64_t *pml4 = table(vm->pml4_phys);
     for (uint64_t i = 0; i < 256; i++) {
         if (!(pml4[i] & PTE_P)) continue;

@@ -63,17 +63,19 @@ uint64_t kva_to_phys(const volatile void *va);
  * tables; the lower half holds the process's private user mappings. */
 typedef struct vmspace {
     uint64_t pml4_phys;
+    int      ref;          /* threads (CLONE_VM) share one vmspace; freed at 0 */
 } vmspace_t;
 
 uint64_t   paging_kernel_pml4(void);                 /* master PML4 (phys) */
-vmspace_t *vmspace_create(void);                     /* kernel half shared */
+vmspace_t *vmspace_create(void);                     /* kernel half shared; ref=1 */
+void       vmspace_ref(vmspace_t *vm);               /* +1 (a thread shares it) */
 void       vmspace_switch(vmspace_t *vm);            /* load CR3 (NULL = master) */
 void       vmspace_map(vmspace_t *vm, uint64_t va, uint64_t pa,
                        size_t pages, uint64_t flags);
 int        vmspace_query(vmspace_t *vm, uint64_t va, uint64_t *pa_out);
 void       vmspace_unmap(vmspace_t *vm, uint64_t va, size_t pages);  /* PTEs only; caller frees pa */
 vmspace_t *vmspace_fork(vmspace_t *parent);          /* copy-on-write share */
-void       vmspace_destroy(vmspace_t *vm);           /* not while active */
+void       vmspace_destroy(vmspace_t *vm);           /* drop a ref; frees at 0 (not while active) */
 
 /* ---- Copy-on-write + page refcounts (ROADMAP §1.1). ----
  * Every arena page carries a refcount = (number of PTEs pointing at it) - 1,

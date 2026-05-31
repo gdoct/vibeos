@@ -80,16 +80,29 @@ typedef struct task {
     task_sigstate_t sig;
 
     /* Per-process fd table (ROADMAP §4 rung 2). Indices 0/1/2 are the serial
-       console implicitly; 3+ point at refcounted open-file objects. NULL == a
-       free descriptor. fork() dups these (sharing the file offset); they
-       survive execve. */
-    struct file  *fdt[VFS_MAX_FD];
-    uint8_t       fd_cloexec[VFS_MAX_FD];  /* FD_CLOEXEC bit per descriptor (§4) */
+       console implicitly; 3+ point at refcounted open-file objects. fork() dups
+       (copies) the table; clone(CLONE_FILES) shares it (refcounted). */
+    struct fdtable *files;
+
+    /* Threads (ROADMAP). A thread group shares a vmspace + fdtable + sighand and
+       a tgid (the leader's id). `is_thread` marks a CLONE_THREAD task: it does
+       not zombie at exit — it clears *clear_child_tid and futex-wakes it (how
+       pthread_join detects exit), then frees. */
+    int           tgid;             /* thread-group id (== getpid()); 0 = use id */
+    int           is_thread;
+    uint64_t      clear_child_tid;  /* CLONE_CHILD_CLEARTID address (user) or 0 */
 
     /* Current working directory (ROADMAP §4): an absolute, normalized path that
        relative path resolution is taken from. Inherited across fork + execve. */
     char          cwd[256];
 } task_t;
+
+/* A refcounted descriptor table so threads (CLONE_FILES) can share one. */
+typedef struct fdtable {
+    int           ref;
+    struct file  *fd[VFS_MAX_FD];
+    uint8_t       cloexec[VFS_MAX_FD];
+} fdtable_t;
 
 /* Initialize the SMP scheduler. Call once on the BSP before creating tasks
    and before any CPU enters scheduler(). */
@@ -110,6 +123,18 @@ void    task_yield(void);
 task_t *task_fork(const char *name, struct vmspace *vm,
                   const struct syscall_frame *frame);
 
+/* clone(2): create a task that may share the caller's address space, fd table,
+   and thread group (ROADMAP). `share_files` shares the fdtable; `vm` is the
+   address space (shared for CLONE_VM, a fresh COW copy otherwise); `is_thread`
+   marks CLONE_THREAD; the child returns to userspace with rsp=`user_stack` and,
+   if `tls`!=0, FS_BASE=`tls`. */
+task_t *task_clone(const char *name, struct vmspace *vm,
+                   const struct syscall_frame *frame, uint64_t user_stack,
+                   uint64_t tls, int share_files, int is_thread);
+
+/* thread-group id of `t` (== getpid for a thread); falls back to its own id. */
+int     task_tgid(task_t *t);
+
 /* Attach a user address space to the current task and switch CR3 to it. */
 void    task_set_vmspace(struct vmspace *vm);
 
@@ -120,6 +145,15 @@ void    task_exit(void);
    ZOMBIE and wakes the parent's wait; otherwise reaps immediately. */
 __attribute__((noreturn))
 void    task_exit_user(int code);
+
+/* A thread (CLONE_THREAD) exiting: no zombie — releases its fd-table + AS refs
+   and dies. The caller handles CLONE_CHILD_CLEARTID + futex wake first. */
+__attribute__((noreturn))
+void    task_exit_thread(void);
+
+/* futex primitives (caller holds sched_lock; key = the word's physical addr). */
+void    futex_sleep_on(uint64_t key);
+int     futex_wake_key(uint64_t key, int n);
 
 /* Terminate the current user task because of signal `sig` (ROADMAP §3): like
    task_exit_user but the wait4 status reports WIFSIGNALED instead of an exit

@@ -57,6 +57,10 @@ rm -f "$VDISK"
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/pkg.elf /bin/pkg
 [ -f user/build/vibehello.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/vibehello.elf /bin/vibehello
+[ -f user/build/abitest.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/abitest.elf /bin/abitest
+[ -f user/build/threadtest.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/threadtest.elf /bin/threadtest
 
 # Dynamic linking (ROADMAP §4): ship the musl dynamic linker as
 # /lib/ld-musl-x86_64.so.1 (the host's musl libc.so doubles as the loader) and a
