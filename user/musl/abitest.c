@@ -11,6 +11,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 
 int main(void) {
     struct utsname u;
@@ -53,6 +56,31 @@ int main(void) {
         printf("bind: FAILED\n");
     }
     close(s);
+
+    /* access(2) — existence check. */
+    printf("access(/bin/sh)=%d access(/nope)=%d\n",
+           access("/bin/sh", F_OK), access("/nope", F_OK));
+
+    /* statx(2) — modern stat, called raw (this musl is too old to declare it). */
+    struct statx_min {
+        unsigned mask, blksize; unsigned long long attributes;
+        unsigned nlink, uid, gid; unsigned short mode, pad1;
+        unsigned long long ino, size, blocks;
+        unsigned char rest[128];
+    } stx;
+    long sr = syscall(332 /*statx*/, AT_FDCWD, "/bin/sh", 0, 0x7ff, &stx);
+    if (sr == 0)
+        printf("statx(/bin/sh): mode=%o size=%llu\n", stx.mode & 07777, stx.size);
+    else
+        printf("statx: FAILED (%ld)\n", sr);
+
+    /* fcntl advisory lock — should succeed (no real locking). */
+    int lf = open("/tmp_lockfile", O_RDWR | O_CREAT, 0644);
+    if (lf >= 0) {
+        struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+        printf("fcntl F_SETLK=%d\n", fcntl(lf, F_SETLK, &fl));
+        close(lf);
+    }
 
     printf("abitest done\n");
     return 0;

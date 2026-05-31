@@ -82,6 +82,7 @@ static inline vmspace_t *cur_vm(void) { return task_current()->vm; }
 /* *at() dirfd / flags. */
 #define AT_FDCWD       (-100)
 #define AT_EMPTY_PATH  0x1000
+#define AT_SYMLINK_NOFOLLOW 0x100
 
 /* lseek whence. */
 #define SEEK_SET 0
@@ -781,6 +782,49 @@ static int64_t sys_lstat(const char *upath, struct linux_stat *st) {
     return 0;
 }
 
+/* access / faccessat / faccessat2: existence check (no permission model yet, so
+   any mode against an existing path succeeds). */
+static int64_t sys_access(const char *upath, int mode) {
+    (void)mode;
+    struct linux_stat ks;
+    return pathstat_k(upath, &ks) < 0 ? -ENOENT_ : 0;
+}
+
+/* statx — the modern stat used by recent coreutils/busybox. Fill the basic-stats
+   fields from the same data as stat. */
+static int64_t sys_statx(int dirfd, const char *upath, int flags,
+                         unsigned mask, uint64_t ubuf) {
+    (void)mask;
+    struct linux_stat ks;
+    int64_t r;
+    char tmp[4];
+    copy_user_str(tmp, upath, sizeof tmp);
+    if ((flags & AT_EMPTY_PATH) && tmp[0] == '\0') r = fstat_k(dirfd, &ks);
+    else r = pathstat_k2(upath, &ks, !(flags & AT_SYMLINK_NOFOLLOW));
+    if (r < 0) return r;
+
+    struct statx_ts { int64_t sec; uint32_t nsec; int32_t pad; };
+    struct statx {
+        uint32_t mask, blksize; uint64_t attributes;
+        uint32_t nlink, uid, gid; uint16_t mode, pad1; uint64_t ino, size, blocks;
+        uint64_t attributes_mask;
+        struct statx_ts atime, btime, ctime, mtime;
+        uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
+        uint64_t mnt_id; uint64_t pad2[13];
+    } sx;
+    kmemset(&sx, 0, sizeof sx);
+    sx.mask = 0x7ff;                             /* STATX_BASIC_STATS */
+    sx.blksize = (uint32_t)ks.st_blksize;
+    sx.nlink = (uint32_t)ks.st_nlink;
+    sx.uid = ks.st_uid; sx.gid = ks.st_gid;
+    sx.mode = (uint16_t)ks.st_mode;
+    sx.ino = ks.st_ino; sx.size = (uint64_t)ks.st_size; sx.blocks = (uint64_t)ks.st_blocks;
+    sx.atime.sec = ks.st_atime; sx.mtime.sec = ks.st_mtime; sx.ctime.sec = ks.st_ctime;
+    sx.dev_major = 0; sx.dev_minor = 1;
+    if (copy_to_user(cur_vm(), ubuf, &sx, sizeof sx) < 0) return -EFAULT_;
+    return 0;
+}
+
 static int64_t sys_getdents64(int fd, void *ubuf, uint64_t count) {
     file_t *f = fd_get(fd);
     if (!f) return -EBADF_;
@@ -934,8 +978,9 @@ static int64_t sys_dup2(int oldfd, int newfd) {
 /* fcntl: F_DUPFD(_CLOEXEC) / F_GETFD / F_SETFD / F_GETFL / F_SETFL. FD_CLOEXEC is
    now tracked per descriptor and enforced by execve (ROADMAP §4). */
 static int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
-    enum { F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030 };
-    enum { FD_CLOEXEC_BIT = 1 };
+    enum { F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4,
+           F_SETLK=6, F_SETLKW=7, F_GETLK=5, F_DUPFD_CLOEXEC=1030 };
+    enum { FD_CLOEXEC_BIT = 1, F_UNLCK = 2 };
     file_t *f = fd_get(fd);
     int is_console = (fd >= 0 && fd <= 2);
     if (!f && !is_console) return -EBADF_;
@@ -953,6 +998,11 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
         return 0;
     case F_GETFL: return f ? f->flags : O_RDWR;
     case F_SETFL: if (f) f->flags = (int)arg; return 0;
+    /* Advisory record locks: no real locking yet, so report "unlocked" and let
+       every lock attempt succeed (enough for binutils/dpkg-style fcntl locking). */
+    case F_GETLK: { int16_t unlck = F_UNLCK; copy_to_user(cur_vm(), arg, &unlck, sizeof unlck); return 0; }
+    case F_SETLK:
+    case F_SETLKW: return 0;
     default:      return -EINVAL_;
     }
 }
@@ -1206,6 +1256,12 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 80:  return (uint64_t)sys_chdir((const char *)f->rdi);     /* chdir */
     case 83:  return (uint64_t)sys_mkdir((const char *)f->rdi, (int)f->rsi);   /* mkdir */
     case 258: return (uint64_t)sys_mkdir((const char *)f->rsi, (int)f->rdx);   /* mkdirat */
+    case 21:  return (uint64_t)sys_access((const char *)f->rdi, (int)f->rsi);   /* access */
+    case 269: return (uint64_t)sys_access((const char *)f->rsi, (int)f->rdx);   /* faccessat(dirfd,path,mode) */
+    case 439: return (uint64_t)sys_access((const char *)f->rsi, (int)f->rdx);   /* faccessat2 */
+    case 332: return (uint64_t)sys_statx((int)f->rdi, (const char *)f->rsi, (int)f->rdx,
+                                         (unsigned)f->r10, f->r8);              /* statx */
+    case 280: return 0;                                        /* utimensat (no mtime store) */
     case 88:  return (uint64_t)sys_symlink((const char *)f->rdi, (const char *)f->rsi); /* symlink */
     case 89:  return (uint64_t)sys_readlink((const char *)f->rdi, (char *)f->rsi, f->rdx); /* readlink */
     case 267: return (uint64_t)sys_readlink((const char *)f->rsi, (char *)f->rdx, f->r10); /* readlinkat */
