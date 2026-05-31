@@ -57,6 +57,11 @@ typedef struct {
        window is drained with non-blocking reads every frame. */
     uint8_t *rbuf;
     int rgot, rneed, rcap;
+    /* one pending outgoing event message — input is sent atomically and dropped
+       (not queued unbounded) when the client falls behind, so the compositor
+       never blocks on a slow client. */
+    uint8_t obuf[64];
+    int olen, ooff;
 } win_t;
 
 static win_t      g_win[MAXWIN];
@@ -217,12 +222,25 @@ static int write_full(int fd, const void *buf, int n) {
     return 0;
 }
 
+/* Flush a window's pending outgoing event (non-blocking). */
+static void flush_out(win_t *w) {
+    while (w->ooff < w->olen) {
+        int r = write(w->fd, w->obuf + w->ooff, w->olen - w->ooff);
+        if (r <= 0) return;                      /* EAGAIN / error: try later */
+        w->ooff += r;
+    }
+    w->olen = w->ooff = 0;
+}
+
 static void send_input(win_t *w, int ev, int x, int y, int buttons, int key) {
+    flush_out(w);
+    if (w->olen) return;                          /* previous event still in flight: drop */
     gmsg_hdr_t hdr = { GEVT_INPUT, sizeof(gevt_input_t) };
     gevt_input_t e = { (uint32_t)ev, x, y, (uint32_t)buttons, (uint32_t)key };
-    if (write_full(w->fd, &hdr, sizeof hdr) || write_full(w->fd, &e, sizeof e)) {
-        /* client gone */
-    }
+    memcpy(w->obuf, &hdr, sizeof hdr);
+    memcpy(w->obuf + sizeof hdr, &e, sizeof e);
+    w->olen = sizeof hdr + sizeof e; w->ooff = 0;
+    flush_out(w);
 }
 
 /* Act on one fully-received message sitting in w->rbuf (header + body). */
@@ -387,6 +405,7 @@ int main(void) {
            connected socket isn't reliable yet, so we don't depend on it) */
         for (int i = 0; i < MAXWIN; i++) {
             if (!g_win[i].used) continue;
+            flush_out(&g_win[i]);                  /* drain any pending event */
             if (pump_client(i) < 0) {
                 printf("[guiwm] window %u closed\n", g_win[i].wid);
                 remove_window(i);

@@ -340,7 +340,11 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
     }
     if (f->kind == FD_PIPE_WR) return pipe_write(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_RD) return -EBADF_;  /* write to read end */
-    if (f->kind == FD_SOCKET) { int r = ksock_send(f->sock, buf, (uint32_t)n); return r < 0 ? -EPIPE_ : r; }
+    if (f->kind == FD_SOCKET) {
+        int r = ksock_send(f->sock, buf, (uint32_t)n, (f->flags & 04000) ? 1 : 0);
+        if (r == -11) return -11;               /* -EAGAIN: send buffer full (non-blocking) */
+        return r < 0 ? -EPIPE_ : r;
+    }
     if (f->kind == FD_DEV || f->kind == FD_PROC) return synth_write(f, buf, (uint32_t)n);
     if (f->kind != FD_FILE) return -EISDIR_;
     if (f->flags & O_APPEND) {                  /* append: write at EOF */
@@ -1279,21 +1283,23 @@ static int64_t sys_accept(int fd, uint64_t uaddr, uint64_t ulen_ptr) {
 
 static int64_t sys_sendto(int fd, uint64_t ubuf, uint64_t len, int flags,
                           uint64_t uaddr, uint32_t ulen) {
-    (void)flags;
     void *ks = sock_get(fd); if (!ks) return -EBADF_;
     if (len && !paging_user_ok(cur_vm(), ubuf, len, 0)) return -EFAULT_;
     uint8_t *kbuf = (uint8_t *)kmalloc(len ? len : 1);
     if (!kbuf) return -ENOMEM_;
+    file_t *ff = fd_get(fd);
+    int nb = (flags & 0x40) || (ff && (ff->flags & 04000)) ? 1 : 0;   /* MSG_DONTWAIT | O_NONBLOCK */
     int r;
     if (len && copy_from_user(kbuf, cur_vm(), ubuf, len) < 0) { kfree(kbuf); return -EFAULT_; }
     if (uaddr) {
         uint32_t ip; uint16_t port;
         if (read_sockaddr(uaddr, ulen, &ip, &port) < 0) { kfree(kbuf); return -EINVAL_; }
-        r = ksock_sendto(ks, kbuf, (uint32_t)len, ip, port);
+        r = ksock_sendto(ks, kbuf, (uint32_t)len, ip, port, nb);
     } else {
-        r = ksock_send(ks, kbuf, (uint32_t)len);
+        r = ksock_send(ks, kbuf, (uint32_t)len, nb);
     }
     kfree(kbuf);
+    if (r == -11) return -11;                    /* -EAGAIN */
     return r < 0 ? -EPIPE_ : r;
 }
 

@@ -77,8 +77,8 @@ int   ksock_bind(void *s, uint32_t ip, uint16_t port);
 int   ksock_listen(void *s, int backlog);
 void *ksock_accept(void *s, uint32_t *peer_ip, uint16_t *peer_port);
 int   ksock_connect(void *s, uint32_t ip, uint16_t port);
-int   ksock_send(void *s, const void *buf, uint32_t len);             /* connected */
-int   ksock_sendto(void *s, const void *buf, uint32_t len, uint32_t ip, uint16_t port);
+int   ksock_send(void *s, const void *buf, uint32_t len, int nonblock);   /* connected */
+int   ksock_sendto(void *s, const void *buf, uint32_t len, uint32_t ip, uint16_t port, int nonblock);
 int   ksock_recv(void *s, void *buf, uint32_t len, int nonblock);   /* connected */
 int   ksock_recvfrom(void *s, void *buf, uint32_t len, uint32_t *ip, uint16_t *port, int nonblock);
 int   ksock_poll(void *s, int want);              /* returns ready NET_POLL* bits */

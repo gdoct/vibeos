@@ -745,10 +745,16 @@ static tcp_pcb_t *tcp_connect(uint32_t dip, uint16_t dport) {
     return t;
 }
 
-static int tcp_write(tcp_pcb_t *t, const uint8_t *data, uint32_t len) {
+static int tcp_write(tcp_pcb_t *t, const uint8_t *data, uint32_t len, int nonblock) {
     uint32_t sent = 0;
     while (sent < len) {
         sched_lock();
+        if (nonblock && t->used && !t->reset &&
+            (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) &&
+            tcp_snd_free(t) == 0) {
+            sched_unlock();
+            return sent ? (int)sent : -11;       /* -EAGAIN: send buffer full */
+        }
         while (t->used && !t->reset &&
                (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) &&
                tcp_snd_free(t) == 0)
@@ -1225,16 +1231,16 @@ int ksock_connect(void *vp, uint32_t ip, uint16_t port) {
     return 0;
 }
 
-int ksock_sendto(void *vp, const void *buf, uint32_t len, uint32_t ip, uint16_t port) {
+int ksock_sendto(void *vp, const void *buf, uint32_t len, uint32_t ip, uint16_t port, int nonblock) {
     ksocket_t *s = (ksocket_t *)vp;
-    if (s->type == SOCK_STREAM) return s->tcp ? tcp_write(s->tcp, (const uint8_t *)buf, len) : -1;
+    if (s->type == SOCK_STREAM) return s->tcp ? tcp_write(s->tcp, (const uint8_t *)buf, len, nonblock) : -1;
     if (!s->udp) s->udp = udp_bind(0);
     return udp_sendto(s->udp, ip, port, buf, len) < 0 ? -1 : (int)len;
 }
 
-int ksock_send(void *vp, const void *buf, uint32_t len) {
+int ksock_send(void *vp, const void *buf, uint32_t len, int nonblock) {
     ksocket_t *s = (ksocket_t *)vp;
-    return ksock_sendto(vp, buf, len, s->peer_ip, s->peer_port);
+    return ksock_sendto(vp, buf, len, s->peer_ip, s->peer_port, nonblock);
 }
 
 int ksock_recvfrom(void *vp, void *buf, uint32_t len, uint32_t *ip, uint16_t *port, int nonblock) {
@@ -1404,7 +1410,7 @@ static void net_pinger(void *arg) {
     /* TCP over loopback: connect to the in-guest echo server, exchange, close. */
     tcp_pcb_t *c = tcp_connect(LOCAL_IP, 8080);
     if (c) {
-        tcp_write(c, (const uint8_t *)"hello-tcp", 9);
+        tcp_write(c, (const uint8_t *)"hello-tcp", 9, 0);
         uint8_t buf[256];
         int n = tcp_read(c, buf, sizeof buf, 0);
         buf[n > 0 ? n : 0] = '\0';
@@ -1419,7 +1425,7 @@ static void net_pinger(void *arg) {
     if (b) {
         static uint8_t blk[6000];
         for (uint32_t i = 0; i < sizeof blk; i++) blk[i] = (uint8_t)('A' + (i % 26));
-        int w = tcp_write(b, blk, sizeof blk);
+        int w = tcp_write(b, blk, sizeof blk, 0);
         kprintf("[net] tcp bulk wrote %d bytes to :8081\n", w);
         tcp_close(b);
     }
@@ -1453,7 +1459,7 @@ static void net_http_server(void *arg) {
         const char *tail = "\r\nConnection: close\r\n\r\n";
         for (const char *q = tail; *q; q++) resp[hlen++] = *q;
         kmemcpy(resp + hlen, body, blen);
-        tcp_write(c, (const uint8_t *)resp, hlen + blen);
+        tcp_write(c, (const uint8_t *)resp, hlen + blen, 0);
         tcp_close(c);                          /* HTTP/1.0: close right after the response */
     }
 }
@@ -1473,7 +1479,7 @@ static void net_tcp_server(void *arg) {
             const char *pfx = "echo: ";
             int k = 0; while (pfx[k]) { rep[k] = (uint8_t)pfx[k]; k++; }
             kmemcpy(rep + k, req, n);
-            tcp_write(c, rep, k + n);
+            tcp_write(c, rep, k + n, 0);
         }
         uint8_t drain[64];
         while (tcp_read(c, drain, sizeof drain, 0) > 0) { }   /* read to EOF */
