@@ -18,6 +18,8 @@ built with `g++` and GNU `ld` (the bootloader is a UEFI PE32+ application).
 
 All features were vibe coded, and the project is licensed under MIT.
 
+<img width="1277" height="1023" alt="image" src="https://github.com/user-attachments/assets/f3e462ce-f0a7-4d82-bfed-bc4252b58ea9" />
+
 ## What is implemented
 
 The roadmap in [ROADMAP.md](ROADMAP.md) is the source of truth for the
