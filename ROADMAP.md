@@ -1,10 +1,13 @@
 # VibeOS — what we have, what's next
 
 A from-scratch x86-64 kernel: boots over UEFI into the higher half with its own
-page tables, schedules user processes preemptively across **all** CPUs, isolates
-them in copy-on-write address spaces, delivers POSIX signals, has a writable
-on-disk filesystem and an IPv4/TCP network stack, and runs **real static *and*
-dynamically-linked `x86_64-linux-musl` binaries** over a serial shell. Every
+page tables; preemptive SMP scheduler with per-CPU run queues + work-stealing;
+copy-on-write, ASLR'd address spaces; POSIX signals **and threads** (`clone` /
+`futex`, so unmodified musl **pthreads** run); a writable, crash-safe filesystem
+(VibeFS, with symlinks); a **WAN-grade TCP/IP** stack over virtio-net; a
+ChaCha20 **CSPRNG**; and a **`/config`-driven, service-managed init**. It runs
+**real static *and* dynamically-linked `x86_64-linux-musl` binaries** over a
+serial shell, and ships its own **`x86_64-vibeos-musl` cross toolchain**. Every
 feature boots end-to-end on QEMU q35 + OVMF and is verified by serial output.
 
 Detail lives in the code and git history; this file is the map, not the manual.
@@ -112,7 +115,8 @@ Detail lives in the code and git history; this file is the map, not the manual.
   unit sections / dbus) — just files you can `ls` and `cat`. (Fds 0/1/2 are now
   redirectable — console by default, but the fd table is consulted first — which
   is what lets init point a service at a log file.)
-- **Shell + tooling** — `/bin/init` → `/bin/sh` over serial; host `disktool-cli`
+- **Shell + tooling** — `/bin/init` (the service manager) brings up `/bin/sh`
+  over serial; host `disktool-cli`
   ([interop/tools/diskutil](interop/tools/diskutil/)) builds/populates VibeFS
   images; `./build.sh` + `make run` (`-smp 4`, virtio-blk + virtio-net). A
   **cross toolchain** ([toolchain/](toolchain/)): `x86_64-vibeos-musl-gcc` + a
@@ -154,7 +158,7 @@ What remains:
   (`>`/`<`/`2>` — the kernel now supports it; the shell doesn't parse it yet).
 - **Graphical stack.** A simple windowing system over the framebuffer (`/gui`);
   USB (EHCI/xHCI) + keyboard/mouse input to drive it.
-- **Audio.** An audio subsystem + virtio-sound. 
+- **Audio.** An audio subsystem + virtio-sound.
 
 *Known issue:* unclean-`fsck` drops `/bin/init` on diskutil volumes (workaround =
 clean image per build); root-cause before relying on crash persistence. Other
@@ -167,9 +171,11 @@ backlog: ACPI poweroff; FS journaling / `rename` / permissions.
 ```
 UEFI/OVMF → BOOTX64.EFI → kernel.elf → start.S (bootstrap tables, jump high) → kmain()
   → gdt/idt/percpu(TSS+GS)/syscall → pmm → paging (drop identity) → page refcounts
-  → apic+timer → virtio-blk → fs_mount → irq_enable → sched_init → net_init
-  (virtio-net + worker) → create init+workers → smp_init (APs join: percpu+SYSCALL+SSE)
-  → scheduler() [every CPU] → /bin/init → /bin/sh
+  → csprng → apic+timer → virtio-blk → virtio-rng (seed CSPRNG) → fs_mount
+  → config (/config/system.conf) → irq_enable → sched_init → net_init
+  (virtio-net + worker + tcp timer) → create init+workers → smp_init (APs join:
+  percpu+SYSCALL+SSE) → scheduler() [every CPU]
+  → /bin/init (service manager) → /config/services/* → /bin/sh
 ```
 
 ---
