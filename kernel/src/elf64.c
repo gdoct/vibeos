@@ -34,6 +34,21 @@
 #define EXE_DYN_BASE      0x4000000000ULL         /* 256 GiB: PIE main image base */
 #define INTERP_BASE       0x4100000000ULL         /* 260 GiB: dynamic linker base */
 
+/* ASLR (ROADMAP): a fresh, page-aligned random slide per execve for the PIE
+   image, the dynamic linker, the stack top, and the mmap arena. Each span is
+   sized to stay inside that region's gap so the four areas never overlap. Drawn
+   from the ChaCha20 CSPRNG. (ET_EXEC images load at fixed vaddrs — no exe slide
+   possible there, but the stack/mmap are still randomized.) */
+#define ASLR_EXE_SPAN     0x40000000ULL           /* 1 GiB (gap to INTERP is 4 GiB) */
+#define ASLR_INTERP_SPAN  0x40000000ULL           /* 1 GiB */
+#define ASLR_MMAP_SPAN    0x40000000ULL           /* 1 GiB */
+#define ASLR_STACK_SPAN   0x00800000ULL           /* up to 8 MiB down from the top */
+
+static uint64_t aslr_off(uint64_t span) {
+    if (span < PAGE_SIZE) return 0;
+    return (csprng_u64() % (span / PAGE_SIZE)) * PAGE_SIZE;   /* page-aligned */
+}
+
 #define MAX_ARGS          64                      /* argv/envp cap per vector */
 
 /* auxv types we populate (subset of <elf.h> AT_*). */
@@ -166,12 +181,12 @@ static int load_image(vmspace_t *vm, const char *path, uint64_t want_base, loade
 static void build_initial_stack(const loaded_t *exe, uint64_t interp_base,
                                 const char *execfn,
                                 char *const argv[], char *const envp[],
-                                uint64_t *rsp_out) {
+                                uint64_t *rsp_out, uint64_t stack_top) {
     int argc = 0; while (argv && argc < MAX_ARGS && argv[argc]) argc++;
     int envc = 0; while (envp && envc < MAX_ARGS && envp[envc]) envc++;
 
     uint64_t argp[MAX_ARGS], envpp[MAX_ARGS];
-    uint64_t sp = USER_STACK_TOP;
+    uint64_t sp = stack_top;
 
     for (int i = 0; i < argc; i++) {
         uint64_t len = (uint64_t)kstrlen(argv[i]) + 1;
@@ -228,7 +243,7 @@ int user_load_path(vmspace_t *vm, const char *path,
                    char *const argv[], char *const envp[],
                    uint64_t *entry_out, uint64_t *rsp_out) {
     loaded_t exe;
-    int r = load_image(vm, path, EXE_DYN_BASE, &exe);
+    int r = load_image(vm, path, EXE_DYN_BASE + aslr_off(ASLR_EXE_SPAN), &exe);
     if (r < 0) return r;
 
     uint64_t real_entry = exe.entry;
@@ -237,7 +252,7 @@ int user_load_path(vmspace_t *vm, const char *path,
 
     if (exe.has_interp) {
         loaded_t interp;
-        r = load_image(vm, exe.interp, INTERP_BASE, &interp);
+        r = load_image(vm, exe.interp, INTERP_BASE + aslr_off(ASLR_INTERP_SPAN), &interp);
         if (r < 0) return r;                 /* missing/!bad dynamic linker */
         if (interp.has_interp) return -9;    /* an interpreter must be static */
         real_entry  = interp.entry;          /* enter the dynamic linker first */
@@ -245,16 +260,17 @@ int user_load_path(vmspace_t *vm, const char *path,
         if (interp.max_va > brk_base) brk_base = interp.max_va;
     }
 
-    /* Stack, with a deliberately-unmapped guard page below it (ROADMAP §1.1). */
-    uint64_t stk_lo = USER_STACK_TOP - (uint64_t)USER_STACK_PAGES * PAGE_SIZE;
-    map_user(vm, stk_lo, USER_STACK_TOP - stk_lo);
-    build_initial_stack(&exe, interp_base, path, argv, envp, rsp_out);
+    /* Stack (ASLR-slid top), with a deliberately-unmapped guard page below it. */
+    uint64_t stack_top = USER_STACK_TOP - aslr_off(ASLR_STACK_SPAN);
+    uint64_t stk_lo = stack_top - (uint64_t)USER_STACK_PAGES * PAGE_SIZE;
+    map_user(vm, stk_lo, stack_top - stk_lo);
+    build_initial_stack(&exe, interp_base, path, argv, envp, rsp_out, stack_top);
 
     /* Heap (brk) starts past the highest mapped image byte; arm the mmap arena
-       the dynamic linker (and malloc) draw from. */
+       the dynamic linker (and malloc) draw from (also ASLR-slid). */
     uint64_t brk_start = PAGE_ALIGN_UP(brk_base);
     user_heap_init(brk_start, brk_start + USER_HEAP_MAX);
-    task_current()->mmap_next = USER_MMAP_BASE;
+    task_current()->mmap_next = USER_MMAP_BASE + aslr_off(ASLR_MMAP_SPAN);
 
     *entry_out = real_entry;
     return 0;
