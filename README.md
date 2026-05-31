@@ -1,4 +1,6 @@
 # VibeOS
+<img width="1211" height="598" alt="image" src="https://github.com/user-attachments/assets/b56c282c-477a-4776-b14e-d45ba2580cc5" />
+
 
 VibeOS is a small x86_64 operating system built around a UEFI boot
 chain, a higher-half kernel, an SMP scheduler that runs user processes on every
