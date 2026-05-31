@@ -101,45 +101,34 @@ once outbound connectivity is available.
 
 ---
 
-## What's next, ordered
+## What's next
 
-The original "next five" — (1) memory correctness + safety (COW fork, usercopy
-validation, kstack reclamation, guarded stacks), (2) user tasks on all cores
-(per-CPU TSS/GS/`swapgs`, IPIs/TLB shootdown), (3) signals, (4) dynamic linking
-(`ET_DYN` + `ld-musl`, file-backed `mmap`), and (5) networking (virtio-net +
-ARP/IP/ICMP/UDP/TCP + BSD sockets + ported `wget`) — are **all shipped** and
-serial-verified, as are **(6) WAN-grade TCP** (send buffer, RTO/RTT, congestion
-control, reassembly, delayed/dup ACKs, TIME-WAIT), **(7) a ChaCha20 CSPRNG**
-(RDRAND + jitter + virtio-rng entropy, RFC 6528 TCP ISNs, `AT_RANDOM`), and
-**(8) per-CPU run queues with work-stealing** (home-CPU affinity; kernel tasks
-stolen across cores, user tasks BSP-pinned), **(9) userspace quality-of-life**
-(`chdir`/cwd, `FD_CLOEXEC`, symlinks, `/dev` + `/proc`, a respawning init, and a
-tar package tool), and **(10) a cross toolchain** — `x86_64-vibeos-musl-gcc` +
-a VibeOS sysroot ([toolchain/](toolchain/)) that builds binaries for VibeOS
-directly (its loader, `__vibeos__`, `<vibeos.h>`); `make sysroot` assembles it
-and `/bin/vibehello` is built with it.
+The original ordered backlog — (1) memory correctness + safety, (2) user tasks
+on all cores, (3) signals, (4) dynamic linking, (5) networking, then (6)
+WAN-grade TCP, (7) a ChaCha20 CSPRNG, (8) per-CPU run queues with work-stealing,
+(9) userspace quality-of-life (`chdir`/cwd, `FD_CLOEXEC`, symlinks, `/dev` +
+`/proc`, a respawning init, a tar package tool), and (10) a cross toolchain
+(`x86_64-vibeos-musl-gcc` + sysroot) — is **fully shipped and serial-verified**.
+It all lives in "What works today" now. The ABI was widened alongside (`uname`,
+`clock_gettime`, `getrandom`, real `getsockname`/`getpeername`/`getsockopt`,
+`mkdir`, `lstat`, `symlink`/`readlink`), exercised by the cross-built
+`/bin/abitest`.
 
-The original backlog is now cleared. **ABI widened** since: `uname`,
-`clock_gettime`, `gettimeofday`, `getrandom` (from the CSPRNG), real
-`getsockname`/`getpeername`/`getsockopt`, `mkdir`/`mkdirat`, `lstat`,
-`symlink`/`readlink`, `chdir`, and `fcntl` `F_GETFD`/`F_SETFD`/
-`F_DUPFD_CLOEXEC` — exercised by `/bin/abitest` (itself cross-built). See "What
-works today".
+What remains is small ABI polish plus three larger themes:
 
-**Still open, as opportunity allows:** more `stat`/`fcntl` variants for
-busybox/binutils; threads (`clone`/futex); PIE load base is fixed (no ASLR yet).
+- **Small ABI gaps**, as opportunity allows: more `stat`/`fcntl` variants for
+  busybox/binutils; threads (`clone`/futex); ASLR (PIE load base is fixed).
+- **Config + service-managed init.** A `/config` directory with a simple (YAML)
+  format; kernel services to read, parse, and reload it; a fuller init with a
+  service-definition format, dependency ordering, and logging.
+- **Graphical stack.** A simple windowing system over the framebuffer (`/gui`);
+  USB (EHCI/xHCI) + keyboard/mouse input to drive it.
+- **Audio.** An audio subsystem + virtio-sound.
 
 *Known issue:* unclean-`fsck` drops `/bin/init` on diskutil volumes (workaround =
 clean image per build); root-cause before relying on crash persistence. Other
-backlog: ACPI poweroff; FS journaling/`rename`/permissions.
+backlog: ACPI poweroff; FS journaling / `rename` / permissions.
 
-## Additional features in scope, high level
-** a /config directory with a simple format (yaml) for build and runtime configuration.
-** kernel services for reading, parsing, and reloading these config files
-** A more fully-featured init system with a simple service definition format, dependency management, and logging.
-** Simple windowing system for the framebuffer (in /gui )
-** USB (EHCI/XHCI) + input drivers (keyboard/mouse) for a graphical UI.
-** Audio subsystem + virtio-sound.
 ---
 
 ## How it boots
