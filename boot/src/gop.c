@@ -9,11 +9,12 @@ EFI_STATUS gop_init(FramebufferInfo *fb_out) {
     if (EFI_ERROR(s)) return s;
 
     /*
-     * Pick the highest-resolution mode whose pixel format is a flat
-     * 32-bit BGR or RGB layout. We skip PixelBitMask / PixelBltOnly
-     * modes — they require translation work the kernel doesn't need
-     * during early boot.
+     * Prefer our target resolution (PREF_W x PREF_H) when the firmware offers
+     * it; otherwise fall back to the highest-resolution mode. Only flat 32-bit
+     * BGR/RGB modes are considered — PixelBitMask / PixelBltOnly need translation
+     * the kernel doesn't do during early boot.
      */
+    const UINT32 PREF_W = 1280, PREF_H = 960;
     UINT32 best_mode = gop->Mode->Mode;
     UINT32 best_pixels = gop->Mode->Info->HorizontalResolution
                        * gop->Mode->Info->VerticalResolution;
@@ -21,6 +22,7 @@ EFI_STATUS gop_init(FramebufferInfo *fb_out) {
     int have_linear = (best_fmt == PixelBlueGreenRedReserved8BitPerColor)
                    || (best_fmt == PixelRedGreenBlueReserved8BitPerColor);
     if (!have_linear) best_pixels = 0;
+    UINT32 pref_mode = 0; int pref_found = 0;
 
     for (UINT32 i = 0; i < gop->Mode->MaxMode; i++) {
         EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = 0;
@@ -29,6 +31,9 @@ EFI_STATUS gop_init(FramebufferInfo *fb_out) {
         int linear = (info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)
                   || (info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor);
         if (!linear) continue;
+        if (info->HorizontalResolution == PREF_W && info->VerticalResolution == PREF_H) {
+            pref_mode = i; pref_found = 1;        /* exact match — use it */
+        }
         UINT32 pixels = info->HorizontalResolution * info->VerticalResolution;
         if (pixels > best_pixels) {
             best_pixels = pixels;
@@ -36,6 +41,8 @@ EFI_STATUS gop_init(FramebufferInfo *fb_out) {
             best_fmt = info->PixelFormat;
         }
     }
+
+    if (pref_found) best_mode = pref_mode;
 
     if (best_mode != gop->Mode->Mode) {
         s = gop->SetMode(gop, best_mode);

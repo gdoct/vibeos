@@ -473,6 +473,7 @@ run: $(IMG) $(VDISK)
 	  -device virtio-rng-pci \
 	  -device piix3-usb-uhci,id=uhci \
 	  -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 \
+	  -vga none -device VGA,edid=on,xres=1280,yres=960 \
 	  -monitor unix:/tmp/vibeos-mon.sock,server,nowait \
 	  $(QEMU_DISPLAY) \
 	  -serial stdio
