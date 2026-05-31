@@ -102,8 +102,14 @@ State it owns:
   compositing
 - the **window list in Z-order** (bottom→top), the **focused** window, and the
   window currently being dragged/resized
-- the **cursor** (sprite + screen position from `usb_mouse_get`) and the desktop
-  background / wallpaper
+- the **mouse pointer** — a cursor sprite (an arrow bitmap with a transparent
+  color-key, plus its hotspot) drawn at the `usb_mouse_get` position. It is
+  **always composited last, on top of every window**, so it is never occluded.
+  To move it without smearing, the WM saves the pixels under the cursor before
+  drawing it and restores them next frame (or marks the old + new cursor rects
+  dirty and re-composites them). Showing a pointer that tracks the mouse is the
+  first visible sign of life and a hard requirement of the GUI.
+- the desktop background / wallpaper
 - a **dirty region** so each frame only re-composites what changed
 
 What it does each frame / event:
@@ -162,9 +168,10 @@ create windows and react to events.
 
 1. **In-kernel, single window** — bring `libdraw` + a minimal `libwin` + `libwm`
    up inside the kernel (a `gui` worker task) drawing straight to `fb_device` and
-   polling `usb_mouse_get`. Goal: a draggable window with a button that reacts to
-   clicks, plus the cursor. This proves all three layers end-to-end with the
-   least plumbing.
+   polling `usb_mouse_get`. First milestone: **a mouse pointer rendered on the
+   desktop that tracks the mouse** (proves libdraw + the cursor pipeline); then a
+   draggable window with a button that reacts to clicks. This proves all three
+   layers end-to-end with the least plumbing.
 2. **Userspace clients** — once the model is right, expose the framebuffer (mmap
    a `/dev/fb`) and an input device (`/dev/input`), and let userspace apps link
    `libdraw`/`libwin` and talk to the WM over a small protocol (a pipe or shared
