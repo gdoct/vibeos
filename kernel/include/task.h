@@ -52,6 +52,17 @@ typedef struct task {
     struct task  *wq_next;
     uint64_t      wake_tick;    /* absolute tick deadline for ksleep_ms */
 
+    /* Per-CPU run-queue link + affinity (ROADMAP §3). rq_next threads this task
+       through its home CPU's ready queue; only meaningful when state==READY.
+       home_cpu is the CPU it last ran on — its scheduler re-queues it there, and
+       an idle CPU steals it only when its own queue is empty. */
+    struct task  *rq_next;
+    int           home_cpu;
+    int           bsp_only;     /* user tasks: the ring-3 syscall/tty/pipe/fd path
+                                   is lock-free on the assumption it only runs on
+                                   the BSP, so a task with an address space is
+                                   pinned to CPU 0 and never stolen (ROADMAP §3). */
+
     /* User-process fields (NULL/0 for kernel threads). The scheduler loads
        `vm`'s CR3 on switch; brk_* track the heap; parent/exit_code/child_wq
        feed wait4 (a parent sleeps on child_wq until a child becomes ZOMBIE). */

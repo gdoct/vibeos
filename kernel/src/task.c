@@ -15,18 +15,28 @@
  * Each CPU runs its own scheduler() loop on its boot/AP stack. Tasks never
  * switch directly to each other; they switch to/from the per-CPU scheduler
  * context. A single sched_lock protects all task state (the `state` field,
- * the wait queues, the sleeper list, and each CPU's `current`) and is held
- * *across* every context switch — handed off like a baton: the side that
- * resumes after a switch is responsible for releasing it (task_trampoline /
- * fork_child_return on first run; the scheduler / yielding task otherwise).
+ * the wait queues, the sleeper list, the per-CPU run queues, and each CPU's
+ * `current`) and is held *across* every context switch — handed off like a
+ * baton: the side that resumes after a switch is responsible for releasing it
+ * (task_trampoline / fork_child_return on first run; the scheduler / yielding
+ * task otherwise).
+ *
+ * Run queues (ROADMAP §3): each CPU owns a FIFO of READY tasks. A task is
+ * enqueued on its home CPU (the one it last ran on, for cache affinity); a
+ * scheduler pops its own queue first and only steals from another CPU's queue
+ * when its own is empty. Because the baton lock spans the context switch, a
+ * task on a run queue can never be popped by another CPU before the switch that
+ * saves its rsp has completed — so the lock, not a per-task on_cpu flag, is what
+ * makes cross-CPU stealing safe. (The lock therefore stays global by design;
+ * the win here is O(1) pick + affinity + *explicit* stealing over the old
+ * O(MAX_TASKS) ready-scan, and a much shorter critical section per pick.)
  *
  * Interrupt state is tracked per-CPU (push_off/pop_off, à la xv6 push/popcli)
  * rather than stored in the lock, because the lock crosses context switches —
  * so the IF baton must follow the CPU, not the lock word.
  *
- * Scope: kernel tasks run on any CPU; user tasks are pinned to the BSP, so the
- * ring-3 syscall/IRQ path keeps using one global kernel-stack latch (no swapgs
- * yet). Lifting that is the follow-on.
+ * Scope: kernel and user tasks both run on any CPU (per-CPU TSS/GS + swapgs,
+ * §2), so any ready task is stealable by any core.
  */
 
 #define KSTACK_PAGES   4   /* 16 KiB kernel stack per task */
@@ -48,6 +58,54 @@ static int      g_started = 0;
 /* Per-CPU scheduler state. */
 static uint64_t g_sched_rsp[SMP_MAX_CPUS];   /* the scheduler loop's saved rsp */
 static task_t  *g_cpu_cur[SMP_MAX_CPUS];     /* running task (NULL while in scheduler) */
+
+/* Per-CPU ready queues (ROADMAP §3). A FIFO of READY tasks per CPU, threaded
+   through task->rq_next. All touched only under sched_lock — the same baton that
+   crosses context switches, so a task pushed here can't be popped by another CPU
+   until the switch that saves its rsp completes. The win over the old global
+   array scan: O(1) pick, CPU affinity, and explicit (not incidental) stealing. */
+static task_t  *g_runq_head[SMP_MAX_CPUS];
+static task_t  *g_runq_tail[SMP_MAX_CPUS];
+
+static void runq_push(int cpu, task_t *t) {
+    t->rq_next = nullptr;
+    if (g_runq_tail[cpu]) g_runq_tail[cpu]->rq_next = t;
+    else                  g_runq_head[cpu] = t;
+    g_runq_tail[cpu] = t;
+}
+static task_t *runq_pop(int cpu) {
+    task_t *t = g_runq_head[cpu];
+    if (t) {
+        g_runq_head[cpu] = t->rq_next;
+        if (!g_runq_head[cpu]) g_runq_tail[cpu] = nullptr;
+        t->rq_next = nullptr;
+    }
+    return t;
+}
+
+/* Mark a task READY and enqueue it on a run queue (lock held). User tasks
+   (bsp_only) always go on CPU 0's queue; kernel tasks go on their home CPU. */
+static void enqueue_ready(task_t *t) {
+    t->state = TASK_READY;
+    runq_push(t->bsp_only ? 0 : t->home_cpu, t);
+}
+
+/* Steal the first *kernel* task from `cpu`'s run queue (lock held). User tasks
+   are BSP-pinned, so they are never stolen — we walk past them. */
+static task_t *runq_steal(int cpu) {
+    task_t *prev = nullptr, *t = g_runq_head[cpu];
+    while (t) {
+        if (!t->bsp_only) {
+            if (prev) prev->rq_next = t->rq_next;
+            else      g_runq_head[cpu] = t->rq_next;
+            if (g_runq_tail[cpu] == t) g_runq_tail[cpu] = prev;
+            t->rq_next = nullptr;
+            return t;
+        }
+        prev = t; t = t->rq_next;
+    }
+    return nullptr;
+}
 
 /* Tasks asleep in ksleep, linked through wq_next; under sched_lock. */
 static task_t  *g_sleepers = nullptr;
@@ -128,7 +186,8 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
     for (int j = 0; j < 6; j++) *--sp = 0;
     t->saved_rsp = (uint64_t)sp;
 
-    t->state = TASK_READY;
+    t->home_cpu = smp_cpu_index();    /* created here; stealing rebalances later */
+    enqueue_ready(t);
     int id = t->id;
     sched_unlock();
     kprintf("[sched] task %d \"%s\" entry=%p\n", id, name, (void *)(uintptr_t)entry);
@@ -138,6 +197,7 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
 void task_set_vmspace(struct vmspace *vm) {
     task_t *t = task_current();
     t->vm = vm;
+    if (vm) t->bsp_only = 1;          /* became a user task: pin to the BSP (§3) */
     uint64_t cr3 = vm ? vm->pml4_phys : paging_kernel_pml4();
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
 }
@@ -188,7 +248,9 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     for (int j = 0; j < 6; j++) *--sp = 0;
     t->saved_rsp = (uint64_t)sp;
 
-    t->state = TASK_READY;
+    t->bsp_only = (vm != nullptr);    /* user process: BSP-pinned (§3) */
+    t->home_cpu = 0;
+    enqueue_ready(t);
     int id = t->id, pid = parent->id;
     sched_unlock();
     kprintf("[sched] fork: %d \"%s\" -> child %d\n", pid, parent->name, id);
@@ -209,15 +271,18 @@ static void apply_task_mm(task_t *t) {
     if (t->vm) wrmsr(MSR_FS_BASE, t->fs_base);   /* restore this task's TLS base */
 }
 
-/* Pick a READY task. Since §2 user tasks run on any core (per-CPU TSS/GS), so
-   any CPU may pick any ready task — the single global run queue gives implicit
-   work-stealing (an idle core pulls whatever is runnable). */
+/* Pick a READY task for CPU `cpu`: prefer this CPU's own run queue (warm cache),
+   and only when it is empty steal one ready task from another CPU's queue
+   (explicit work-stealing, ROADMAP §3). §2 user tasks run on any core, so any
+   task is stealable. Lock held. */
 static task_t *pick_ready(int cpu) {
-    (void)cpu;
-    for (int i = 1; i < MAX_TASKS; i++) {
-        task_t *t = &g_tasks[i];
-        if (t->state != TASK_READY) continue;
-        return t;
+    task_t *t = runq_pop(cpu);
+    if (t) return t;
+    int n = smp_cpu_count();
+    for (int i = 1; i < n; i++) {                 /* scan the other CPUs in order */
+        int victim = (cpu + i) % n;
+        t = runq_steal(victim);                   /* steals kernel tasks only */
+        if (t) return t;
     }
     return nullptr;
 }
@@ -239,6 +304,7 @@ void scheduler(void) {
         task_t *t = pick_ready(c);
         if (t) {
             t->state = TASK_RUNNING;
+            t->home_cpu = c;          /* re-home to where it last ran (affinity) */
             g_cpu_cur[c] = t;
             apply_task_mm(t);
             context_switch(&g_sched_rsp[c], t->saved_rsp);  /* run t (lock held) */
@@ -264,7 +330,7 @@ void task_yield(void) {
     if (!g_started) return;
     sched_lock();
     task_t *t = g_cpu_cur[smp_cpu_index()];
-    if (t) t->state = TASK_READY;
+    if (t) enqueue_ready(t);          /* back on this CPU's queue, then yield */
     sched();
     sched_unlock();
 }
@@ -280,7 +346,7 @@ void task_exit(void) {
 
 /* wait-queue internals (assume sched_lock held). */
 static void make_ready_locked(task_t *t) {
-    if (t->state == TASK_BLOCKED) t->state = TASK_READY;
+    if (t->state == TASK_BLOCKED) enqueue_ready(t);
 }
 static void wq_sleep_locked(wait_queue_t *wq) {
     task_t *t = g_cpu_cur[smp_cpu_index()];
@@ -359,7 +425,7 @@ void task_cont(task_t *t) {
     sched_lock();
     if (t->stopped) {
         t->stopped = 0;
-        if (t->state == TASK_BLOCKED) t->state = TASK_READY;
+        if (t->state == TASK_BLOCKED) enqueue_ready(t);
     }
     sched_unlock();
 }
@@ -435,15 +501,15 @@ void task_tick(void) {
     while (*pp) {
         task_t *t = *pp;
         if (t->state == TASK_BLOCKED && t->wake_tick <= now) {
-            *pp = t->wq_next; t->wq_next = nullptr; t->state = TASK_READY;
+            *pp = t->wq_next; t->wq_next = nullptr; enqueue_ready(t);
         } else {
             pp = &t->wq_next;
         }
     }
     task_t *cur = g_cpu_cur[smp_cpu_index()];
     if (cur && cur->state == TASK_RUNNING) {
-        cur->state = TASK_READY;
-        sched();                      /* preempt; resumes here when rescheduled */
+        enqueue_ready(cur);           /* re-queue on this CPU, then preempt */
+        sched();                      /* resumes here when rescheduled */
     }
     sched_unlock();
 }

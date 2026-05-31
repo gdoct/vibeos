@@ -78,6 +78,7 @@ KERNEL_CFLAGS = \
 	-Iboot/include \
 	-O2 \
 	-Wall -Wextra -Wno-unused-parameter \
+	-MMD -MP \
 	-std=c++17
 
 KERNEL_LDFLAGS = \
@@ -128,6 +129,11 @@ KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/
 KERNEL_C_OBJS = $(KERNEL_C_SRCS:kernel/src/%.c=kernel/build/%.o)
 KERNEL_S_OBJS = $(KERNEL_S_SRCS:kernel/src/%.S=kernel/build/%.o)
 KERNEL_OBJS   = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS)
+
+# Header-dependency tracking (-MMD): a change to a .h recompiles every .c that
+# includes it. Without this, editing a struct in a header silently leaves stale
+# .o files with the old layout — a brutal class of bug.
+-include $(KERNEL_C_OBJS:.o=.d)
 
 KERNEL_ELF = kernel/build/kernel.elf
 

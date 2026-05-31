@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "regs.h"
 #include "task.h"
+#include "smp.h"
 #include "paging.h"
 #include "signal.h"
 
@@ -85,6 +86,9 @@ void exception_handler(regs_t *r) {
     kprintf("   rbp=%016lx  r8=%016lx  r9=%016lx\n", r->rbp, r->r8,  r->r9);
     kprintf("   r10=%016lx r11=%016lx r12=%016lx\n", r->r10, r->r11, r->r12);
     kprintf("   r13=%016lx r14=%016lx r15=%016lx\n", r->r13, r->r14, r->r15);
+    { task_t *ct = task_current();
+      kprintf("   cpu=%d cur=%d \"%s\" vm=%p\n", smp_cpu_index(),
+              ct ? ct->id : -1, ct ? ct->name : "?", ct ? (void*)ct->vm : (void*)0); }
 
     panic("unhandled exception");
 }

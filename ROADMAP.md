@@ -21,10 +21,16 @@ Detail lives in the code and git history; this file is the map, not the manual.
   per-CPU 100 Hz timers) ([apic.c](kernel/src/apic.c), [idt.c](kernel/src/idt.c)).
 - **SMP** — AP bringup via INIT-SIPI-SIPI ([smp.c](kernel/src/smp.c)); xv6-style
   scheduler with one `sched_lock` baton held across switches
-  ([task.c](kernel/src/task.c)). **User tasks run on every core**: per-CPU TSS +
-  GS base with `swapgs` on syscall/IRQ entry ([percpu.c](kernel/src/percpu.c),
+  ([task.c](kernel/src/task.c)). Per-CPU TSS + GS base with `swapgs` on
+  syscall/IRQ entry ([percpu.c](kernel/src/percpu.c),
   [usermode.S](kernel/src/usermode.S), [isr.S](kernel/src/isr.S)); APs enable
   SYSCALL + SSE. Cross-CPU IPIs + TLB shootdown ([apic.c](kernel/src/apic.c)).
+  **Per-CPU run queues with work-stealing** (ROADMAP §3): each CPU owns a FIFO of
+  ready tasks (home-CPU affinity), and an idle core steals a *kernel* task from a
+  busy core's queue — O(1) pick + a much shorter critical section than the old
+  global ready-scan. **Kernel tasks run on every core; user tasks are pinned to
+  the BSP** — the ring-3 syscall / tty-line / pipe / fd-table paths are
+  deliberately lock-free on that assumption, so user tasks are never stolen.
 - **Memory** — own 4-level paging + direct map + guarded kstacks
   ([paging.c](kernel/src/paging.c)); bump+freelist PMM; slab/large kmalloc.
   **Copy-on-write fork** with per-page refcounts; **validated `copy_to/from_user`**
@@ -88,20 +94,17 @@ validation, kstack reclamation, guarded stacks), (2) user tasks on all cores
 (`ET_DYN` + `ld-musl`, file-backed `mmap`), and (5) networking (virtio-net +
 ARP/IP/ICMP/UDP/TCP + BSD sockets + ported `wget`) — are **all shipped** and
 serial-verified, as are **(6) WAN-grade TCP** (send buffer, RTO/RTT, congestion
-control, reassembly, delayed/dup ACKs, TIME-WAIT) and **(7) a ChaCha20 CSPRNG**
-(RDRAND + jitter + virtio-rng entropy, RFC 6528 TCP ISNs, `AT_RANDOM`). See
-"What works today". What remains, ordered:
+control, reassembly, delayed/dup ACKs, TIME-WAIT), **(7) a ChaCha20 CSPRNG**
+(RDRAND + jitter + virtio-rng entropy, RFC 6528 TCP ISNs, `AT_RANDOM`), and
+**(8) per-CPU run queues with work-stealing** (home-CPU affinity; kernel tasks
+stolen across cores, user tasks BSP-pinned). See "What works today". What
+remains, ordered:
 
-**1. Per-CPU run queues + work-stealing.** Today one global run queue under the
-`sched_lock` baton serves every core (an idle CPU pulls any ready task — implicit
-work-stealing, but the single lock is the scalability ceiling). Split into
-per-CPU queues with explicit stealing once contention matters.
-
-**2. Userspace quality-of-life.** `chdir`/cwd, symlinks, `FD_CLOEXEC`; a tiny
+**1. Userspace quality-of-life.** `chdir`/cwd, symlinks, `FD_CLOEXEC`; a tiny
 `/proc` (pid dirs + `stat`) and `/dev` (`null`/`zero`/`tty`/`random`); a real
 (small) init that respawns the shell; a package format (tar + VibeFS metadata).
 
-**3. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
+**2. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
 `gcc`/`clang` build for VibeOS directly instead of repurposing host musl.
 
 **Also widening the ABI toward busybox/binutils** as opportunity allows (more
