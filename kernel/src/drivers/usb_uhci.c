@@ -6,6 +6,7 @@
 #include "task.h"
 #include "timer.h"
 #include "tty.h"
+#include "fb.h"
 
 /*
  * UHCI (USB 1.1) host controller + USB HID boot-protocol driver (ROADMAP:
@@ -222,14 +223,15 @@ static void kbd_report(hid_dev_t *h, const uint8_t *r) {
 /* Accumulated mouse state, exported for a future GUI (usb_mouse_get). The
    pointer is clamped to a virtual screen; a GUI consumer can rebind the bounds. */
 static volatile int g_mx = 512, g_my = 384, g_mbtn;
-#define MOUSE_W 1024
-#define MOUSE_H 768
 
 static void mouse_report(const uint8_t *r) {
     int8_t dx = (int8_t)r[1], dy = (int8_t)r[2];
     g_mx += dx; g_my += dy;
-    if (g_mx < 0) g_mx = 0; else if (g_mx >= MOUSE_W) g_mx = MOUSE_W - 1;
-    if (g_my < 0) g_my = 0; else if (g_my >= MOUSE_H) g_my = MOUSE_H - 1;
+    int mw = 1024, mh = 768;                     /* clamp to the framebuffer, if any */
+    fb_device_t *fb = fb_get();
+    if (fb) { mw = (int)fb->width; mh = (int)fb->height; }
+    if (g_mx < 0) g_mx = 0; else if (g_mx >= mw) g_mx = mw - 1;
+    if (g_my < 0) g_my = 0; else if (g_my >= mh) g_my = mh - 1;
     int btn = r[0] & 7;
     if (btn != g_mbtn) {                         /* log button transitions only */
         kprintf("[mouse] x=%d y=%d buttons=%c%c%c\n", g_mx, g_my,

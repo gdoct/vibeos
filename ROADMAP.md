@@ -48,6 +48,16 @@ Detail lives in the code and git history; this file is the map, not the manual.
   framebuffer; serial TTY backing `read(0)`. **VibeFS** ([fs.c](kernel/src/fs.c)) —
   writable, crash-safe ordered writes + `fsck`, 4 KiB blocks, triple-indirect +
   64-bit size.
+- **GUI** (graphics/graphics.md, phase 1) — a strictly-layered framebuffer
+  windowing stack: **libdraw** ([gui_draw.c](kernel/src/gui_draw.c)) — surfaces +
+  clipped primitives (rects, lines, blit, color-keyed blit, bitmap text);
+  **libwin** ([gui_win.c](kernel/src/gui_win.c)) — windows with chrome (title
+  bar/border) + button/label widgets + hit-testing; **libwm**
+  ([gui_wm.c](kernel/src/gui_wm.c)) — a desktop compositor (back buffer, window
+  Z-order, raise/focus, **a mouse pointer that tracks the USB mouse**, title-bar
+  drag, click routing) in a `guiwm` worker. A demo window (draggable, with a
+  click-counting button) ships on the desktop. Verified on QEMU: a `screendump`
+  confirms the cursor + window pixels, and a self-test confirms drag + click.
 - **USB input** (ROADMAP) — a **UHCI** host-controller driver
   ([usb_uhci.c](kernel/src/drivers/usb_uhci.c)): frame-list schedule of queue
   heads + transfer descriptors in DMA memory, device enumeration over endpoint 0
@@ -165,11 +175,13 @@ What remains:
   per-service file logging, and a `sysconf services` view) are shipped. What's
   left of this theme is socket-/timer-activated services and shell I/O redirection
   (`>`/`<`/`2>` — the kernel now supports it; the shell doesn't parse it yet).
-- **Graphical stack.** USB **keyboard + mouse input are done** (UHCI HID, see
-  "What works today"); what remains here is the GUI itself — a 2D draw library
-  and a simple windowing system over the framebuffer (`/gui`), consuming
-  `usb_mouse_get` + the keyboard. (A modern xHCI/EHCI controller and USB hub
-  support are optional follow-ons; UHCI already drives the HID devices.)
+- **Graphical stack.** Phase 1 is up — libdraw + libwin + libwm with a
+  mouse-tracking pointer, a draggable window, and a clickable button (see "What
+  works today"). What remains: route the **keyboard to the focused window**
+  (today it still goes to the TTY); real widgets (textbox/menus), a taskbar +
+  launcher, and moving the stack to **userspace clients** over an mmap'd
+  `/dev/fb` + `/dev/input` (graphics/graphics.md phase 2). Optional: xHCI/EHCI +
+  USB hub support (UHCI already drives the HID devices).
 - **Audio.** An audio subsystem + virtio-sound.
 
 *Known issue:* unclean-`fsck` drops `/bin/init` on diskutil volumes (workaround =

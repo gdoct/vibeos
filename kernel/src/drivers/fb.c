@@ -83,3 +83,6 @@ fb_device_t *fb_init(const FramebufferInfo *info) {
     device_register(&g_fb.dev);
     return &g_fb;
 }
+
+/* The primary framebuffer, or NULL before fb_init (used by the GUI). */
+fb_device_t *fb_get(void) { return g_fb.base ? &g_fb : (fb_device_t *)0; }

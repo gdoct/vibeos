@@ -15,6 +15,7 @@
 #include "net.h"
 #include "csprng.h"
 #include "config.h"
+#include "gui.h"
 #include "usermode.h"
 #include "percpu.h"
 #include "../../boot/include/bootinfo.h"
@@ -280,6 +281,7 @@ extern "C" void kmain(BootInfo *bi) {
     sched_init();
     net_init();           /* probe virtio-net + start the net worker (ROADMAP §5) */
     usb_init();           /* probe UHCI + start the USB HID worker (keyboard/mouse) */
+    gui_init();           /* framebuffer compositor + window manager (ROADMAP: GUI) */
     create_initial_tasks();
     smp_init();
     smp_ipi_selftest();   /* verify the cross-CPU IPI path (ROADMAP §2) */

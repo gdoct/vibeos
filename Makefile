@@ -14,6 +14,10 @@ CC      := g++
 LD      := ld
 QEMU    ?= qemu-system-x86_64
 OVMF    ?= /usr/share/OVMF/OVMF_CODE_4M.fd
+# Display backend. Default is QEMU's own window so you can see + use the GUI;
+# override with `make run QEMU_DISPLAY=-display\ none` on a headless host (the
+# framebuffer still exists for `screendump` over the monitor socket).
+QEMU_DISPLAY ?=
 
 # --- Bootloader (UEFI PE32+) ---
 
@@ -114,6 +118,9 @@ KERNEL_C_SRCS = \
 	kernel/src/random.c \
 	kernel/src/csprng.c \
 	kernel/src/config.c \
+	kernel/src/gui_draw.c \
+	kernel/src/gui_win.c \
+	kernel/src/gui_wm.c \
 	kernel/src/file.c \
 	kernel/src/pipe.c \
 	kernel/src/synth.c \
@@ -410,6 +417,7 @@ run: $(IMG) $(VDISK)
 	  -device piix3-usb-uhci,id=uhci \
 	  -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 \
 	  -monitor unix:/tmp/vibeos-mon.sock,server,nowait \
+	  $(QEMU_DISPLAY) \
 	  -serial stdio
 
 clean:

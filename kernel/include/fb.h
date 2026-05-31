@@ -29,6 +29,9 @@ typedef struct fb_device {
 /* Initialise the primary framebuffer from BootInfo and register it. */
 fb_device_t *fb_init(const FramebufferInfo *info);
 
+/* The primary framebuffer, or NULL before fb_init. */
+fb_device_t *fb_get(void);
+
 /* Pack an RGB triple into the format of the given device. */
 uint32_t fb_rgb(const fb_device_t *fb, uint8_t r, uint8_t g, uint8_t b);
 
