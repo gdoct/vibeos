@@ -64,10 +64,18 @@ Detail lives in the code and git history; this file is the map, not the manual.
   `/bin/ftest`, `/bin/pipetest`, `/bin/sigtest`, `/bin/nettest`). Syscalls: TLS
   (`arch_prctl`), anon + file `mmap`/`munmap`/`mprotect`, `read`/`write`/`writev`,
   `brk`, `nanosleep`, signals, sockets; **file I/O over a per-process fd table** —
-  `open`/`openat`/`close`/`lseek`/`stat`/`lstat`/`fstat`/`getdents64`/`getcwd`/
-  `chdir`/`fcntl`/`dup`/`dup2`/`mkdir`/`symlink`/`readlink`
-  ([file.c](kernel/src/file.c)); **`pipe`/`pipe2`**
-  ([pipe.c](kernel/src/pipe.c)); `fork`/`execve`/`wait4`/`exit`.
+  `open`/`openat`/`close`/`lseek`/`stat`/`lstat`/`statx`/`fstat`/`getdents64`/
+  `getcwd`/`chdir`/`access`/`faccessat`/`fcntl`/`dup`/`dup2`/`mkdir`/`symlink`/
+  `readlink` ([file.c](kernel/src/file.c)); **`pipe`/`pipe2`**
+  ([pipe.c](kernel/src/pipe.c)); `fork`/`execve`/`wait4`/`exit`;
+  `uname`/`clock_gettime`/`getrandom`/`getsockname`. **ASLR** (ROADMAP) — a
+  per-execve CSPRNG slide on the PIE image, dynamic linker, stack, and mmap
+  arena.
+- **Threads** (ROADMAP) — `clone(CLONE_VM|CLONE_FILES|CLONE_THREAD|CLONE_SETTLS
+  |CLONE_*_TID)` over a refcounted address space + descriptor table, `futex`
+  (WAIT/WAKE), `gettid`/`tgid`, and `CHILD_CLEARTID` for `pthread_join`. Runs
+  unmodified **musl pthreads** ([user/musl/threadtest.c](user/musl/threadtest.c):
+  4 threads × 20 000 mutex-guarded increments join to an exact total).
 - **Userspace quality-of-life** (ROADMAP §4) — a per-process **cwd** (`chdir`/
   `getcwd`, `./`–`../`–normalizing path resolution); **`FD_CLOEXEC`** tracked
   per-descriptor and enforced by `execve`; **symlinks** in VibeFS (new
@@ -114,16 +122,19 @@ It all lives in "What works today" now. The ABI was widened alongside (`uname`,
 `mkdir`, `lstat`, `symlink`/`readlink`), exercised by the cross-built
 `/bin/abitest`.
 
-What remains is small ABI polish plus three larger themes:
+The "small ABI gaps" are now closed too: **ASLR**, **threads** (`clone`/`futex`/
+pthreads), and the `statx` / `access` / fcntl-lock variants all shipped above.
+What remains:
 
-- **Small ABI gaps**, as opportunity allows: more `stat`/`fcntl` variants for
-  busybox/binutils; threads (`clone`/futex); ASLR (PIE load base is fixed).
+- **Remaining ABI polish**, as opportunity allows: tear down sibling threads on
+  `exec`/`exit_group` (today join-before-exit is assumed); robust-futex
+  ownership; `clock_nanosleep`/`ppoll`; signals targeted at a specific thread.
 - **Config + service-managed init.** A `/config` directory with a simple (YAML)
   format; kernel services to read, parse, and reload it; a fuller init with a
   service-definition format, dependency ordering, and logging.
 - **Graphical stack.** A simple windowing system over the framebuffer (`/gui`);
   USB (EHCI/xHCI) + keyboard/mouse input to drive it.
-- **Audio.** An audio subsystem + virtio-sound.
+- **Audio.** An audio subsystem + virtio-sound. 
 
 *Known issue:* unclean-`fsck` drops `/bin/init` on diskutil volumes (workaround =
 clean image per build); root-cause before relying on crash persistence. Other
