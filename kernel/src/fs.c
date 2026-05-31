@@ -475,27 +475,60 @@ static int dir_empty(inode_t *dir) {
 
 /* --------------------------------------------------------------------- paths */
 
-/* Resolve an absolute path to an inode number, or 0 if any component is missing
-   or a non-final component is not a directory. */
-static uint32_t path_resolve(const char *path) {
-    if (!path || path[0] != '/') return 0;
-    uint32_t ino = g.sb.root_inode;
-    const char *p = path + 1;
+#define FS_SYMLINK_MAX  8       /* max symlinks followed in one resolution */
+
+/* Walk `p` (relative, components separated by '/') starting at directory inode
+   `ino`, following symlinks. A symlink in a non-final position is always
+   followed; a final symlink is followed only if `follow_final`. `.`/`..` resolve
+   naturally because every directory carries them as real entries. Returns the
+   inode number, or 0 on a missing/!dir component or a symlink loop. */
+static uint32_t resolve_from(uint32_t ino, const char *p, int follow_final, int depth) {
+    if (depth > FS_SYMLINK_MAX) return 0;
+    while (*p == '/') p++;
     while (*p) {
         const char *start = p;
         while (*p && *p != '/') p++;
         uint32_t nlen = (uint32_t)(p - start);
-        if (nlen > 0) {
-            inode_t dir;
-            inode_read(ino, &dir);
-            if (dir.type != FT_DIR) return 0;
-            uint32_t child = dir_lookup(&dir, start, nlen);
-            if (!child) return 0;
+        while (*p == '/') p++;
+        int is_final = (*p == 0);
+        if (nlen == 0) continue;
+
+        inode_t dir;
+        inode_read(ino, &dir);
+        if (dir.type != FT_DIR) return 0;
+        uint32_t child = dir_lookup(&dir, start, nlen);
+        if (!child) return 0;
+
+        inode_t ci;
+        inode_read(child, &ci);
+        if (ci.type == FT_SYMLINK && (!is_final || follow_final)) {
+            char target[256];
+            uint32_t tlen = ci.size < sizeof target - 1 ? (uint32_t)ci.size : sizeof target - 1;
+            uint32_t b0 = bmap(&ci, 0, 0);
+            if (b0) { uint8_t tb[FS_BLOCK_SIZE]; bread(b0, tb); kmemcpy(target, tb, tlen); }
+            else tlen = 0;
+            target[tlen] = '\0';
+            uint32_t base = (target[0] == '/') ? g.sb.root_inode : ino;  /* containing dir */
+            uint32_t tino = resolve_from(base, target, 1, depth + 1);
+            if (!tino) return 0;
+            ino = tino;                          /* continue walk from the target */
+        } else {
             ino = child;
         }
-        while (*p == '/') p++;
     }
     return ino;
+}
+
+/* Resolve an absolute path to an inode number (follows a final symlink), or 0. */
+static uint32_t path_resolve(const char *path) {
+    if (!path || path[0] != '/') return 0;
+    return resolve_from(g.sb.root_inode, path + 1, 1, 0);
+}
+
+/* Like path_resolve but does not follow a trailing symlink (for lstat/readlink). */
+static uint32_t path_lresolve(const char *path) {
+    if (!path || path[0] != '/') return 0;
+    return resolve_from(g.sb.root_inode, path + 1, 0, 0);
 }
 
 /* Split a path into (parent inode, final component). On success *parent is the
@@ -1038,6 +1071,63 @@ int fs_resolve(const char *path) {
     uint32_t ino = path_resolve(path);
     if (!ino) return FS_ENOENT;
     return (int)ino;
+}
+
+int fs_lresolve(const char *path) {
+    if (!g.mounted) return FS_EINVAL;
+    uint32_t ino = path_lresolve(path);
+    if (!ino) return FS_ENOENT;
+    return (int)ino;
+}
+
+/* Create a symbolic link at `linkpath` whose target is `target`. The target
+   string is stored as the link inode's file data (crash-safe order: data ->
+   inode -> dirent), so a symlink is just a small file of type FT_SYMLINK. */
+int fs_symlink(const char *target, const char *linkpath) {
+    if (!g.mounted) return FS_EINVAL;
+    uint32_t tlen = (uint32_t)kstrlen(target);
+    if (tlen == 0 || tlen >= FS_BLOCK_SIZE) return FS_EINVAL;
+
+    uint32_t parent, nlen;
+    const char *name;
+    int r = path_parent(linkpath, &parent, &name, &nlen);
+    if (r != FS_OK) return r;
+
+    inode_t pdir;
+    inode_read(parent, &pdir);
+    if (pdir.type != FT_DIR) return FS_ENOTDIR;
+    if (dir_lookup(&pdir, name, nlen)) return FS_EEXIST;
+
+    uint32_t ino = inode_alloc(FT_SYMLINK);
+    if (!ino) return FS_ENOSPC;
+    inode_t in;
+    inode_read(ino, &in);
+    uint32_t b = bmap(&in, 0, 1);                    /* one data block for the target */
+    if (!b) { inode_free(ino, &in); flush_meta(); return FS_ENOSPC; }
+    uint8_t buf[FS_BLOCK_SIZE];
+    kmemset(buf, 0, sizeof buf);
+    kmemcpy(buf, target, tlen);
+    bwrite(b, buf);
+    in.size = tlen;
+    in.links = 1;
+    inode_write(ino, &in);                           /* inode before dirent */
+
+    r = dir_add(parent, &pdir, name, nlen, ino, FT_SYMLINK);
+    if (r != FS_OK) { inode_free(ino, &in); flush_meta(); return r; }
+    flush_meta();
+    return FS_OK;
+}
+
+int fs_readlink(uint32_t ino, char *buf, uint32_t bufsz) {
+    if (!g.mounted) return FS_EINVAL;
+    inode_t in;
+    inode_read(ino, &in);
+    if (in.type != FT_SYMLINK) return FS_EINVAL;
+    uint32_t n = in.size < bufsz ? (uint32_t)in.size : bufsz;
+    uint32_t b0 = bmap(&in, 0, 0);
+    if (b0) { uint8_t tb[FS_BLOCK_SIZE]; bread(b0, tb); kmemcpy(buf, tb, n); }
+    else n = 0;
+    return (int)n;
 }
 
 int fs_istat(uint32_t ino, fs_stat_t *out) {

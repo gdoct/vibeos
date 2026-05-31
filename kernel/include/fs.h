@@ -29,6 +29,7 @@ extern "C" {
 #define FT_NONE         0
 #define FT_REG          1              /* regular file */
 #define FT_DIR          2              /* directory */
+#define FT_SYMLINK      3              /* symbolic link (target stored as data) */
 
 /* Block-pointer geometry of an inode.
  *
@@ -155,8 +156,11 @@ typedef struct {
     uint32_t ctime, mtime;   /* timer ticks (100 Hz) */
 } fs_stat_t;
 
-int fs_resolve(const char *path);                    /* inode number (>0) or FS errno */
+int fs_resolve(const char *path);                    /* inode number (>0) or FS errno; follows symlinks */
+int fs_lresolve(const char *path);                   /* like fs_resolve but does NOT follow a final symlink */
 int fs_istat  (uint32_t ino, fs_stat_t *out);
+int fs_symlink(const char *target, const char *linkpath);   /* create a symlink */
+int fs_readlink(uint32_t ino, char *buf, uint32_t bufsz);   /* read a symlink target (no NUL); bytes or FS errno */
 int fs_truncate_ino(uint32_t ino);                   /* drop to zero length */
 int fs_pread  (uint32_t ino, uint64_t off, void *buf, uint32_t n);
 int fs_pwrite (uint32_t ino, uint64_t off, const void *buf, uint32_t n);

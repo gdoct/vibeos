@@ -50,6 +50,17 @@ static long sys_getdents64(int fd, void *buf, unsigned long n) {
                      : "a"(217L), "D"((long)fd), "S"(buf), "d"(n) : "rcx", "r11", "memory");
     return r;
 }
+static long sys_symlink(const char *target, const char *link) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(88L), "D"(target), "S"(link) : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_readlink(const char *path, char *buf, unsigned long n) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r)
+                     : "a"(89L), "D"(path), "S"(buf), "d"(n) : "rcx", "r11", "memory");
+    return r;
+}
 static long sys_fork(void) {
     long r;
     __asm__ volatile("syscall" : "=a"(r) : "a"(57L) : "rcx", "r11", "memory");
@@ -117,7 +128,7 @@ int main(void) {
 
         if (streq(argv[0], "exit")) { puts1("bye\n"); sys_exit(0); }
         if (streq(argv[0], "help")) {
-            puts1("builtins: help, exit, cd, pwd, echo, cat, ls\n"
+            puts1("builtins: help, exit, cd, pwd, echo, cat, ls, ln -s, readlink\n"
                   "run a program by name (hello) or path (/bin/hello)\n");
             continue;
         }
@@ -129,6 +140,20 @@ int main(void) {
         if (streq(argv[0], "pwd")) {
             char cwd[256];
             if (sys_getcwd(cwd, sizeof cwd) >= 0) { puts1(cwd); puts1("\n"); }
+            continue;
+        }
+        if (streq(argv[0], "ln")) {                  /* ln -s target link */
+            if (argc == 4 && streq(argv[1], "-s")) {
+                if (sys_symlink(argv[2], argv[3]) < 0) puts1("ln: symlink failed\n");
+            } else puts1("usage: ln -s target link\n");
+            continue;
+        }
+        if (streq(argv[0], "readlink")) {
+            if (argc > 1) {
+                char tgt[256]; long m = sys_readlink(argv[1], tgt, sizeof tgt - 1);
+                if (m >= 0) { tgt[m] = 0; puts1(tgt); puts1("\n"); }
+                else puts1("readlink: not a symlink\n");
+            }
             continue;
         }
         if (streq(argv[0], "echo")) {

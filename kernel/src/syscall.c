@@ -63,6 +63,8 @@ extern "C" void syscall_entry(void);
 #define ENOSYS_     38
 #define EFAULT_     14
 #define EPIPE_      32
+#define EACCES_     13
+#define EEXIST_     17
 
 /* The current user task's address space — the target for all copy_*_user
    validation. Kernel threads have no vm and never reach the user-pointer paths. */
@@ -91,6 +93,7 @@ static inline vmspace_t *cur_vm(void) { return task_current()->vm; }
 #define S_IFREG  0100000
 #define S_IFCHR  0020000
 #define S_IFIFO  0010000
+#define S_IFLNK  0120000
 #define DT_DIR   4
 #define DT_REG   8
 #define DT_CHR   2
@@ -548,8 +551,9 @@ static void fill_stat(struct linux_stat *st, uint32_t ino, const fs_stat_t *s) {
     st->st_dev   = 1;
     st->st_ino   = ino;
     st->st_nlink = s->links;
-    int dir = (s->type == FT_DIR);
-    st->st_mode  = (dir ? S_IFDIR | 0755 : S_IFREG | 0644);
+    st->st_mode  = (s->type == FT_DIR)     ? (S_IFDIR | 0755)
+                 : (s->type == FT_SYMLINK) ? (S_IFLNK | 0777)
+                                           : (S_IFREG | 0644);
     st->st_size  = (int64_t)s->size;
     st->st_blksize = FS_BLOCK_SIZE;
     st->st_blocks  = (int64_t)((s->size + 511) / 512);
@@ -688,8 +692,9 @@ static int64_t sys_fstat(int fd, struct linux_stat *st) {
     return 0;
 }
 
-/* Fill `out` for a path; the caller copies it to user space. */
-static int64_t pathstat_k(const char *upath, struct linux_stat *out) {
+/* Fill `out` for a path; the caller copies it to user space. `follow` chooses
+   stat (follow a trailing symlink) vs lstat (return the symlink itself). */
+static int64_t pathstat_k2(const char *upath, struct linux_stat *out, int follow) {
     char path[256];
     resolve_path(path, sizeof path, upath);
     int sc = synth_classify(path, nullptr);
@@ -698,12 +703,49 @@ static int64_t pathstat_k(const char *upath, struct linux_stat *out) {
         fill_stat_synth(out, sc == SYNTH_DIR, sc == SYNTH_NODE && is_char);
         return 0;
     }
-    int ino = fs_resolve(path);
+    int ino = follow ? fs_resolve(path) : fs_lresolve(path);
     if (ino < 0) return fs_to_errno(ino);
     fs_stat_t s;
     if (fs_istat((uint32_t)ino, &s) != FS_OK) return -ENOENT_;
     fill_stat(out, (uint32_t)ino, &s);
     return 0;
+}
+static int64_t pathstat_k(const char *upath, struct linux_stat *out) {
+    return pathstat_k2(upath, out, 1);           /* default: follow symlinks */
+}
+
+/* mkdir(path, mode): create a directory (mode ignored — no perms yet). */
+static int64_t sys_mkdir(const char *upath, int mode) {
+    (void)mode;
+    char path[256];
+    resolve_path(path, sizeof path, upath);
+    if (synth_classify(path, nullptr) != SYNTH_NONE) return -EEXIST_;
+    int r = fs_mkdir(path);
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
+/* symlink(target, linkpath): create a symbolic link (ROADMAP §4). */
+static int64_t sys_symlink(const char *utarget, const char *ulink) {
+    char target[256], link[256];
+    copy_user_str(target, utarget, sizeof target);
+    resolve_path(link, sizeof link, ulink);
+    if (synth_classify(link, nullptr) != SYNTH_NONE) return -EACCES_;  /* /dev,/proc are read-only */
+    int r = fs_symlink(target, link);
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
+/* readlink(path, buf, bufsz): read a symlink's target (no NUL terminator). */
+static int64_t sys_readlink(const char *upath, char *ubuf, uint64_t bufsz) {
+    char path[256];
+    resolve_path(path, sizeof path, upath);
+    int ino = fs_lresolve(path);
+    if (ino < 0) return fs_to_errno(ino);
+    char tmp[256];
+    int r = fs_readlink((uint32_t)ino, tmp, sizeof tmp);
+    if (r < 0) return r == FS_EINVAL ? -EINVAL_ : fs_to_errno(r);
+    uint32_t n = (uint32_t)r < bufsz ? (uint32_t)r : (uint32_t)bufsz;
+    if (n && copy_to_user(cur_vm(), (uint64_t)(uintptr_t)ubuf, tmp, n) < 0) return -EFAULT_;
+    return (int64_t)n;
 }
 
 static int64_t sys_newfstatat(int dirfd, const char *upath,
@@ -726,6 +768,14 @@ static int64_t sys_newfstatat(int dirfd, const char *upath,
 static int64_t sys_stat(const char *upath, struct linux_stat *st) {
     struct linux_stat ks;
     int64_t r = pathstat_k(upath, &ks);
+    if (r < 0) return r;
+    if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)st, &ks, sizeof ks) < 0) return -EFAULT_;
+    return 0;
+}
+
+static int64_t sys_lstat(const char *upath, struct linux_stat *st) {
+    struct linux_stat ks;
+    int64_t r = pathstat_k2(upath, &ks, 0);      /* do not follow a trailing symlink */
     if (r < 0) return r;
     if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)st, &ks, sizeof ks) < 0) return -EFAULT_;
     return 0;
@@ -1083,8 +1133,8 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 4:   return (uint64_t)sys_stat((const char *)f->rdi,
                                         (struct linux_stat *)f->rsi);  /* stat */
     case 5:   return (uint64_t)sys_fstat((int)f->rdi, (struct linux_stat *)f->rsi); /* fstat */
-    case 6:   return (uint64_t)sys_stat((const char *)f->rdi,
-                                        (struct linux_stat *)f->rsi);  /* lstat (no symlinks) */
+    case 6:   return (uint64_t)sys_lstat((const char *)f->rdi,
+                                        (struct linux_stat *)f->rsi);  /* lstat */
     case 8:   return (uint64_t)sys_lseek((int)f->rdi, (int64_t)f->rsi, (int)f->rdx); /* lseek */
     case 9:   return (uint64_t)sys_mmap(f->rdi, f->rsi, (int)f->rdx, (int)f->r10,
                                         (int)f->r8, f->r9);            /* mmap */
@@ -1129,7 +1179,11 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 186: return (uint64_t)task_current()->id;             /* gettid (== pid, no threads) */
     case 79:  return (uint64_t)sys_getcwd((char *)f->rdi, f->rsi);  /* getcwd */
     case 80:  return (uint64_t)sys_chdir((const char *)f->rdi);     /* chdir */
-    case 89:  return (uint64_t)(int64_t)-EINVAL_;              /* readlink: no symlinks */
+    case 83:  return (uint64_t)sys_mkdir((const char *)f->rdi, (int)f->rsi);   /* mkdir */
+    case 258: return (uint64_t)sys_mkdir((const char *)f->rsi, (int)f->rdx);   /* mkdirat */
+    case 88:  return (uint64_t)sys_symlink((const char *)f->rdi, (const char *)f->rsi); /* symlink */
+    case 89:  return (uint64_t)sys_readlink((const char *)f->rdi, (char *)f->rsi, f->rdx); /* readlink */
+    case 267: return (uint64_t)sys_readlink((const char *)f->rsi, (char *)f->rdx, f->r10); /* readlinkat */
     case 217: return (uint64_t)sys_getdents64((int)f->rdi, (void *)f->rsi, f->rdx); /* getdents64 */
     case 257: return (uint64_t)sys_openat((int)f->rdi, (const char *)f->rsi,
                                           (int)f->rdx, (int)f->r10);   /* openat */

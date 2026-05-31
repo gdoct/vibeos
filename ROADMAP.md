@@ -64,9 +64,20 @@ Detail lives in the code and git history; this file is the map, not the manual.
   `/bin/ftest`, `/bin/pipetest`, `/bin/sigtest`, `/bin/nettest`). Syscalls: TLS
   (`arch_prctl`), anon + file `mmap`/`munmap`/`mprotect`, `read`/`write`/`writev`,
   `brk`, `nanosleep`, signals, sockets; **file I/O over a per-process fd table** —
-  `open`/`openat`/`close`/`lseek`/`stat`/`fstat`/`getdents64`/`getcwd`/`fcntl`/
-  `dup`/`dup2` ([file.c](kernel/src/file.c)); **`pipe`/`pipe2`**
+  `open`/`openat`/`close`/`lseek`/`stat`/`lstat`/`fstat`/`getdents64`/`getcwd`/
+  `chdir`/`fcntl`/`dup`/`dup2`/`mkdir`/`symlink`/`readlink`
+  ([file.c](kernel/src/file.c)); **`pipe`/`pipe2`**
   ([pipe.c](kernel/src/pipe.c)); `fork`/`execve`/`wait4`/`exit`.
+- **Userspace quality-of-life** (ROADMAP §4) — a per-process **cwd** (`chdir`/
+  `getcwd`, `./`–`../`–normalizing path resolution); **`FD_CLOEXEC`** tracked
+  per-descriptor and enforced by `execve`; **symlinks** in VibeFS (new
+  `FT_SYMLINK` inode, followed during path resolution, fsck-safe);
+  synthetic **`/dev`** (`null`/`zero`/`full`/`random`/`urandom`/`tty`) and a
+  tiny **`/proc`** (a dir per live task + `self`, each with a `stat` file)
+  ([synth.c](kernel/src/synth.c)); a real **init** (PID 1) that forks + respawns
+  the shell; and a **package tool** ([user/musl/pkg.c](user/musl/pkg.c)) that
+  extracts/lists POSIX ustar tarballs (files, dirs, symlinks). Shell builtins
+  `cd`/`pwd`/`echo`/`cat`/`ls`/`ln -s`/`readlink` exercise it over serial.
 - **Randomness** — a **ChaCha20 DRBG** ([csprng.c](kernel/src/csprng.c)) seeded
   from RDRAND, RDTSC timing jitter, and **virtio-rng** hardware entropy
   ([virtio_rng.c](kernel/src/drivers/virtio_rng.c)), with per-request rekey for
@@ -78,8 +89,9 @@ Detail lives in the code and git history; this file is the map, not the manual.
   ([interop/tools/diskutil](interop/tools/diskutil/)) builds/populates VibeFS
   images; `./build.sh` + `make run` (`-smp 4`, virtio-blk + virtio-net).
 
-**ABI simplifications still open:** cwd fixed at `/` (no `chdir`); no symlinks;
-dirs open read-only; `FD_CLOEXEC` not enforced. TCP's retransmit / reassembly
+**ABI simplifications still open:** dirs open read-only; no hard links / rename;
+no file permissions (mode bits are cosmetic); `fchdir` unsupported (no
+inode→path map). TCP's retransmit / reassembly
 paths are implemented but only structurally exercised — loopback/SLIRP is
 lossless and in-order, so loss-recovery awaits verification against a real host
 once outbound connectivity is available.
@@ -97,14 +109,11 @@ serial-verified, as are **(6) WAN-grade TCP** (send buffer, RTO/RTT, congestion
 control, reassembly, delayed/dup ACKs, TIME-WAIT), **(7) a ChaCha20 CSPRNG**
 (RDRAND + jitter + virtio-rng entropy, RFC 6528 TCP ISNs, `AT_RANDOM`), and
 **(8) per-CPU run queues with work-stealing** (home-CPU affinity; kernel tasks
-stolen across cores, user tasks BSP-pinned). See "What works today". What
-remains, ordered:
+stolen across cores, user tasks BSP-pinned), and **(9) userspace quality-of-life**
+(`chdir`/cwd, `FD_CLOEXEC`, symlinks, `/dev` + `/proc`, a respawning init, and a
+tar package tool). See "What works today". What remains, ordered:
 
-**1. Userspace quality-of-life.** `chdir`/cwd, symlinks, `FD_CLOEXEC`; a tiny
-`/proc` (pid dirs + `stat`) and `/dev` (`null`/`zero`/`tty`/`random`); a real
-(small) init that respawns the shell; a package format (tar + VibeFS metadata).
-
-**2. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
+**1. Toolchain integration.** A cross target `x86_64-vibeos-musl` + a sysroot, so
 `gcc`/`clang` build for VibeOS directly instead of repurposing host musl.
 
 **Also widening the ABI toward busybox/binutils** as opportunity allows (more
