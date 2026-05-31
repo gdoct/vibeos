@@ -241,6 +241,58 @@ backlog: ACPI poweroff; FS journaling / `rename` / permissions.
 
 ---
 
+## Milestones — porting real software
+
+Four "can VibeOS run *X*?" targets, in rough effort order. The intent is to keep
+these as north stars and refine the in-between steps later. We already have the
+hard parts: a `x86_64-vibeos-musl` cross toolchain, static **and** dynamic musl
+binaries, threads (`clone`/`futex`/pthreads), signals, sockets, and a fd table —
+so anything built as static `x86_64-linux-musl` is already ABI-compatible. Each
+milestone is mostly about closing specific syscall/ABI gaps, not new subsystems.
+
+**Shared prerequisites (block most of the below):**
+
+- **File mutation syscalls** — `unlink`/`unlinkat`, `rename`, `rmdir`,
+  `ftruncate` are not wired up (note: `fs_unlink` already exists in
+  [fs.c](kernel/src/fs.c) — just unexposed). Nearly everything that writes temp
+  files needs these. Cheapest, highest-leverage gap.
+- **Credentials** — no `getuid`/`geteuid`/`getgid`/`getegid` (and no
+  `setuid`/`setgid`). musl startup and most tools expect them; hardcoding to 0 is
+  enough to start.
+- **Real timekeeping** — `clock_gettime`/`gettimeofday` are 100 Hz and fake the
+  wall clock (`sec = ticks/100`). A proper timebase is quietly needed everywhere.
+- **Interactive I/O** — `ioctl` always returns `-ENOTTY`; no PTYs
+  (`/dev/ptmx`/pts); no sessions/job control (`setsid`/`setpgid`/`tcsetpgrp`).
+  Gateway to any interactive program.
+- **More multiplexing** — only `poll` exists; no `select`/`pselect`/`ppoll`/
+  `epoll`/`eventfd`/`timerfd`.
+
+1. **Run `bash`** *(closest — file-mutation + credentials + a little tty work).*
+   Scripted (non-interactive) bash needs little beyond what we have plus
+   `getuid`/`geteuid` and `unlink`. Interactive bash additionally needs termios
+   `ioctl` (line editing) and `setpgid`/`tcsetpgrp` (job control).
+2. **Run a Rust program** *(near — reuse the `x86_64-unknown-linux-musl` target).*
+   A statically-linked Rust binary already matches our ABI; `std` rides on musl +
+   futex/threads, which we have. No custom Rust target needed. A hello-world is
+   roughly bash-level effort (time resolution + a few std-init syscalls).
+   *Out of scope here: running `rustc`/`cargo` on-device — that's LLVM, a separate
+   long-horizon milestone.*
+3. **Run a C compiler** *(moderate for tcc, large for gcc).* **TinyCC** is the
+   realistic target: single binary, tiny syscall footprint; main blocker is
+   `unlink`/`rename` for temp files. **gcc** is a multi-process pipeline (cc1/as/ld)
+   that churns temp files and is a heavyweight cross-build — a milestone, not a sprint.
+4. **Run OpenSSH** *(hardest of the four).* Crypto is userspace (free) and we have
+   TCP/sockets/`poll`, but sshd wants a real **credential model** (`setuid`/`setgid`
+   for privilege separation), **PTYs** for interactive sessions, a passwd database,
+   and termios. The ssh **client** is more feasible than the server.
+
+Suggested first cuts (unblock the most for the least): wire
+`unlink`/`unlinkat`/`rename`/`rmdir`/`ftruncate`; add `getuid`/`geteuid`/`getgid`/
+`getegid`; give `clock_gettime` a real timebase — then attempt a static Rust
+hello-world and scripted bash before tackling PTYs/job control.
+
+---
+
 ## How it boots
 
 ```
