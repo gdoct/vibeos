@@ -84,6 +84,11 @@ typedef struct task {
        free descriptor. fork() dups these (sharing the file offset); they
        survive execve. */
     struct file  *fdt[VFS_MAX_FD];
+    uint8_t       fd_cloexec[VFS_MAX_FD];  /* FD_CLOEXEC bit per descriptor (§4) */
+
+    /* Current working directory (ROADMAP §4): an absolute, normalized path that
+       relative path resolution is taken from. Inherited across fork + execve. */
+    char          cwd[256];
 } task_t;
 
 /* Initialize the SMP scheduler. Call once on the BSP before creating tasks

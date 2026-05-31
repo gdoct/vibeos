@@ -12,6 +12,8 @@
 #include "smp.h"
 #include "signal.h"
 #include "net.h"
+#include "synth.h"
+#include "csprng.h"
 
 /*
  * System calls (ROADMAP §3 + §4 Linux ABI).
@@ -73,6 +75,7 @@ static inline vmspace_t *cur_vm(void) { return task_current()->vm; }
 #define O_TRUNC       0x200
 #define O_APPEND      0x400
 #define O_DIRECTORY   0x10000
+#define O_CLOEXEC     0x80000
 
 /* *at() dirfd / flags. */
 #define AT_FDCWD       (-100)
@@ -90,6 +93,7 @@ static inline vmspace_t *cur_vm(void) { return task_current()->vm; }
 #define S_IFIFO  0010000
 #define DT_DIR   4
 #define DT_REG   8
+#define DT_CHR   2
 
 /* Map a VibeFS FS_* error (negative) to a Linux errno (negative). */
 static int64_t fs_to_errno(int e) {
@@ -227,7 +231,7 @@ static file_t *fd_get(int fd) {
 static int fd_install(file_t *f) {
     task_t *t = task_current();
     for (int i = 3; i < VFS_MAX_FD; i++)
-        if (!t->fdt[i]) { t->fdt[i] = f; return i; }
+        if (!t->fdt[i]) { t->fdt[i] = f; t->fd_cloexec[i] = 0; return i; }
     return -EMFILE_;
 }
 
@@ -246,6 +250,7 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
     if (f->kind == FD_PIPE_WR) return pipe_write(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_RD) return -EBADF_;  /* write to read end */
     if (f->kind == FD_SOCKET) { int r = ksock_send(f->sock, buf, (uint32_t)n); return r < 0 ? -EPIPE_ : r; }
+    if (f->kind == FD_DEV || f->kind == FD_PROC) return synth_write(f, buf, (uint32_t)n);
     if (f->kind != FD_FILE) return -EISDIR_;
     if (f->flags & O_APPEND) {                  /* append: write at EOF */
         fs_stat_t st;
@@ -268,6 +273,8 @@ static int64_t sys_read(int fd, void *buf, uint64_t n) {
     if (f->kind == FD_PIPE_RD) return pipe_read(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_WR) return -EBADF_;  /* read from write end */
     if (f->kind == FD_SOCKET) return ksock_recv(f->sock, buf, (uint32_t)n);
+    if (f->kind == FD_DEV || f->kind == FD_PROC) return synth_read(f, buf, (uint32_t)n);
+    if (f->kind == FD_DEVDIR) return -EISDIR_;
     if (f->kind != FD_FILE) return -EISDIR_;
     int r = fs_pread(f->ino, f->off, buf, (uint32_t)n);
     if (r < 0) return fs_to_errno(r);
@@ -358,6 +365,16 @@ static int64_t sys_execve(const char *upath, char *const uargv[], char *const ue
     }
     vmspace_destroy(oldvm);                     /* committed; old AS now idle */
     kfree(a);
+    /* Close descriptors marked FD_CLOEXEC (ROADMAP §4). */
+    for (int i = 3; i < VFS_MAX_FD; i++) {
+        if (t->fd_cloexec[i] && t->fdt[i]) {
+            file_t *cf = t->fdt[i];
+            if (cf->kind == FD_SOCKET && cf->refcount == 1) ksock_close(cf->sock);
+            t->fdt[i] = nullptr;
+            file_unref(cf);
+        }
+        t->fd_cloexec[i] = 0;
+    }
     signals_exec(t);                            /* reset caught handlers to default */
     t->fs_base = 0;                             /* fresh image: TLS reset until arch_prctl */
     kprintf("[syscall] exec '%s' -> entry=%lx\n", path, (unsigned long)entry);
@@ -480,15 +497,49 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot) {
 
 /* ---- §4 rung 2: file I/O against VibeFS through the fd table ---- */
 
-/* Build an absolute kernel-side path from a user path. Relative paths are taken
-   from the (fixed) cwd "/", since there is no chdir yet. */
+/* Normalize an absolute path in-place semantics: collapse "//", ".", and ".."
+   into `dst`. `src` must already be absolute (leading '/'). */
+static void normalize_abs(char *dst, unsigned dstsz, const char *src) {
+    /* Stack of component start offsets within dst (dst always begins with '/'). */
+    unsigned stack[64]; int sp = 0;
+    unsigned o = 0;
+    if (dstsz) dst[o++] = '/';
+    unsigned i = 0;
+    while (src[i]) {
+        while (src[i] == '/') i++;                 /* skip separators */
+        if (!src[i]) break;
+        char comp[64]; unsigned c = 0;             /* read one component */
+        while (src[i] && src[i] != '/' && c < sizeof comp - 1) comp[c++] = src[i++];
+        comp[c] = '\0';
+        while (src[i] && src[i] != '/') i++;        /* drop an over-long tail */
+        if (comp[0] == '.' && comp[1] == '\0') continue;            /* "." */
+        if (comp[0] == '.' && comp[1] == '.' && comp[2] == '\0') {  /* ".." */
+            if (sp > 0) { o = stack[--sp]; }        /* pop a component */
+            continue;
+        }
+        if (sp < (int)(sizeof stack / sizeof stack[0])) stack[sp++] = o;
+        if (o > 1 && o + 1 < dstsz) dst[o++] = '/'; /* separator before non-first */
+        for (unsigned k = 0; comp[k] && o + 1 < dstsz; k++) dst[o++] = comp[k];
+    }
+    if (o == 0 && dstsz) dst[o++] = '/';
+    dst[o < dstsz ? o : dstsz - 1] = '\0';
+}
+
+/* Build an absolute, normalized kernel-side path from a user path, taking
+   relative paths from the calling task's cwd (ROADMAP §4). */
 static void resolve_path(char *dst, unsigned dstsz, const char *upath) {
     char tmp[256];
     copy_user_str(tmp, upath, sizeof tmp);
-    unsigned i = 0;
-    if (tmp[0] != '/') { if (dstsz) dst[i++] = '/'; }
-    for (unsigned j = 0; tmp[j] && i + 1 < dstsz; j++) dst[i++] = tmp[j];
-    dst[i] = '\0';
+    char joined[512];
+    unsigned o = 0;
+    if (tmp[0] != '/') {                            /* relative: prefix cwd */
+        const char *cwd = task_current()->cwd;
+        for (unsigned k = 0; cwd[k] && o + 1 < sizeof joined; k++) joined[o++] = cwd[k];
+        if (o == 0 || joined[o - 1] != '/') if (o + 1 < sizeof joined) joined[o++] = '/';
+    }
+    for (unsigned k = 0; tmp[k] && o + 1 < sizeof joined; k++) joined[o++] = tmp[k];
+    joined[o] = '\0';
+    normalize_abs(dst, dstsz, joined);
 }
 
 /* Fill a Linux struct stat from a VibeFS inode. */
@@ -516,9 +567,22 @@ static void fill_stat_console(struct linux_stat *st) {
 }
 
 static int64_t sys_openat(int dirfd, const char *upath, int flags, int mode) {
-    (void)dirfd; (void)mode;                    /* AT_FDCWD only; cwd is "/" */
+    (void)dirfd; (void)mode;                    /* AT_FDCWD / absolute (cwd-relative) */
     char path[256];
     resolve_path(path, sizeof path, upath);
+
+    /* Synthetic /dev and /proc take precedence over the real fs (ROADMAP §4). */
+    if (synth_classify(path, nullptr) != SYNTH_NONE) {
+        file_t *sf = file_alloc();
+        if (!sf) return -ENFILE_;
+        int sr = synth_open(path, sf);
+        if (sr < 0) { file_unref(sf); return sr == -2 ? -ENOENT_ : -ENOENT_; }
+        sf->flags = flags;
+        int sfd = fd_install(sf);
+        if (sfd < 0) { file_unref(sf); return sfd; }
+        if (flags & O_CLOEXEC) task_current()->fd_cloexec[sfd] = 1;
+        return sfd;
+    }
 
     int ino = fs_resolve(path);
     if (ino < 0) {
@@ -554,6 +618,7 @@ static int64_t sys_openat(int dirfd, const char *upath, int flags, int mode) {
     f->kind = kind; f->ino = (uint32_t)ino; f->off = 0; f->flags = flags;
     int fd = fd_install(f);
     if (fd < 0) { file_unref(f); return fd; }
+    if (flags & O_CLOEXEC) task_current()->fd_cloexec[fd] = 1;
     return fd;
 }
 
@@ -563,6 +628,7 @@ static int64_t sys_close(int fd) {
     if (!f) return -EBADF_;
     if (f->kind == FD_SOCKET && f->refcount == 1) ksock_close(f->sock);  /* last ref */
     task_current()->fdt[fd] = nullptr;
+    task_current()->fd_cloexec[fd] = 0;
     file_unref(f);
     return 0;
 }
@@ -584,6 +650,15 @@ static int64_t sys_lseek(int fd, int64_t off, int whence) {
     return n;
 }
 
+/* Stat a synthetic /dev or /proc object (ROADMAP §4). */
+static void fill_stat_synth(struct linux_stat *st, int is_dir, int is_char) {
+    kmemset(st, 0, sizeof *st);
+    st->st_dev = 1; st->st_nlink = 1; st->st_blksize = 4096;
+    st->st_mode = is_dir ? (S_IFDIR | 0555)
+                : is_char ? (S_IFCHR | 0666)
+                          : (S_IFREG | 0444);
+}
+
 /* Fill `out` (a kernel struct) for an fd; the caller copies it to user space. */
 static int64_t fstat_k(int fd, struct linux_stat *out) {
     if (fd >= 0 && fd <= 2) { fill_stat_console(out); return 0; }
@@ -596,6 +671,9 @@ static int64_t fstat_k(int fd, struct linux_stat *out) {
         out->st_blksize = 4096;
         return 0;
     }
+    if (f->kind == FD_DEV)    { fill_stat_synth(out, 0, 1); return 0; }
+    if (f->kind == FD_DEVDIR) { fill_stat_synth(out, 1, 0); return 0; }
+    if (f->kind == FD_PROC)   { fill_stat_synth(out, 0, 0); return 0; }
     fs_stat_t s;
     if (fs_istat(f->ino, &s) != FS_OK) return -ENOENT_;
     fill_stat(out, f->ino, &s);
@@ -614,6 +692,12 @@ static int64_t sys_fstat(int fd, struct linux_stat *st) {
 static int64_t pathstat_k(const char *upath, struct linux_stat *out) {
     char path[256];
     resolve_path(path, sizeof path, upath);
+    int sc = synth_classify(path, nullptr);
+    if (sc != SYNTH_NONE) {                      /* /dev or /proc */
+        int is_char = (path[1] == 'd');          /* "/dev/..." -> char device */
+        fill_stat_synth(out, sc == SYNTH_DIR, sc == SYNTH_NODE && is_char);
+        return 0;
+    }
     int ino = fs_resolve(path);
     if (ino < 0) return fs_to_errno(ino);
     fs_stat_t s;
@@ -650,6 +734,28 @@ static int64_t sys_stat(const char *upath, struct linux_stat *st) {
 static int64_t sys_getdents64(int fd, void *ubuf, uint64_t count) {
     file_t *f = fd_get(fd);
     if (!f) return -EBADF_;
+    if (f->kind == FD_DEVDIR) {                  /* synthetic /dev or /proc */
+        if (count && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)ubuf, count, 1))
+            return -EFAULT_;
+        uint8_t *out = (uint8_t *)ubuf;
+        uint64_t used = 0;
+        for (;;) {
+            char nm[64]; int type = 1;
+            if (!synth_readdir(f, (int)f->off, nm, sizeof nm, &type)) break;
+            unsigned namelen = (unsigned)kstrlen(nm);
+            unsigned reclen = (sizeof(struct linux_dirent64) + namelen + 1 + 7) & ~7u;
+            if (used + reclen > count) { if (used == 0) return -EINVAL_; break; }
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(out + used);
+            d->d_ino = 1 + (uint64_t)f->off;
+            d->d_off = (int64_t)(f->off + 1);
+            d->d_reclen = (uint16_t)reclen;
+            d->d_type = (type == 2) ? DT_DIR : (type == 1 ? DT_REG : DT_CHR);
+            kmemcpy(d->d_name, nm, namelen + 1);
+            used += reclen;
+            f->off++;
+        }
+        return (int64_t)used;
+    }
     if (f->kind != FD_DIR) return -ENOTDIR_;
     if (count && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)ubuf, count, 1))
         return -EFAULT_;
@@ -682,11 +788,33 @@ static int64_t sys_getdents64(int fd, void *ubuf, uint64_t count) {
 }
 
 static int64_t sys_getcwd(char *ubuf, uint64_t size) {
-    const char *cwd = "/";                       /* no chdir yet */
+    const char *cwd = task_current()->cwd;
     uint64_t n = (uint64_t)kstrlen(cwd) + 1;
     if (size < n) return -34;                    /* -ERANGE */
     if (copy_to_user(cur_vm(), (uint64_t)(uintptr_t)ubuf, cwd, n) < 0) return -EFAULT_;
     return (int64_t)n;
+}
+
+/* chdir: resolve to an absolute normalized path, verify it is a directory
+   (real or synthetic), and store it as the task's cwd (ROADMAP §4). */
+static int64_t sys_chdir(const char *upath) {
+    char path[256];
+    resolve_path(path, sizeof path, upath);
+    int sc = synth_classify(path, nullptr);
+    if (sc == SYNTH_NONE) {
+        int ino = fs_resolve(path);
+        if (ino < 0) return fs_to_errno(ino);
+        fs_stat_t s;
+        if (fs_istat((uint32_t)ino, &s) != FS_OK) return -ENOENT_;
+        if (s.type != FT_DIR) return -ENOTDIR_;
+    } else if (sc != SYNTH_DIR) {
+        return -ENOTDIR_;
+    }
+    task_t *t = task_current();
+    unsigned i = 0;
+    for (; path[i] && i < sizeof t->cwd - 1; i++) t->cwd[i] = path[i];
+    t->cwd[i] = '\0';
+    return 0;
 }
 
 /* pipe2: create a pipe and install its read/write ends at the two lowest free
@@ -749,21 +877,30 @@ static int64_t sys_dup2(int oldfd, int newfd) {
     if (t->fdt[newfd]) file_unref(t->fdt[newfd]);
     file_ref(f);
     t->fdt[newfd] = f;
+    t->fd_cloexec[newfd] = 0;                     /* dup2 clears CLOEXEC (POSIX) */
     return newfd;
 }
 
-/* Minimal fcntl: F_DUPFD/F_GETFD/F_SETFD/F_GETFL/F_SETFL. Enough for musl's
-   stdio and isatty paths; FD_CLOEXEC is accepted but not enforced (execve keeps
-   fds either way today). */
+/* fcntl: F_DUPFD(_CLOEXEC) / F_GETFD / F_SETFD / F_GETFL / F_SETFL. FD_CLOEXEC is
+   now tracked per descriptor and enforced by execve (ROADMAP §4). */
 static int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
-    enum { F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 };
+    enum { F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030 };
+    enum { FD_CLOEXEC_BIT = 1 };
     file_t *f = fd_get(fd);
     int is_console = (fd >= 0 && fd <= 2);
     if (!f && !is_console) return -EBADF_;
+    task_t *t = task_current();
     switch (cmd) {
     case F_DUPFD: return sys_dup(fd);
-    case F_GETFD: return 0;                       /* no FD_CLOEXEC tracking */
-    case F_SETFD: return 0;
+    case F_DUPFD_CLOEXEC: {
+        int64_t nfd = sys_dup(fd);
+        if (nfd >= 0) t->fd_cloexec[nfd] = 1;
+        return nfd;
+    }
+    case F_GETFD: return (fd >= 0 && fd < VFS_MAX_FD && t->fd_cloexec[fd]) ? FD_CLOEXEC_BIT : 0;
+    case F_SETFD:
+        if (fd >= 0 && fd < VFS_MAX_FD) t->fd_cloexec[fd] = (arg & FD_CLOEXEC_BIT) ? 1 : 0;
+        return 0;
     case F_GETFL: return f ? f->flags : O_RDWR;
     case F_SETFL: if (f) f->flags = (int)arg; return 0;
     default:      return -EINVAL_;
@@ -991,6 +1128,7 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 72:  return (uint64_t)sys_fcntl((int)f->rdi, (int)f->rsi, f->rdx);  /* fcntl */
     case 186: return (uint64_t)task_current()->id;             /* gettid (== pid, no threads) */
     case 79:  return (uint64_t)sys_getcwd((char *)f->rdi, f->rsi);  /* getcwd */
+    case 80:  return (uint64_t)sys_chdir((const char *)f->rdi);     /* chdir */
     case 89:  return (uint64_t)(int64_t)-EINVAL_;              /* readlink: no symlinks */
     case 217: return (uint64_t)sys_getdents64((int)f->rdi, (void *)f->rsi, f->rdx); /* getdents64 */
     case 257: return (uint64_t)sys_openat((int)f->rdi, (const char *)f->rsi,

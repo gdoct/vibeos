@@ -21,6 +21,35 @@ static long sys_write(int fd, const void *buf, unsigned long n) {
                      : "a"(1L), "D"((long)fd), "S"(buf), "d"(n) : "rcx", "r11", "memory");
     return r;
 }
+static long sys_chdir(const char *path) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(80L), "D"(path) : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_getcwd(char *buf, unsigned long size) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(79L), "D"(buf), "S"(size) : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_openat(int dfd, const char *path, long flags, long mode) {
+    long r;
+    register long r10 __asm__("r10") = mode;
+    __asm__ volatile("syscall" : "=a"(r)
+                     : "a"(257L), "D"((long)dfd), "S"(path), "d"(flags), "r"(r10)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_close(int fd) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(3L), "D"((long)fd) : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_getdents64(int fd, void *buf, unsigned long n) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r)
+                     : "a"(217L), "D"((long)fd), "S"(buf), "d"(n) : "rcx", "r11", "memory");
+    return r;
+}
 static long sys_fork(void) {
     long r;
     __asm__ volatile("syscall" : "=a"(r) : "a"(57L) : "rcx", "r11", "memory");
@@ -88,8 +117,52 @@ int main(void) {
 
         if (streq(argv[0], "exit")) { puts1("bye\n"); sys_exit(0); }
         if (streq(argv[0], "help")) {
-            puts1("builtins: help, exit\n"
+            puts1("builtins: help, exit, cd, pwd, echo, cat, ls\n"
                   "run a program by name (hello) or path (/bin/hello)\n");
+            continue;
+        }
+        if (streq(argv[0], "cd")) {
+            const char *dir = argc > 1 ? argv[1] : "/";
+            if (sys_chdir(dir) < 0) { puts1("cd: "); puts1(dir); puts1(": no such directory\n"); }
+            continue;
+        }
+        if (streq(argv[0], "pwd")) {
+            char cwd[256];
+            if (sys_getcwd(cwd, sizeof cwd) >= 0) { puts1(cwd); puts1("\n"); }
+            continue;
+        }
+        if (streq(argv[0], "echo")) {
+            for (int i = 1; i < argc; i++) { puts1(argv[i]); if (i + 1 < argc) puts1(" "); }
+            puts1("\n");
+            continue;
+        }
+        if (streq(argv[0], "cat")) {
+            for (int i = 1; i < argc; i++) {
+                long fd = sys_openat(-100, argv[i], 0 /*O_RDONLY*/, 0);
+                if (fd < 0) { puts1("cat: "); puts1(argv[i]); puts1(": cannot open\n"); continue; }
+                char buf[512]; long m;
+                while ((m = sys_read((int)fd, buf, sizeof buf)) > 0) sys_write(1, buf, (unsigned long)m);
+                sys_close((int)fd);
+            }
+            continue;
+        }
+        if (streq(argv[0], "ls")) {
+            const char *dir = argc > 1 ? argv[1] : ".";
+            long fd = sys_openat(-100, dir, 0x10000 /*O_DIRECTORY*/, 0);
+            if (fd < 0) { puts1("ls: "); puts1(dir); puts1(": cannot open\n"); continue; }
+            char dbuf[1024]; long m;
+            while ((m = sys_getdents64((int)fd, dbuf, sizeof dbuf)) > 0) {
+                long off = 0;
+                while (off < m) {
+                    /* struct linux_dirent64: ino(8) off(8) reclen(2) type(1) name... */
+                    unsigned short reclen = *(unsigned short *)(dbuf + off + 16);
+                    const char *name = dbuf + off + 19;
+                    puts1(name); puts1("  ");
+                    off += reclen;
+                }
+            }
+            puts1("\n");
+            sys_close((int)fd);
             continue;
         }
 

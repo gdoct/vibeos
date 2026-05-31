@@ -23,7 +23,9 @@ file_t *file_alloc(void) {
             f->ino = 0;
             f->off = 0;
             f->flags = 0;
+            f->dev = 0;
             f->pipe = nullptr;
+            f->sock = nullptr;
             return f;
         }
     }

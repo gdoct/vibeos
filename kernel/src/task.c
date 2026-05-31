@@ -170,6 +170,7 @@ static task_t *alloc_task_slot(const char *name) {
     kmemset(t, 0, sizeof(*t));
     t->id = slot; t->name = name;
     t->stack_base = base; t->stack_top = top;
+    t->cwd[0] = '/'; t->cwd[1] = '\0';     /* default cwd (§4) */
     return t;
 }
 
@@ -217,11 +218,14 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     signals_fork(t, parent);            /* inherit handlers + mask (not pending) */
 
     /* Dup the fd table: the child shares each open-file object (and thus its
-       offset) with the parent, à la Linux fork. */
+       offset) with the parent, à la Linux fork. The per-fd FD_CLOEXEC bit is a
+       descriptor property, so it is copied too. */
     for (int i = 0; i < VFS_MAX_FD; i++) {
         t->fdt[i] = parent->fdt[i];
+        t->fd_cloexec[i] = parent->fd_cloexec[i];
         if (t->fdt[i]) file_ref(t->fdt[i]);
     }
+    for (unsigned i = 0; i < sizeof t->cwd; i++) t->cwd[i] = parent->cwd[i];  /* inherit cwd */
 
     /* Craft the child stack: context_switch -> fork_child_return, which finds a
        copy of the parent's syscall frame (rax forced to 0) and sysrets. The

@@ -115,6 +115,7 @@ KERNEL_C_SRCS = \
 	kernel/src/csprng.c \
 	kernel/src/file.c \
 	kernel/src/pipe.c \
+	kernel/src/synth.c \
 	kernel/src/net.c \
 	kernel/src/drivers/virtio_net.c \
 	kernel/src/drivers/fb.c \
