@@ -79,6 +79,7 @@ KERNEL_CFLAGS = \
 	-fno-exceptions \
 	-fno-rtti \
 	-Ikernel/include \
+	-Igui/core/include \
 	-Iboot/include \
 	-O2 \
 	-Wall -Wextra -Wno-unused-parameter \
@@ -118,10 +119,6 @@ KERNEL_C_SRCS = \
 	kernel/src/random.c \
 	kernel/src/csprng.c \
 	kernel/src/config.c \
-	kernel/src/gui_draw.c \
-	kernel/src/gui_win.c \
-	kernel/src/gui_wm.c \
-	kernel/src/gui_logo.c \
 	kernel/src/file.c \
 	kernel/src/pipe.c \
 	kernel/src/synth.c \
@@ -137,14 +134,24 @@ KERNEL_C_SRCS = \
 	kernel/src/drivers/timer.c
 KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S kernel/src/usermode.S kernel/src/ap_boot.S
 
+# GUI core (gui/core) — the kernel-side windowing lib (libdraw + libwin + libwm),
+# compiled into the kernel for now. The userspace counterpart lives in gui/client.
+GUI_C_SRCS = \
+	gui/core/src/gui_draw.c \
+	gui/core/src/gui_win.c \
+	gui/core/src/gui_wm.c \
+	gui/core/src/gui_logo.c
+
 KERNEL_C_OBJS = $(KERNEL_C_SRCS:kernel/src/%.c=kernel/build/%.o)
 KERNEL_S_OBJS = $(KERNEL_S_SRCS:kernel/src/%.S=kernel/build/%.o)
-KERNEL_OBJS   = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS)
+GUI_C_OBJS    = $(GUI_C_SRCS:gui/core/src/%.c=gui/build/%.o)
+KERNEL_OBJS   = $(KERNEL_S_OBJS) $(KERNEL_C_OBJS) $(GUI_C_OBJS)
 
 # Header-dependency tracking (-MMD): a change to a .h recompiles every .c that
 # includes it. Without this, editing a struct in a header silently leaves stale
 # .o files with the old layout — a brutal class of bug.
 -include $(KERNEL_C_OBJS:.o=.d)
+-include $(GUI_C_OBJS:.o=.d)
 
 KERNEL_ELF = kernel/build/kernel.elf
 
@@ -225,6 +232,14 @@ kernel/build/%.o: kernel/src/%.c | kernel/build kernel/build/drivers
 
 kernel/build/%.o: kernel/src/%.S | kernel/build
 	$(CC) -c $< -o $@
+
+# GUI core sources live under gui/core/src but compile with the kernel flags and
+# link into the kernel — same toolchain, just a separate source tree.
+gui/build:
+	mkdir -p $@
+
+gui/build/%.o: gui/core/src/%.c | gui/build
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 kernel: $(KERNEL_ELF)
 
@@ -422,4 +437,4 @@ run: $(IMG) $(VDISK)
 	  -serial stdio
 
 clean:
-	rm -rf boot/build kernel/build user/build
+	rm -rf boot/build kernel/build gui/build user/build
