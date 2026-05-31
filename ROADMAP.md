@@ -183,18 +183,19 @@ What remains:
   per-service file logging, and a `sysconf services` view) are shipped. What's
   left of this theme is socket-/timer-activated services and shell I/O redirection
   (`>`/`<`/`2>` — the kernel now supports it; the shell doesn't parse it yet).
-- **Graphical stack (phase 2).** Phase 1 is up (libdraw + libwin + libwm). The
-  remaining work is: 
-  **Move the gui code** to a folder `/gui` and split it into a kernel-side lib 
-  (`gui/core`) and a userspace client (`gui/client`);
+- **Graphical stack (phase 2).** Phase 1 is up (libdraw + libwin + libwm, with a
+  mouse pointer, keyboard-to-focused-field, and the desktop logo), and the code
+  now lives in [gui/](gui/) — split into the kernel-side lib [gui/core/](gui/core/)
+  and a [gui/client/](gui/client/) scaffold for the userspace side. The remaining
+  work is the **client/server split itself**: move rendering + input out to
+  **userspace GUI clients** over mmap'd `/dev/fb` + `/dev/input`, which first needs
+  the kernel to grow those primitives (mmap of `/dev/fb`, a `/dev/input` event
+  source).
 - **Mature windowing model.** Standardize GUI IPC around a message bus + shared
   C library (`gui` namespace), run a **process per window**, and ship a demo GUI
-  client that renders the Mandelbrot set in its own window. 
-- **Add more widgets** (menus/scrollbars beyond the existing button/label/textbox); 
-- add a taskbar + launcher
-- move rendering/input to **userspace GUI clients** over mmap'd
-  `/dev/fb` + `/dev/input` (graphics/graphics.md phase 2). (Mouse-pointer tracking
-  and keyboard-to-focused-field already shipped in phase 1.)
+  client that renders the Mandelbrot set in its own window. Add more widgets
+  (menus/scrollbars beyond the existing button/label/textbox); add a taskbar +
+  launcher (graphics/graphics.md phase 2).
 - **USB follow-on for GUI.** Optional xHCI/EHCI + USB hub support (UHCI already
   drives the HID devices).
 - **Audio.** An audio subsystem + virtio-sound.
