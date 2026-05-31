@@ -1,0 +1,5 @@
+# /config/services/welcome.yaml — a oneshot that prints a banner at boot.
+description: boot banner
+exec:        /bin/vibehello
+oneshot:     yes
+enabled:     yes

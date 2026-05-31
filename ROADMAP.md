@@ -93,15 +93,20 @@ Detail lives in the code and git history; this file is the map, not the manual.
   monotonic term) and `AT_RANDOM` (musl's stack canary). A non-crypto
   xorshift/RDRAND RNG ([random.c](kernel/src/random.c)) remains for plumbing
   variety.
-- **Configuration** (ROADMAP: config service) — a kernel **config service**
-  ([config.c](kernel/src/config.c)) reads **`/config/system.conf`** at boot into
-  a key/value store (a small YAML-ish `key: value` format with `#` comments and
-  dotted keys) and lets subsystems query it — `uname`'s hostname and the boot
-  motd come from `/config`. `config_reload()` re-reads it live; the
+- **Configuration + service-managed init** (ROADMAP) — a kernel **config
+  service** ([config.c](kernel/src/config.c)) reads **`/config/system.conf`** at
+  boot into a key/value store (a small YAML-ish `key: value` format with `#`
+  comments and dotted keys) and lets subsystems query it — `uname`'s hostname and
+  the boot motd come from `/config`. `config_reload()` re-reads it live; the
   `sysconfig(1000)` syscall + **`/bin/sysconf`** tool
-  ([user/musl/sysconf.c](user/musl/sysconf.c)) `list`/`get`/`set`/`reload` it
-  (a `set` rewrites the file and reloads, so e.g. the hostname changes without a
-  reboot).
+  ([user/musl/sysconf.c](user/musl/sysconf.c)) `list`/`get`/`set`/`reload` it (a
+  `set` rewrites the file and reloads, so e.g. the hostname changes without a
+  reboot). PID 1 is a **service-managed init** ([user/musl/sinit.c](user/musl/sinit.c)):
+  it reads one discoverable YAML file per service from **`/config/services/`**
+  (`exec`/`respawn`/`oneshot`/`enabled`/`after:` deps), starts them in dependency
+  order, runs oneshots to completion, supervises + respawns the rest, and logs
+  with timestamps. Not SysV (no runlevels / rc scripts) and not systemd (no unit
+  sections / dbus) — just files you can `ls` and `cat`.
 - **Shell + tooling** — `/bin/init` → `/bin/sh` over serial; host `disktool-cli`
   ([interop/tools/diskutil](interop/tools/diskutil/)) builds/populates VibeFS
   images; `./build.sh` + `make run` (`-smp 4`, virtio-blk + virtio-net). A
@@ -138,10 +143,10 @@ What remains:
 - **Remaining ABI polish**, as opportunity allows: tear down sibling threads on
   `exec`/`exit_group` (today join-before-exit is assumed); robust-futex
   ownership; `clock_nanosleep`/`ppoll`; signals targeted at a specific thread.
-- **Service-managed init.** The `/config` store + reload service is shipped (see
-  "What works today"); what's left of this theme is a fuller **init** with a
-  service-definition format under `/config`, dependency ordering, supervision,
-  and logging.
+- **Init polish.** The config store + service-managed init are shipped (see "What
+  works today"). What's left of this theme is incremental: per-service log files
+  (today it logs to the console), restart back-off / failure limits, socket- or
+  timer-activated services, and a `sysconf services` view of live state.
 - **Graphical stack.** A simple windowing system over the framebuffer (`/gui`);
   USB (EHCI/xHCI) + keyboard/mouse input to drive it.
 - **Audio.** An audio subsystem + virtio-sound. 

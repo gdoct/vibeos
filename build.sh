@@ -35,8 +35,20 @@ rm -f "$VDISK"
 "$DISKUTIL" --create-volume "$VDISK_SIZE" "$VDISK"
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /bin
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /config
+"$DISKUTIL" --diskfile "$VDISK" --mkdir /config/services
 "$DISKUTIL" --diskfile "$VDISK" --import config/system.conf /config/system.conf
-"$DISKUTIL" --diskfile "$VDISK" --import user/build/init.elf  /bin/init
+# Service definitions (ROADMAP: service-managed init) — one discoverable YAML per
+# service, read by the init at boot.
+for svc in config/services/*.yaml; do
+  [ -f "$svc" ] && "$DISKUTIL" --diskfile "$VDISK" --import "$svc" "/config/services/$(basename "$svc")"
+done
+# /bin/init is the service-managed init (sinit) when built; else the freestanding
+# fallback (user/init.c).
+if [ -f user/build/sinit.elf ]; then
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/sinit.elf /bin/init
+else
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/init.elf  /bin/init
+fi
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/sh.elf    /bin/sh
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/hello.elf /bin/hello
 [ -f user/build/mhello.elf ] && \

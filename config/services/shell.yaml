@@ -1,0 +1,7 @@
+# /config/services/shell.yaml — the interactive serial shell.
+# Starts after the welcome banner; respawned whenever it exits.
+description: interactive serial shell
+exec:        /bin/sh
+respawn:     yes
+enabled:     yes
+after:       welcome
