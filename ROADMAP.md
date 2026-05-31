@@ -183,15 +183,15 @@ What remains:
   (`>`/`<`/`2>` — the kernel now supports it; the shell doesn't parse it yet).
 - **Graphical stack (phase 2).** Phase 1 is up (libdraw + libwin + libwm). The
   remaining work is: 
-- **Mature windowing model.** Standardize GUI IPC around a message bus + shared
-  C library (`gui` namespace), run a **process per window**, and ship a demo GUI
-  client that renders the Mandelbrot set in its own window.
   **Move the gui code** to a folder `/gui` and split it into a kernel-side lib 
   (`gui/`) and a userspace client (`gui_client/`);
-  route the **keyboard to the focused window** (today it still
-  goes to the TTY); add real widgets (textbox/menus); add a taskbar + launcher,
-  and move rendering/input to **userspace GUI clients** over mmap'd `/dev/fb` +
-  `/dev/input` (graphics/graphics.md phase 2).
+- **Mature windowing model.** Standardize GUI IPC around a message bus + shared
+  C library (`gui` namespace), run a **process per window**, and ship a demo GUI
+  client that renders the Mandelbrot set in its own window. Add more widgets
+  (menus/scrollbars beyond the existing button/label/textbox); add a taskbar +
+  launcher, and move rendering/input to **userspace GUI clients** over mmap'd
+  `/dev/fb` + `/dev/input` (graphics/graphics.md phase 2). (Mouse-pointer tracking
+  and keyboard-to-focused-field already shipped in phase 1.)
 - **USB follow-on for GUI.** Optional xHCI/EHCI + USB hub support (UHCI already
   drives the HID devices).
 - **Audio.** An audio subsystem + virtio-sound.
