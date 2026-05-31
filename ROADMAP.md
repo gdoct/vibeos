@@ -103,10 +103,15 @@ Detail lives in the code and git history; this file is the map, not the manual.
   `set` rewrites the file and reloads, so e.g. the hostname changes without a
   reboot). PID 1 is a **service-managed init** ([user/musl/sinit.c](user/musl/sinit.c)):
   it reads one discoverable YAML file per service from **`/config/services/`**
-  (`exec`/`respawn`/`oneshot`/`enabled`/`after:` deps), starts them in dependency
-  order, runs oneshots to completion, supervises + respawns the rest, and logs
-  with timestamps. Not SysV (no runlevels / rc scripts) and not systemd (no unit
-  sections / dbus) — just files you can `ls` and `cat`.
+  (`exec`/`respawn`/`oneshot`/`enabled`/`after:` deps/`log:` path), starts them in
+  dependency order, runs oneshots to completion, and supervises the rest —
+  **restart back-off** with a rapid-failure limit (gives up after repeated fast
+  crashes), **per-service file logging** (redirects a service's stdout/stderr to
+  its `log:` file), and a live snapshot at `/config/services.state` (viewable via
+  `sysconf services`). Not SysV (no runlevels / rc scripts) and not systemd (no
+  unit sections / dbus) — just files you can `ls` and `cat`. (Fds 0/1/2 are now
+  redirectable — console by default, but the fd table is consulted first — which
+  is what lets init point a service at a log file.)
 - **Shell + tooling** — `/bin/init` → `/bin/sh` over serial; host `disktool-cli`
   ([interop/tools/diskutil](interop/tools/diskutil/)) builds/populates VibeFS
   images; `./build.sh` + `make run` (`-smp 4`, virtio-blk + virtio-net). A
@@ -143,10 +148,10 @@ What remains:
 - **Remaining ABI polish**, as opportunity allows: tear down sibling threads on
   `exec`/`exit_group` (today join-before-exit is assumed); robust-futex
   ownership; `clock_nanosleep`/`ppoll`; signals targeted at a specific thread.
-- **Init polish.** The config store + service-managed init are shipped (see "What
-  works today"). What's left of this theme is incremental: per-service log files
-  (today it logs to the console), restart back-off / failure limits, socket- or
-  timer-activated services, and a `sysconf services` view of live state.
+- **Init polish.** The config store + service-managed init (with restart back-off,
+  per-service file logging, and a `sysconf services` view) are shipped. What's
+  left of this theme is socket-/timer-activated services and shell I/O redirection
+  (`>`/`<`/`2>` — the kernel now supports it; the shell doesn't parse it yet).
 - **Graphical stack.** A simple windowing system over the framebuffer (`/gui`);
   USB (EHCI/xHCI) + keyboard/mouse input to drive it.
 - **Audio.** An audio subsystem + virtio-sound. 

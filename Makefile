@@ -171,6 +171,7 @@ USER_ABITEST = user/build/abitest.elf
 USER_THREAD = user/build/threadtest.elf
 USER_SYSCONF = user/build/sysconf.elf
 USER_SINIT  = user/build/sinit.elf
+USER_HEARTBEAT = user/build/heartbeat.elf
 
 # VibeOS cross toolchain (ROADMAP §"Toolchain integration").
 VIBEOS_CC     = ./toolchain/x86_64-vibeos-musl-gcc
@@ -226,7 +227,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -336,6 +337,13 @@ endif
 $(USER_SINIT): user/musl/sinit.c $(SYSROOT_SPECS) | user/build
 ifeq ($(MUSL_CC),)
 	@echo "warning: musl-tools not found; skipping $(USER_SINIT)"
+else
+	$(VIBEOS_CC) -static -no-pie -O2 -o $@ $<
+endif
+
+$(USER_HEARTBEAT): user/musl/heartbeat.c $(SYSROOT_SPECS) | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-tools not found; skipping $(USER_HEARTBEAT)"
 else
 	$(VIBEOS_CC) -static -no-pie -O2 -o $@ $<
 endif

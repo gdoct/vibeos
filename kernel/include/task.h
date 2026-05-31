@@ -171,7 +171,7 @@ void    task_cont(task_t *t);        /* undo a stop */
 /* Reap one ZOMBIE child of the current task, freeing its address space and
    slot and returning its pid (with *status set to the exit code). Blocks if
    children exist but none has exited yet; returns -ECHILD if there are none. */
-int     task_wait(int *status);
+int     task_wait(int *status, int nohang, int wpid);  /* wpid>0: that child only; nohang: 0 if none ready */
 
 /* Timer-driven: wake due sleepers and preempt the running task. Called from
    the tick IRQ on every CPU. No-op until sched_init has run. */

@@ -83,12 +83,20 @@ int main(int argc, char **argv) {
         printf("sysconf: reloaded %ld setting(s)\n", n);
         return 0;
     }
+    if (strcmp(argv[1], "services") == 0) {       /* live state written by init */
+        int fd = open("/config/services.state", O_RDONLY);
+        if (fd < 0) { printf("sysconf: no live service state yet\n"); return 1; }
+        char b[1024]; long m;
+        while ((m = read(fd, b, sizeof b)) > 0) write(1, b, m);
+        close(fd);
+        return 0;
+    }
     if (strcmp(argv[1], "set") == 0 && argc >= 4) {
         if (set_key(argv[2], argv[3]) != 0) return 1;
         long n = sysconfig(CFG_RELOAD, 0, 0, 0);
         printf("sysconf: set %s=%s, reloaded %ld setting(s)\n", argv[2], argv[3], n);
         return 0;
     }
-    fprintf(stderr, "usage: sysconf [list | get <key> | reload | set <key> <val>]\n");
+    fprintf(stderr, "usage: sysconf [list | get <key> | set <key> <val> | reload | services]\n");
     return 2;
 }

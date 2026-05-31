@@ -36,6 +36,7 @@ rm -f "$VDISK"
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /bin
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /config
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /config/services
+"$DISKUTIL" --diskfile "$VDISK" --mkdir /config/logs
 "$DISKUTIL" --diskfile "$VDISK" --import config/system.conf /config/system.conf
 # Service definitions (ROADMAP: service-managed init) — one discoverable YAML per
 # service, read by the init at boot.
@@ -77,6 +78,8 @@ fi
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/threadtest.elf /bin/threadtest
 [ -f user/build/sysconf.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/sysconf.elf /bin/sysconf
+[ -f user/build/heartbeat.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/heartbeat.elf /bin/heartbeat
 
 # Dynamic linking (ROADMAP §4): ship the musl dynamic linker as
 # /lib/ld-musl-x86_64.so.1 (the host's musl libc.so doubles as the loader) and a

@@ -331,13 +331,11 @@ static int fd_install(file_t *f) {
 static int64_t sys_write(int fd, const void *buf, uint64_t n) {
     if (n && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)buf, n, 0))
         return -EFAULT_;                        /* bad user buffer: no kernel fault */
-    if (fd == 1 || fd == 2) {                   /* stdout / stderr -> serial */
-        serial_write((const char *)buf, (size_t)n);
-        return (int64_t)n;
-    }
-    if (fd == 0) return -EBADF_;
     file_t *f = fd_get(fd);
-    if (!f) return -EBADF_;
+    if (!f) {                                   /* 0/1/2 default to the console... */
+        if (fd == 1 || fd == 2) { serial_write((const char *)buf, (size_t)n); return (int64_t)n; }
+        return -EBADF_;                         /* ...unless redirected onto a file */
+    }
     if (f->kind == FD_PIPE_WR) return pipe_write(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_RD) return -EBADF_;  /* write to read end */
     if (f->kind == FD_SOCKET) { int r = ksock_send(f->sock, buf, (uint32_t)n); return r < 0 ? -EPIPE_ : r; }
@@ -356,11 +354,11 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
 static int64_t sys_read(int fd, void *buf, uint64_t n) {
     if (n && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)buf, n, 1))
         return -EFAULT_;                        /* writable check + COW break */
-    if (fd == 0)                                /* stdin -> serial console TTY */
-        return tty_read((char *)buf, (uint32_t)n);
-    if (fd == 1 || fd == 2) return -EBADF_;
     file_t *f = fd_get(fd);
-    if (!f) return -EBADF_;
+    if (!f) {                                   /* 0 defaults to the console TTY */
+        if (fd == 0) return tty_read((char *)buf, (uint32_t)n);
+        return -EBADF_;
+    }
     if (f->kind == FD_PIPE_RD) return pipe_read(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_WR) return -EBADF_;  /* read from write end */
     if (f->kind == FD_SOCKET) return ksock_recv(f->sock, buf, (uint32_t)n);
@@ -725,9 +723,8 @@ static int64_t sys_openat(int dirfd, const char *upath, int flags, int mode) {
 }
 
 static int64_t sys_close(int fd) {
-    if (fd >= 0 && fd <= 2) return 0;           /* console: no-op */
     file_t *f = fd_get(fd);
-    if (!f) return -EBADF_;
+    if (!f) return (fd >= 0 && fd <= 2) ? 0 : -EBADF_;   /* bare console: no-op */
     if (f->kind == FD_SOCKET && f->refcount == 1) ksock_close(f->sock);  /* last ref */
     task_current()->files->fd[fd] = nullptr;
     task_current()->files->cloexec[fd] = 0;
@@ -798,9 +795,11 @@ static void fill_stat_synth(struct linux_stat *st, int is_dir, int is_char) {
 
 /* Fill `out` (a kernel struct) for an fd; the caller copies it to user space. */
 static int64_t fstat_k(int fd, struct linux_stat *out) {
-    if (fd >= 0 && fd <= 2) { fill_stat_console(out); return 0; }
     file_t *f = fd_get(fd);
-    if (!f) return -EBADF_;
+    if (!f) {                                   /* bare console (0/1/2) */
+        if (fd >= 0 && fd <= 2) { fill_stat_console(out); return 0; }
+        return -EBADF_;
+    }
     if (f->kind == FD_PIPE_RD || f->kind == FD_PIPE_WR) {
         kmemset(out, 0, sizeof *out);
         out->st_mode = S_IFIFO | 0600;
@@ -1083,9 +1082,8 @@ static int64_t sys_pipe(int *ufds) { return sys_pipe2(ufds, 0); }
 
 /* dup the open-file at `oldfd` into the lowest free descriptor >= 3. */
 static int64_t sys_dup(int oldfd) {
-    if (oldfd >= 0 && oldfd <= 2) return oldfd;  /* console fds are identity */
     file_t *f = fd_get(oldfd);
-    if (!f) return -EBADF_;
+    if (!f) return (oldfd >= 0 && oldfd <= 2) ? oldfd : -EBADF_;  /* bare console: identity */
     file_ref(f);
     int fd = fd_install(f);
     if (fd < 0) { file_unref(f); return fd; }
@@ -1094,13 +1092,15 @@ static int64_t sys_dup(int oldfd) {
 
 /* dup oldfd onto newfd exactly, closing whatever newfd held. */
 static int64_t sys_dup2(int oldfd, int newfd) {
-    if (oldfd >= 0 && oldfd <= 2 && newfd >= 0 && newfd <= 2) return newfd;
+    if (newfd < 0 || newfd >= VFS_MAX_FD) return -EBADF_;
     file_t *f = fd_get(oldfd);
-    if (!f) return -EBADF_;
-    if (newfd < 0 || newfd >= VFS_MAX_FD || newfd <= 2) return -EBADF_;
+    if (!f) {                                         /* oldfd is the bare console */
+        if ((oldfd == 0 || oldfd == 1 || oldfd == 2) && oldfd == newfd) return newfd;
+        return -EBADF_;
+    }
     if (oldfd == newfd) return newfd;
     task_t *t = task_current();
-    if (t->files->fd[newfd]) file_unref(t->files->fd[newfd]);
+    if (t->files->fd[newfd]) file_unref(t->files->fd[newfd]);  /* redirect 0/1/2 -> a file */
     file_ref(f);
     t->files->fd[newfd] = f;
     t->files->cloexec[newfd] = 0;                     /* dup2 clears CLOEXEC (POSIX) */
@@ -1139,11 +1139,13 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
     }
 }
 
+#define WNOHANG 1
 static int64_t sys_wait4(int pid, int *ustatus, int options, void *rusage) {
-    (void)pid; (void)options; (void)rusage;     /* wait for any child for now */
+    (void)rusage;
     int code = 0;
-    int got = task_wait(&code);                 /* code already encoded (exit/signal) */
-    if (got < 0) return got;                    /* -ECHILD */
+    /* pid > 0: that child; pid <= 0: any child (process-group wait unsupported). */
+    int got = task_wait(&code, options & WNOHANG, pid > 0 ? pid : 0);
+    if (got <= 0) return got;                    /* -ECHILD, or 0 = none ready (WNOHANG) */
     if (ustatus &&
         copy_to_user(cur_vm(), (uint64_t)(uintptr_t)ustatus, &code, sizeof code) < 0)
         return -EFAULT_;

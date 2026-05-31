@@ -567,7 +567,7 @@ void task_cont(task_t *t) {
     sched_unlock();
 }
 
-int task_wait(int *status) {
+int task_wait(int *status, int nohang, int wpid) {
     sched_lock();
     task_t *p = g_cpu_cur[smp_cpu_index()];
     for (;;) {
@@ -575,6 +575,7 @@ int task_wait(int *status) {
         for (int i = 1; i < MAX_TASKS; i++) {
             task_t *c = &g_tasks[i];
             if (c->parent != p) continue;
+            if (wpid > 0 && c->id != wpid) continue;   /* waitpid(pid): only that child */
             if (c->state == TASK_ZOMBIE) {
                 int pid = c->id;
                 /* Encode a Linux wait status: WIFSIGNALED (low 7 bits = signal)
@@ -591,6 +592,7 @@ int task_wait(int *status) {
             if (c->state != TASK_DEAD && c->state != TASK_NONE) have_child = 1;
         }
         if (!have_child) { sched_unlock(); return -10; }   /* -ECHILD */
+        if (nohang) { sched_unlock(); return 0; }          /* WNOHANG: nothing ready */
         wq_sleep_locked(&p->child_wq);
     }
 }

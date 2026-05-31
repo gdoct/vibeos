@@ -1,0 +1,7 @@
+# /config/services/heartbeat.yaml — a supervised background daemon.
+# Output is redirected to a log file (cat it to watch it grow).
+description: periodic heartbeat daemon
+exec:        /bin/heartbeat
+respawn:     yes
+enabled:     yes
+log:         /config/logs/heartbeat.log
