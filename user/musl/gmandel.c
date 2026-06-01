@@ -83,11 +83,7 @@ int main(void) {
             if (!s.px) { printf("gmandel: surface alloc failed\n"); break; }
             rerender = 1;
         }
-        if (rerender) {
-            render(&s);
-            printf("[gmandel] DBG render+commit %dx%d (surf %dx%d)\n", c->w, c->h, s.w, s.h);
-            gc_commit(c, &s);
-        }
+        if (rerender) { render(&s); gc_commit(c, &s); }
         usleep(20000);
     }
     gfx_free(&s);

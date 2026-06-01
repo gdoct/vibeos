@@ -85,8 +85,15 @@ static wait_queue_t g_rxq_wq;
 /* Loopback frames generated *by the worker* (e.g. a TCP ACK while tcp_input
    holds sched_lock) are deferred to this worker-private queue and drained after
    the current frame, so the stack never re-enters the sched_lock-protected rx
-   path while already holding it. Only the worker touches it -> no lock. */
-#define LOQ_N 32
+   path while already holding it. Only the worker touches it -> no lock.
+
+   Sized to hold a full pump pass without dropping: one tcp_output can emit a
+   whole advertised window (≤64 KiB ≈ 45 MSS segments) under one lock hold before
+   the drain runs, and a pass may flush several PCBs plus their ACKs. Dropping a
+   loopback frame here looks like packet loss to TCP — it triggers retransmits and
+   collapses cwnd, stalling large transfers (GUI frames) — so this must comfortably
+   exceed the per-pass segment burst. */
+#define LOQ_N 256
 static rxslot_t  g_loq[LOQ_N];
 static uint32_t  g_loq_head, g_loq_tail;
 static task_t   *g_net_worker = nullptr;
@@ -480,6 +487,7 @@ typedef struct tcp_pcb {
 
     /* receive sequence space */
     uint32_t     rcv_nxt;
+    uint32_t     rcv_adv;                       /* right edge of the window we last advertised */
     uint8_t      rxbuf[TCP_RXBUF];
     uint32_t     rxhead, rxtail;               /* byte ring (head=producer) */
     tcp_ooo_t    ooo[TCP_OOO_N];
@@ -559,7 +567,9 @@ static void tcp_send_seg(tcp_pcb_t *t, uint32_t seq, uint8_t flags,
     th->ack = htonl_(t->rcv_nxt);
     th->flags = flags;
     uint32_t freew = tcp_rx_free(t);
-    th->window = htons_((uint16_t)(freew > 0xFFFF ? 0xFFFF : freew));
+    if (freew > 0xFFFF) freew = 0xFFFF;
+    th->window = htons_((uint16_t)freew);
+    t->rcv_adv = t->rcv_nxt + freew;            /* remember the edge we just offered */
     th->csum = 0; th->urg = 0;
     if (mss_opt) {                              /* kind=2, len=4, value */
         seg[hlen + 0] = 2; seg[hlen + 1] = 4;
@@ -796,13 +806,21 @@ static int tcp_read(tcp_pcb_t *t, uint8_t *buf, uint32_t len, int nonblock) {
     if (!t->used || t->reset) { sched_unlock(); return -1; }
     uint32_t avail = tcp_rx_used(t);
     uint32_t n = avail < len ? avail : len;
-    int was_full = (tcp_rx_free(t) == 0);
     for (uint32_t i = 0; i < n; i++) {
         buf[i] = t->rxbuf[t->rxtail];
         t->rxtail = (t->rxtail + 1) % TCP_RXBUF;
     }
     int eof = (n == 0 && t->peer_fin);
-    if (was_full && n > 0) { t->need_ack = 1; tcp_kick(t); }   /* window opened: advertise it */
+    /* Window-update ACK (receiver-side silly-window avoidance): reading drained
+       the rxbuf, so the window we can now offer (rcv_nxt + free) may sit well past
+       what we last advertised (rcv_adv). A sender that filled the old window is
+       blocked waiting to hear it reopened, so advertise the new edge once it grows
+       by at least an MSS — otherwise large transfers stall on the final bytes. */
+    uint32_t mss = t->snd_mss ? t->snd_mss : TCP_MSS;
+    uint32_t new_adv = t->rcv_nxt + tcp_rx_free(t);
+    if (n > 0 && seq_gt(new_adv, t->rcv_adv) && (new_adv - t->rcv_adv) >= mss) {
+        t->need_ack = 1; tcp_kick(t);
+    }
     sched_unlock();
     return eof ? 0 : (int)n;
 }
@@ -1004,6 +1022,7 @@ static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
                 c->snd_una = c->snd_nxt = c->iss;
                 c->snd_buf_seq = c->iss + 1;
                 c->rcv_nxt = seq + 1;            /* +1 for the SYN */
+                c->rcv_adv = c->rcv_nxt;         /* tcp_output() will advertise the real window */
                 c->snd_wnd = win ? win : TCP_MSS;
                 c->snd_wl1 = seq; c->snd_wl2 = c->iss;
                 c->listener = lst;
@@ -1033,12 +1052,22 @@ static void tcp_input(uint32_t src, const uint8_t *p, uint32_t len) {
         return;
     }
 
-    if (flags & TCP_ACK) tcp_recv_ack(t, ack, win, seq);
+    if (flags & TCP_ACK) {
+        tcp_recv_ack(t, ack, win, seq);
+        /* The ACK may have freed send-buffer space or reopened the receive window
+           (a pure window update carries no data, so no other path would react).
+           Push whatever the window now admits — without this, a sender that filled
+           a shrunken window stalls on its final bytes forever. */
+        if (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT ||
+            t->state == T_FIN_WAIT_1 || t->state == T_CLOSING || t->state == T_LAST_ACK)
+            tcp_output(t);
+    }
 
     switch (t->state) {
     case T_SYN_SENT:
         if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
             t->rcv_nxt = seq + 1;
+            t->rcv_adv = t->rcv_nxt;
             t->snd_wnd = win ? win : TCP_MSS;
             t->snd_wl1 = seq; t->snd_wl2 = ack;
             t->syn_acked = 1;
