@@ -585,6 +585,45 @@ static int64_t sys_munmap(uint64_t addr, uint64_t len) {
     return 0;
 }
 
+/* mremap (ROADMAP §4): resize an anonymous mapping. musl's realloc() of large
+   (mmap-backed) chunks calls this — e.g. the GUI window manager growing its
+   per-window receive buffer on a resize drag. Our mmap is a bump-arena with no
+   per-region size table, so we cannot safely extend in place (the VA just past a
+   region may be a PROT_NONE guard musl reserved). We therefore honour the model
+   musl always asks for — MREMAP_MAYMOVE — by allocating a fresh region above
+   mmap_next, copying the live bytes, and unmapping the old one. Shrink frees the
+   tail in place. */
+#define MREMAP_MAYMOVE 1
+static int64_t sys_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
+                          int flags, uint64_t new_addr) {
+    (void)new_addr;
+    if ((old_addr & PAGE_MASK) || new_len == 0) return -EINVAL_;
+    task_t *t = task_current();
+    uint64_t old_pg = PAGE_ALIGN_UP(old_len);
+    uint64_t new_pg = PAGE_ALIGN_UP(new_len);
+
+    if (new_pg == old_pg) return (int64_t)old_addr;        /* same page count */
+
+    if (new_pg < old_pg) {                                  /* shrink: free tail */
+        sys_munmap(old_addr + new_pg, old_pg - new_pg);
+        return (int64_t)old_addr;
+    }
+
+    /* grow: relocate (we can't trust the VA above the region to be free). */
+    if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM_;
+    uint64_t base = (t->mmap_next += new_pg) - new_pg;
+    for (uint64_t va = base; va < base + new_pg; va += PAGE_SIZE) {
+        uint64_t pa = pmm_alloc_page();                     /* zeroed by the PMM */
+        if (!pa) return -ENOMEM_;
+        vmspace_map(t->vm, va, pa, 1, PTE_P | PTE_W | PTE_U);
+    }
+    /* same address space is live, so the old + new VAs are both reachable */
+    kmemcpy((void *)(uintptr_t)base, (const void *)(uintptr_t)old_addr,
+            old_len < new_len ? old_len : new_len);
+    sys_munmap(old_addr, old_pg);
+    return (int64_t)base;
+}
+
 static int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot) {
     len  = PAGE_ALIGN_UP(len);
     addr = PAGE_ALIGN_DOWN(addr);
@@ -1371,6 +1410,8 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 10:  return (uint64_t)sys_mprotect(f->rdi, f->rsi, (int)f->rdx);  /* mprotect */
     case 11:  return (uint64_t)sys_munmap(f->rdi, f->rsi);      /* munmap */
     case 12:  return sys_brk(f->rdi);
+    case 25:  return (uint64_t)sys_mremap(f->rdi, f->rsi, f->rdx, (int)f->r10,
+                                          f->r8);                  /* mremap */
     case 13:  return (uint64_t)sys_rt_sigaction((int)f->rdi, (const void *)f->rsi,
                                                 (void *)f->rdx, f->r10);  /* rt_sigaction */
     case 14:  return (uint64_t)sys_rt_sigprocmask((int)f->rdi, (const void *)f->rsi,

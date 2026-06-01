@@ -21,10 +21,14 @@ int main(void) {
     int bx = 10, by = 30, vx = 3, vy = 2, ticks = 0;
     for (;;) {
         gevt_input_t ev;
-        int r = gc_poll(c, &ev);
-        if (r < 0) break;
-        if (r > 0 && ev.ev == GE_KEY && ev.key == 'q') break;
-        if (r > 0 && ev.ev == GE_RESIZE) {       /* re-make the surface */
+        int r, resized = 0, quit = 0;
+        /* Drain all pending events (coalesce a resize burst to the final size). */
+        while ((r = gc_poll(c, &ev)) > 0) {
+            if (ev.ev == GE_KEY && ev.key == 'q') quit = 1;
+            else if (ev.ev == GE_RESIZE) resized = 1;   /* c->w/c->h updated in gc_poll */
+        }
+        if (r < 0 || quit) break;
+        if (resized) {                               /* re-make the surface */
             gfx_free(&s); s = gfx_alloc(c->w, c->h);
             if (!s.px) break;
         }

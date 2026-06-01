@@ -520,8 +520,25 @@ int main(void) {
     compose(); present_rect(0,0,g_screen.w,g_screen.h); draw_cursor();
     g_dirty = 0;
 
+    /* DBG harness: auto-launch a client and resize it on a timer (no mouse). */
+    launch("/bin/gmandel");
+    long dbg_tick = 0; int dbg_step = 0;
+
     struct pollfd pfd[MAXWIN+1];
     for (;;) {
+        /* DBG: simulate a mouse-drag resize — a BURST of do_resize calls on
+           consecutive frames, like the WM does for each mouse-move event. */
+        dbg_tick++;
+        if (g_nz > 0) {
+            int top = g_z[g_nz-1];
+            if (dbg_tick >= 200 && dbg_tick < 260 && dbg_step == 0) {
+                int n = (int)(dbg_tick - 200);          /* 0..59: grow 200->500ish */
+                do_resize(top, 200 + n*5, 150 + n*4);
+                if (dbg_tick == 259) { dbg_step = 1;
+                    printf("[guiwm] DBG drag-burst done, final %dx%d\n",
+                           g_win[top].w, g_win[top].h); }
+            }
+        }
         int np = 0;
         pfd[np].fd = ls; pfd[np].events = POLLIN; np++;
         int map[MAXWIN+1]; map[0] = -1;

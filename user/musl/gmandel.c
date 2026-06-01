@@ -57,25 +57,36 @@ int main(void) {
 
     for (;;) {
         gevt_input_t ev;
-        int r = gc_poll(c, &ev);
-        if (r < 0) { printf("gmandel: window closed\n"); break; }
-        if (r > 0 && ev.ev == GE_RESIZE) {       /* re-render at the new size */
-            gfx_free(&s); s = gfx_alloc(c->w, c->h);
-            if (s.px) { render(&s); gc_commit(c, &s); }
-        }
-        if (r > 0 && ev.ev == GE_KEY) {
-            int redraw = 1;
-            switch (ev.key) {
-            case 'q': gc_close(c); gfx_free(&s); return 0;
-            case '=': case '+': scale *= 0.7; break;
-            case '-': scale /= 0.7; break;
-            case 'w': cy -= scale*0.1; break;
-            case 's': cy += scale*0.1; break;
-            case 'a': cx -= scale*0.1; break;
-            case 'd': cx += scale*0.1; break;
-            default: redraw = 0; break;
+        int r, resized = 0, rerender = 0;
+        /* Drain ALL pending events before acting. A resize drag delivers a burst
+           of GE_RESIZE (one per WM frame); rendering the fractal for each is far
+           too slow and the client would lag the whole drag behind. Coalesce them:
+           gc_poll keeps c->w/c->h at the latest size, so we render just once. */
+        while ((r = gc_poll(c, &ev)) > 0) {
+            if (ev.ev == GE_RESIZE) resized = 1;     /* c->w/c->h already updated */
+            else if (ev.ev == GE_KEY) {
+                switch (ev.key) {
+                case 'q': gc_close(c); gfx_free(&s); return 0;
+                case '=': case '+': scale *= 0.7; rerender = 1; break;
+                case '-': scale /= 0.7;            rerender = 1; break;
+                case 'w': cy -= scale*0.1;         rerender = 1; break;
+                case 's': cy += scale*0.1;         rerender = 1; break;
+                case 'a': cx -= scale*0.1;         rerender = 1; break;
+                case 'd': cx += scale*0.1;         rerender = 1; break;
+                default: break;
+                }
             }
-            if (redraw) { render(&s); gc_commit(c, &s); }
+        }
+        if (r < 0) { printf("gmandel: window closed\n"); break; }
+        if (resized) {                               /* re-fit surface to final size */
+            gfx_free(&s); s = gfx_alloc(c->w, c->h);
+            if (!s.px) { printf("gmandel: surface alloc failed\n"); break; }
+            rerender = 1;
+        }
+        if (rerender) {
+            render(&s);
+            printf("[gmandel] DBG render+commit %dx%d (surf %dx%d)\n", c->w, c->h, s.w, s.h);
+            gc_commit(c, &s);
         }
         usleep(20000);
     }

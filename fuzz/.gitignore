@@ -1,0 +1,12 @@
+# build outputs
+tcpfuzz
+tcpdbg
+tcpcov
+# fuzzer state / coverage
+corpus/
+artifacts/
+*.profraw
+*.profdata
+crash-*
+timeout-*
+oom-*
