@@ -4,8 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern const uint8_t font8x8[128][8];   /* font8x8_u.c */
-
 gfx_surface_t gfx_wrap(uint32_t *px, int w, int h, int stride) {
     gfx_surface_t s = { px, w, h, stride };
     return s;
@@ -115,28 +113,73 @@ void gfx_blit_alpha(gfx_surface_t *dst, const uint32_t *src, int sw, int sh, int
     }
 }
 
+/* ---- text: antialiased glyph atlases (see gfx_font.h) ---- */
+
+static const gfx_font_t *g_font = &gfx_font_chicago;
+static gfx_font_size_t   g_size = GFX_FONT_NORMAL;
+
+static const gfx_face_t *face(void) { return &g_font->faces[g_size]; }
+
+void gfx_set_font(const gfx_font_t *f) { if (f) g_font = f; }
+void gfx_set_size(gfx_font_size_t sz)  { if (sz < GFX_FONT_NSIZES) g_size = sz; }
+
+int gfx_line_h(void)      { return face()->line_h; }
+int gfx_font_ascent(void) { return face()->ascent; }
+int gfx_cell_w(void)      { return face()->cell_w; }
+
+/* Advance width of one ASCII byte in the active face (cell_w for misses). */
+static int glyph_advance(const gfx_face_t *f, unsigned char uc) {
+    if (uc < f->first || uc > f->last) return f->cell_w;
+    return f->glyphs[uc - f->first].advance;
+}
+
 void gfx_char(gfx_surface_t *s, int x, int y, char c, uint32_t fg) {
-    unsigned char idx = (unsigned char)c;
-    if (idx >= 'a' && idx <= 'z') idx -= 32;
-    if (idx >= 128) idx = '?';
-    const uint8_t *glyph = font8x8[idx];
-    for (int row = 0; row < GFX_GLYPH_H; row++) {
-        uint8_t bits = glyph[row];
-        for (int col = 0; col < GFX_GLYPH_W; col++)
-            if (bits & (0x80 >> col)) gfx_pixel(s, x + col, y + row, fg);
+    const gfx_face_t *f = face();
+    unsigned char uc = (unsigned char)c;
+    if (uc < f->first || uc > f->last) return;        /* no glyph (incl. space) */
+    const gfx_glyph_t *g = &f->glyphs[uc - f->first];
+    const uint8_t *a = f->alpha + g->off;
+    int bx = x + g->xoff;
+    int by = y + f->ascent + g->yoff;                 /* atlas is baseline-relative */
+    uint32_t fr = (fg >> 16) & 0xFF, fgc = (fg >> 8) & 0xFF, fb = fg & 0xFF;
+
+    for (int row = 0; row < g->h; row++) {
+        int py = by + row;
+        if (py < 0 || py >= s->h) continue;
+        const uint8_t *arow = a + (size_t)row * g->w;
+        uint32_t *drow = s->px + (size_t)py * s->stride;
+        for (int col = 0; col < g->w; col++) {
+            uint32_t cov = arow[col];
+            if (!cov) continue;
+            int px = bx + col;
+            if (px < 0 || px >= s->w) continue;
+            if (cov == 255) { drow[px] = fg & 0xFFFFFF; continue; }
+            uint32_t d = drow[px];
+            uint32_t dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
+            uint32_t r = (fr * cov + dr * (255 - cov)) / 255;
+            uint32_t gg = (fgc * cov + dg * (255 - cov)) / 255;
+            uint32_t b = (fb * cov + db * (255 - cov)) / 255;
+            drow[px] = (r << 16) | (gg << 8) | b;
+        }
     }
 }
 
 void gfx_text(gfx_surface_t *s, int x, int y, const char *str, uint32_t fg) {
+    const gfx_face_t *f = face();
     int cx = x;
     for (; *str; str++) {
-        if (*str == '\n') { y += GFX_GLYPH_H; cx = x; continue; }
+        if (*str == '\n') { y += f->line_h; cx = x; continue; }
         gfx_char(s, cx, y, *str, fg);
-        cx += GFX_GLYPH_W;
+        cx += glyph_advance(f, (unsigned char)*str);
     }
 }
 
 int gfx_text_w(const char *str) {
-    int n = 0; for (; *str; str++) n++;
-    return n * GFX_GLYPH_W;
+    const gfx_face_t *f = face();
+    int w = 0, line = 0;
+    for (; *str; str++) {
+        if (*str == '\n') { if (line > w) w = line; line = 0; continue; }
+        line += glyph_advance(f, (unsigned char)*str);
+    }
+    return line > w ? line : w;
 }

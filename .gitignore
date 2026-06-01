@@ -47,3 +47,6 @@ obj/
 # Generated VibeOS cross-toolchain sysroot (rebuild with: make sysroot)
 toolchain/sysroot/
 toolchain/vibeos.specs
+
+# host build-time font tool (binary)
+gui/client/tools/genfont

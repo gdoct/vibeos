@@ -8,6 +8,7 @@
 #define VIBEOS_LIBGFX_H
 
 #include <stdint.h>
+#include "gfx_font.h"
 
 typedef struct gfx_surface {
     uint32_t *px;
@@ -15,8 +16,6 @@ typedef struct gfx_surface {
 } gfx_surface_t;
 
 #define GFX_RGB(r,g,b) (((uint32_t)(r)<<16)|((uint32_t)(g)<<8)|(uint32_t)(b))
-#define GFX_GLYPH_W 8
-#define GFX_GLYPH_H 8
 
 /* Wrap an existing pixel buffer (no allocation). */
 gfx_surface_t gfx_wrap(uint32_t *px, int w, int h, int stride);
@@ -40,8 +39,17 @@ void gfx_blit_key(gfx_surface_t *dst, const uint32_t *src, int sw, int sh,
 /* Alpha-blit a 0xAARRGGBB block over dst (per-pixel alpha). */
 void gfx_blit_alpha(gfx_surface_t *dst, const uint32_t *src, int sw, int sh, int dx, int dy);
 
+/* Text. Glyphs are drawn from the active font/size (default: chicago, NORMAL)
+ * and alpha-blended over the surface in color `fg`. (x,y) is the top-left of
+ * the text line; the baseline sits at y + gfx_font_ascent(). */
+void gfx_set_font(const gfx_font_t *f);     /* switch family (keeps size) */
+void gfx_set_size(gfx_font_size_t sz);      /* tiny..huge */
+
 void gfx_char(gfx_surface_t *s, int x, int y, char c, uint32_t fg);
 void gfx_text(gfx_surface_t *s, int x, int y, const char *str, uint32_t fg);
-int  gfx_text_w(const char *str);   /* pixel width of a string */
+int  gfx_text_w(const char *str);   /* pixel advance width of a string */
+int  gfx_line_h(void);              /* line pitch of the active face */
+int  gfx_font_ascent(void);         /* baseline offset from the line's top */
+int  gfx_cell_w(void);              /* monospace cell width (max advance) */
 
 #endif

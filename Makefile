@@ -11,6 +11,7 @@
 # Test: qemu-system-x86_64 with OVMF firmware.
 
 CC      := g++
+HOSTCC  ?= gcc        # host C compiler for build-time tools (genfont)
 LD      := ld
 QEMU    ?= qemu-system-x86_64
 OVMF    ?= /usr/share/OVMF/OVMF_CODE_4M.fd
@@ -200,9 +201,21 @@ USER_GMANDEL  = user/build/gmandel.elf
 USER_GCLOCK   = user/build/gclock.elf
 USER_GTERM    = user/build/gterm.elf      # graphical terminal over /bin/sh
 USER_GUIHELLO = user/build/guihello.elf   # skeleton example (docs/examples)
-GUI_GFX = gui/client/src/libgfx.c gui/client/src/font8x8_u.c gui/client/src/gui_logo_u.c
+GUI_GFX = gui/client/src/libgfx.c gui/client/src/font_chicago.c gui/client/src/font_mono.c gui/client/src/gui_logo_u.c
 GUI_CLI = gui/client/src/gui_client.c
 GUI_INC = -Igui/client/include
+
+# Font atlases (gui/client/src/font_*.c) are baked from TrueType at build time by
+# the host genfont tool and checked in (like gui_logo_u.c). `make fonts`
+# regenerates them; the normal build just compiles the committed .c. See
+# gui/client/tools/genfont.c and gui/client/include/gfx_font.h.
+GENFONT = gui/client/tools/genfont
+.PHONY: fonts
+$(GENFONT): gui/client/tools/genfont.c gui/client/tools/stb_truetype.h
+	$(HOSTCC) -O2 -o $@ $< -lm
+fonts: $(GENFONT)
+	$(GENFONT) gui/client/assets/chicago.ttf chicago gui/client/src/font_chicago.c
+	$(GENFONT) gui/client/assets/liberation_mono.ttf mono gui/client/src/font_mono.c
 
 # VibeOS cross toolchain (ROADMAP §"Toolchain integration").
 VIBEOS_CC     = ./toolchain/x86_64-vibeos-musl-gcc

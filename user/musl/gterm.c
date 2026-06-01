@@ -39,10 +39,13 @@
 
 extern char **environ;
 
-/* ---- grid geometry (pixels derive from the 8x8 glyph) ---- */
-#define CELL_W    8                 /* GFX_GLYPH_W */
-#define GLYPH_H   8                 /* GFX_GLYPH_H */
-#define LINE_H    11                /* glyph + leading */
+/* ---- grid geometry ----
+   The terminal forces the (proportional) UI font into a fixed monospace cell:
+   CELL_W is the font's max advance, LINE_H its line pitch. Both come from the
+   active face and are filled in main() before the window opens. */
+static int CELL_W;                  /* monospace cell width (gfx_cell_w) */
+static int GLYPH_H;                 /* baseline-ish row for the cursor bar */
+static int LINE_H;                  /* line pitch (gfx_line_h) */
 #define MARGIN_X  6
 #define MARGIN_Y  6
 #define SB_GAP    4                 /* gap between text area and scrollbar */
@@ -52,8 +55,6 @@ extern char **environ;
 /* default (initial) window: an 80x26 grid, matching the classic size */
 #define DEF_COLS  80
 #define DEF_ROWS  26
-#define DEF_W     (MARGIN_X + DEF_COLS*CELL_W + SB_GAP + SB_W + MARGIN_X)
-#define DEF_H     (MARGIN_Y + DEF_ROWS*LINE_H + MARGIN_Y)
 
 /* ---- colors ---- */
 #define C_BG      GFX_RGB(0x10,0x12,0x18)
@@ -75,8 +76,8 @@ static int  g_scroll = 0;           /* lines scrolled up from the bottom */
 /* ---- live geometry, recomputed from the window's pixel size ---- */
 static int  g_cols     = DEF_COLS;
 static int  g_vis_rows = DEF_ROWS;
-static int  g_sb_x     = MARGIN_X + DEF_COLS*CELL_W + SB_GAP;   /* scrollbar x */
-static int  g_track_h  = DEF_ROWS*LINE_H;                       /* scrollbar track */
+static int  g_sb_x     = 0;         /* scrollbar x  (set by recompute_geometry) */
+static int  g_track_h  = 0;         /* scrollbar track (set by recompute_geometry) */
 
 /* Derive the grid + scrollbar layout from a window content size of w x h. */
 static void recompute_geometry(int w, int h) {
@@ -227,6 +228,16 @@ static void scrollbar_to(int y) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    /* A terminal wants monospace: use the serif fixed-width font and drive the
+       cell from its (uniform) advance rather than a hard-coded 8px glyph. */
+    gfx_set_font(&gfx_font_mono);
+    gfx_set_size(GFX_FONT_NORMAL);
+    CELL_W  = gfx_cell_w();
+    LINE_H  = gfx_line_h();
+    GLYPH_H = gfx_font_ascent() + 1;
+    int def_w = MARGIN_X + DEF_COLS*CELL_W + SB_GAP + SB_W + MARGIN_X;
+    int def_h = MARGIN_Y + DEF_ROWS*LINE_H + MARGIN_Y;
+
     for (int i = 0; i < MAXLINES; i++) clear_line(i);
 
     /* Pipes: in[] carries our keystrokes to the shell's stdin; out[] carries
@@ -255,7 +266,7 @@ int main(void) {
     int sh_in = in[1], sh_out = out[0];
     fcntl(sh_out, F_SETFL, fcntl(sh_out, F_GETFL, 0) | O_NONBLOCK);
 
-    gui_conn_t *c = gc_open(DEF_W, DEF_H, "TERMINAL");
+    gui_conn_t *c = gc_open(def_w, def_h, "TERMINAL");
     if (!c) { printf("gterm: cannot reach the window manager\n"); return 1; }
     recompute_geometry(c->w, c->h);
 
