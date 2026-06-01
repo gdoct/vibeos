@@ -228,9 +228,10 @@ static void scrollbar_to(int y) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    /* A terminal wants monospace: use the serif fixed-width font and drive the
-       cell from its (uniform) advance rather than a hard-coded 8px glyph. */
-    gfx_set_font(&gfx_font_mono);
+    /* A terminal wants monospace: use Go Mono (a crisp outline with the Sun/
+       Lucida humanist feel) and drive the cell from its uniform advance rather
+       than a hard-coded 8px glyph. */
+    gfx_set_font(&gfx_font_gomono);
     gfx_set_size(GFX_FONT_NORMAL);
     CELL_W  = gfx_cell_w();
     LINE_H  = gfx_line_h();

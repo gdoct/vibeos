@@ -201,7 +201,7 @@ USER_GMANDEL  = user/build/gmandel.elf
 USER_GCLOCK   = user/build/gclock.elf
 USER_GTERM    = user/build/gterm.elf      # graphical terminal over /bin/sh
 USER_GUIHELLO = user/build/guihello.elf   # skeleton example (docs/examples)
-GUI_GFX = gui/client/src/libgfx.c gui/client/src/font_chicago.c gui/client/src/font_mono.c gui/client/src/gui_logo_u.c
+GUI_GFX = gui/client/src/libgfx.c gui/client/src/font_chicago.c gui/client/src/font_gomono.c gui/client/src/gui_logo_u.c
 GUI_CLI = gui/client/src/gui_client.c
 GUI_INC = -Igui/client/include
 
@@ -215,7 +215,7 @@ $(GENFONT): gui/client/tools/genfont.c gui/client/tools/stb_truetype.h
 	$(HOSTCC) -O2 -o $@ $< -lm
 fonts: $(GENFONT)
 	$(GENFONT) gui/client/assets/chicago.ttf chicago gui/client/src/font_chicago.c
-	$(GENFONT) gui/client/assets/liberation_mono.ttf mono gui/client/src/font_mono.c
+	$(GENFONT) gui/client/assets/go_mono.ttf gomono gui/client/src/font_gomono.c
 
 # VibeOS cross toolchain (ROADMAP §"Toolchain integration").
 VIBEOS_CC     = ./toolchain/x86_64-vibeos-musl-gcc
