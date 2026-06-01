@@ -22,9 +22,10 @@ typedef struct gfb_info {
 /* ---- kernel ABI: /dev/input events (read()) — mirrors kernel input.h ---- */
 #define GIN_MOUSE 1
 #define GIN_KEY   2
+#define GIN_MOD_CTRL 0x01   /* key event: Ctrl held (carried in `buttons`) */
 typedef struct gin_event {
     uint8_t  type;          /* GIN_MOUSE | GIN_KEY */
-    uint8_t  buttons;       /* mouse: bit0=L,1=R,2=M */
+    uint8_t  buttons;       /* mouse: bit0=L,1=R,2=M; key: GIN_MOD_* mask */
     uint8_t  code;          /* key: ASCII */
     uint8_t  pressed;       /* key: 1=down */
     int16_t  x, y;          /* mouse: absolute */
@@ -77,7 +78,7 @@ enum {
 typedef struct gevt_input {
     uint32_t ev;            /* GE_* */
     int32_t  x, y;          /* window-local pixel position (mouse events) */
-    uint32_t buttons;       /* mouse button bitmask */
+    uint32_t buttons;       /* mouse button bitmask; GE_KEY: GIN_MOD_* mask */
     uint32_t key;           /* ASCII (GE_KEY) */
 } gevt_input_t;
 

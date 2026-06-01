@@ -211,6 +211,7 @@ static const char kmap[2][0x40] = {
 
 static void kbd_report(hid_dev_t *h, const uint8_t *r) {
     int shift = (r[0] & 0x22) != 0;            /* L/R shift modifiers */
+    int ctrl  = (r[0] & 0x11) != 0;            /* L/R ctrl modifiers   */
     for (int i = 2; i < 8; i++) {
         uint8_t k = r[i];
         if (k == 0) continue;
@@ -219,7 +220,8 @@ static void kbd_report(hid_dev_t *h, const uint8_t *r) {
         if (was) continue;                     /* still held: not a fresh press */
         if (k < 0x40 && kmap[shift][k]) {
             char c = kmap[shift][k];
-            if (input_grabbed())      input_push_key(c); /* userspace GUI server */
+            int mods = ctrl ? INPUT_MOD_CTRL : 0;
+            if (input_grabbed())      input_push_key(c, mods); /* userspace GUI server */
             else if (gui_wants_keyboard()) gui_input_key(c);  /* in-kernel WM textbox */
             else                      tty_input(c);      /* otherwise the console */
         }

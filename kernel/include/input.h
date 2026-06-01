@@ -21,16 +21,18 @@ extern "C" {
 #define INPUT_EV_MOUSE  1   /* absolute x/y + button bitmask */
 #define INPUT_EV_KEY    2   /* a key press (code = ASCII, pressed = 1) */
 
+#define INPUT_MOD_CTRL  0x01    /* key event: Ctrl held (carried in `buttons`) */
+
 typedef struct input_event {
     uint8_t  type;          /* INPUT_EV_* */
-    uint8_t  buttons;       /* mouse: bit0=L, bit1=R, bit2=M */
+    uint8_t  buttons;       /* mouse: bit0=L,1=R,2=M; key: INPUT_MOD_* mask */
     uint8_t  code;          /* key: ASCII byte */
     uint8_t  pressed;       /* key: 1 = down */
     int16_t  x, y;          /* mouse: absolute pixel position */
 } input_event_t;            /* 8 bytes */
 
 void input_push_mouse(int x, int y, int buttons);
-void input_push_key(char c);
+void input_push_key(char c, int mods);
 
 /* Drain up to n bytes of whole events into buf (non-blocking). Returns bytes. */
 int  input_read(void *buf, uint32_t n);

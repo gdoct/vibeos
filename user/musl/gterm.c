@@ -15,7 +15,8 @@
  * lines, with a draggable scrollbar to page back through history. The grid is
  * derived from the window's pixel size and recomputed on GE_RESIZE, so the
  * window is freely resizable. Output and typing always snap the view to the
- * bottom (latest), like a vtty.
+ * bottom (latest), like a vtty. Ctrl +/- cycles the font through the five baked
+ * sizes (Ctrl-0 resets to NORMAL), re-fitting the grid to the same window.
  *
  * Rendering pushes only what changed: redraw() repaints the whole local surface
  * (cheap), then commit_damage() diffs against the last committed frame and ships
@@ -46,6 +47,7 @@ extern char **environ;
 static int CELL_W;                  /* monospace cell width (gfx_cell_w) */
 static int GLYPH_H;                 /* baseline-ish row for the cursor bar */
 static int LINE_H;                  /* line pitch (gfx_line_h) */
+static int g_font_sz = GFX_FONT_NORMAL;   /* current size; Ctrl +/- adjusts it */
 #define MARGIN_X  6
 #define MARGIN_Y  6
 #define SB_GAP    4                 /* gap between text area and scrollbar */
@@ -90,6 +92,15 @@ static void recompute_geometry(int w, int h) {
     if (g_vis_rows < 1) g_vis_rows = 1;
     g_sb_x    = w - MARGIN_X - SB_W;
     g_track_h = g_vis_rows * LINE_H;
+}
+
+/* Select the active font size and refresh the cached cell metrics from it.
+   Call recompute_geometry() afterwards to re-fit the grid to the new cell. */
+static void apply_font_size(void) {
+    gfx_set_size((gfx_font_size_t)g_font_sz);
+    CELL_W  = gfx_cell_w();
+    LINE_H  = gfx_line_h();
+    GLYPH_H = gfx_font_ascent() + 1;
 }
 
 static int phys(int logical) { return (g_top + logical) % MAXLINES; }
@@ -232,10 +243,7 @@ int main(void) {
        Lucida humanist feel) and drive the cell from its uniform advance rather
        than a hard-coded 8px glyph. */
     gfx_set_font(&gfx_font_gomono);
-    gfx_set_size(GFX_FONT_NORMAL);
-    CELL_W  = gfx_cell_w();
-    LINE_H  = gfx_line_h();
-    GLYPH_H = gfx_font_ascent() + 1;
+    apply_font_size();                  /* fills CELL_W / LINE_H / GLYPH_H */
     int def_w = MARGIN_X + DEF_COLS*CELL_W + SB_GAP + SB_W + MARGIN_X;
     int def_h = MARGIN_Y + DEF_ROWS*LINE_H + MARGIN_Y;
 
@@ -299,7 +307,22 @@ int main(void) {
         while ((r = gc_poll(c, &ev)) > 0) {
             if (ev.ev == GE_KEY) {
                 unsigned k = ev.key;
-                if (k == '\n' || k == '\r') {            /* submit the line */
+                int handled = 0;
+                if (ev.buttons & GIN_MOD_CTRL) {         /* font size shortcuts */
+                    int ns = g_font_sz;
+                    if (k == '=' || k == '+')      { if (ns < GFX_FONT_HUGE) ns++; handled = 1; }
+                    else if (k == '-' || k == '_') { if (ns > GFX_FONT_TINY) ns--; handled = 1; }
+                    else if (k == '0')             { ns = GFX_FONT_NORMAL;         handled = 1; }
+                    if (handled && ns != g_font_sz) {
+                        g_font_sz = ns;
+                        apply_font_size();               /* new CELL_W / LINE_H */
+                        recompute_geometry(c->w, c->h);  /* re-fit the grid */
+                        gfx_clear(&prev, 0);             /* force a full repaint */
+                    }
+                }
+                if (handled) {
+                    /* swallow the Ctrl combo — don't echo it to the shell */
+                } else if (k == '\n' || k == '\r') {     /* submit the line */
                     term_putc('\n');
                     inbuf[inlen++] = '\n';
                     (void)!write(sh_in, inbuf, inlen);
