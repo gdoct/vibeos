@@ -490,7 +490,7 @@ run: $(IMG) $(VDISK)
 	  -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 	  -device virtio-rng-pci \
 	  -device piix3-usb-uhci,id=uhci \
-	  -device usb-kbd,bus=uhci.0,port=1 -device usb-mouse,bus=uhci.0,port=2 \
+	  -device usb-kbd,bus=uhci.0,port=1 -device usb-tablet,bus=uhci.0,port=2 \
 	  -vga none -device VGA,edid=on,xres=1280,yres=960 \
 	  -monitor unix:/tmp/vibeos-mon.sock,server,nowait \
 	  $(QEMU_DISPLAY) \

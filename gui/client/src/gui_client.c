@@ -58,15 +58,26 @@ gui_conn_t *gc_open(int w, int h, const char *title) {
     return c;
 }
 
-int gc_commit(gui_conn_t *c, gfx_surface_t *s) {
-    gmsg_hdr_t hdr = { GMSG_FRAME, (uint32_t)(sizeof(gmsg_frame_t) + (size_t)s->w * s->h * 4) };
-    gmsg_frame_t fr = { 0, 0, (uint32_t)s->w, (uint32_t)s->h };
+int gc_commit_rect(gui_conn_t *c, gfx_surface_t *s, int x, int y, int w, int h) {
+    /* clip the rect to the surface so a bad caller can't desync the stream */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    if (w <= 0 || h <= 0) return 0;                /* nothing to send */
+
+    gmsg_hdr_t hdr = { GMSG_FRAME, (uint32_t)(sizeof(gmsg_frame_t) + (size_t)w * h * 4) };
+    gmsg_frame_t fr = { (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h };
     if (write_full(c->fd, &hdr, sizeof hdr)) return -1;
     if (write_full(c->fd, &fr, sizeof fr)) return -1;
-    /* surface may be strided; send row by row */
-    for (int y = 0; y < s->h; y++)
-        if (write_full(c->fd, s->px + (size_t)y * s->stride, s->w * 4)) return -1;
+    /* surface may be strided; send the rect's rows tightly packed */
+    for (int row = 0; row < h; row++)
+        if (write_full(c->fd, s->px + (size_t)(y + row) * s->stride + x, (size_t)w * 4)) return -1;
     return 0;
+}
+
+int gc_commit(gui_conn_t *c, gfx_surface_t *s) {
+    return gc_commit_rect(c, s, 0, 0, s->w, s->h);
 }
 
 int gc_poll(gui_conn_t *c, gevt_input_t *ev) {

@@ -107,8 +107,8 @@ static uint32_t dma_phys32(const void *p) {
 /* ---- a HID device we found ---- */
 typedef struct {
     int      used;
-    int      proto;            /* 1 = keyboard, 2 = mouse */
-    uint8_t  addr, ep, maxpkt, lowspeed, toggle;
+    int      proto;            /* 1 = keyboard, 2 = relative mouse, 0 = abs pointer (tablet) */
+    uint8_t  addr, ep, maxpkt, lowspeed, toggle, rlen;
     uhci_qh_t *qh;             /* this endpoint's interrupt QH (in the frame list) */
     uhci_td_t *td;             /* its single interrupt-IN TD */
     uint8_t  *report;          /* DMA report buffer */
@@ -247,6 +247,27 @@ static void mouse_report(const uint8_t *r) {
     g_last_btn = btn;
 }
 
+/* Absolute pointer (USB tablet) boot report: byte0 = buttons, bytes 1..2 = X,
+   bytes 3..4 = Y (little-endian, logical range 0..0x7FFF), byte5 = wheel. Unlike
+   a relative mouse there is no accumulation or grab — the host cursor position is
+   delivered directly, which is why a tablet "just works" in a VM. We rescale the
+   0..0x7FFF axes onto the framebuffer. */
+static void tablet_report(const uint8_t *r) {
+    int ax = r[1] | (r[2] << 8);
+    int ay = r[3] | (r[4] << 8);
+    int mw = 1024, mh = 768;
+    fb_device_t *fb = fb_get();
+    if (fb) { mw = (int)fb->width; mh = (int)fb->height; }
+    g_mx = (int)((int64_t)ax * mw / 0x8000);
+    g_my = (int)((int64_t)ay * mh / 0x8000);
+    if (g_mx >= mw) g_mx = mw - 1;
+    if (g_my >= mh) g_my = mh - 1;
+    int btn = r[0] & 7;
+    g_mbtn = btn;
+    if (input_grabbed()) input_push_mouse(g_mx, g_my, btn);
+    g_last_btn = btn;
+}
+
 /* Current pointer position + button bitmask (bit0=L,1=R,2=M). For the GUI. */
 extern "C" void usb_mouse_get(int *x, int *y, int *buttons) {
     if (x) *x = g_mx; if (y) *y = g_my; if (buttons) *buttons = g_mbtn;
@@ -254,7 +275,7 @@ extern "C" void usb_mouse_get(int *x, int *y, int *buttons) {
 
 /* Arm a HID device's interrupt-IN TD (re-used each poll). */
 static void hid_arm(hid_dev_t *h) {
-    int rlen = (h->proto == 1) ? 8 : 4;
+    int rlen = h->rlen;
     h->td->cs = TD_ACTIVE | TD_ERRCNT | (h->lowspeed ? TD_LS : 0);
     h->td->token = (((uint32_t)(rlen - 1) & 0x7FF) << 21) | ((uint32_t)h->toggle << 19) |
                    ((uint32_t)h->ep << 15) | ((uint32_t)h->addr << 8) | PID_IN;
@@ -267,8 +288,9 @@ static void hid_poll(hid_dev_t *h) {
     if (h->td->cs & TD_ACTIVE) return;          /* NAK / not ready yet */
     uint32_t cs = h->td->cs;
     if ((cs & TD_STATUS_MASK) == 0) {           /* success: a report arrived */
-        if (h->proto == 1) kbd_report(h, h->report);
-        else               mouse_report(h->report);
+        if      (h->proto == 1) kbd_report(h, h->report);     /* keyboard */
+        else if (h->proto == 2) mouse_report(h->report);      /* relative mouse */
+        else                    tablet_report(h->report);     /* absolute pointer */
     }
     h->toggle ^= 1;
     hid_arm(h);                                 /* re-poll */
@@ -322,16 +344,18 @@ static void enumerate_port(int port) {
     int cfgval = buf[5];
 
     /* walk interface + endpoint descriptors */
-    int proto = 0, iface = 0, ep = 0, eppkt = 8;
+    int proto = 0, iface = 0, ep = 0, eppkt = 8, is_hid = 0, subclass = 0;
     for (int o = 0; o + 2 <= total; ) {
         int blen = buf[o], btype = buf[o + 1];
         if (blen == 0) break;
         if (btype == 0x04) {                    /* interface */
             if (buf[o + 5] == 0x03) {           /* bInterfaceClass = HID */
+                is_hid = 1;
+                subclass = buf[o + 6];          /* bInterfaceSubClass: 1=boot */
                 proto = buf[o + 7];             /* bInterfaceProtocol: 1=kbd 2=mouse */
                 iface = buf[o + 2];
-            } else proto = 0;
-        } else if (btype == 0x05 && proto) {    /* endpoint */
+            } else is_hid = 0;
+        } else if (btype == 0x05 && is_hid) {   /* endpoint */
             if ((buf[o + 2] & 0x80) && (buf[o + 3] & 0x03) == 0x03) {  /* IN interrupt */
                 ep = buf[o + 2] & 0x0F;
                 eppkt = buf[o + 4];
@@ -339,17 +363,19 @@ static void enumerate_port(int port) {
         }
         o += blen;
     }
-    if (!proto || !ep) { kprintf("[usb] port %d: %04x:%04x not a boot-HID device\n", port + 1, vid, pid); return; }
+    if (!is_hid || !ep) { kprintf("[usb] port %d: %04x:%04x not a HID device\n", port + 1, vid, pid); return; }
 
     set_config(addr, maxpkt, ls, cfgval);
-    hid_set(addr, maxpkt, ls, 0x0B, 0, iface);  /* SET_PROTOCOL: boot */
+    if (subclass == 1)                          /* boot-protocol device only */
+        hid_set(addr, maxpkt, ls, 0x0B, 0, iface);  /* SET_PROTOCOL: boot */
     hid_set(addr, maxpkt, ls, 0x0A, 0, iface);  /* SET_IDLE: 0 (report on change) */
 
     hid_dev_t *h = hid_alloc();
     if (!h) return;
     h->used = 1; h->proto = proto; h->addr = addr; h->ep = ep;
+    h->rlen = proto == 1 ? 8 : (uint8_t)(eppkt ? eppkt : 4);
     h->maxpkt = eppkt ? eppkt : 8; h->lowspeed = ls; h->toggle = 0;
-    uint64_t rp; h->report = (uint8_t *)dma_alloc(8, 16, &rp); h->report_phys = rp;
+    uint64_t rp; h->report = (uint8_t *)dma_alloc(16, 16, &rp); h->report_phys = rp;
     h->qh = (uhci_qh_t *)dma_alloc(sizeof(uhci_qh_t), 16, nullptr);
     h->td = (uhci_td_t *)dma_alloc(sizeof(uhci_td_t), 16, nullptr);
     /* splice this endpoint's QH at the head of the schedule (chains to whatever
@@ -360,9 +386,9 @@ static void enumerate_port(int port) {
     for (uint32_t i = 0; i < 1024; i++) g_framelist[i] = dma_phys32(g_sched_head) | LINK_QH;
     hid_arm(h);
 
+    const char *kind = proto == 1 ? "keyboard" : proto == 2 ? "mouse" : "tablet";
     kprintf("[usb] port %d: %s %04x:%04x addr %d ep %d (%s-speed) -> ready\n",
-            port + 1, proto == 1 ? "keyboard" : "mouse", vid, pid, addr, ep,
-            ls ? "low" : "full");
+            port + 1, kind, vid, pid, addr, ep, ls ? "low" : "full");
 }
 
 /* ---- controller bring-up + worker ---- */

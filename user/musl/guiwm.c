@@ -360,8 +360,19 @@ static void apply_message(win_t *w) {
     if (hdr->type == GMSG_FRAME) {
         gmsg_frame_t *fr = (gmsg_frame_t *)(w->rbuf + sizeof *hdr);
         uint32_t *src = (uint32_t *)(w->rbuf + sizeof *hdr + sizeof *fr);
-        if ((int)fr->w == w->w && (int)fr->h == w->h && w->pix)
-            memcpy(w->pix, src, (size_t)w->w * w->h * 4);
+        /* Blit the damage rect (fr->x,fr->y,fr->w,fr->h), supplied tightly
+           packed, into the window's pixel buffer. Clip to the current size so a
+           stale frame at the old size (after a resize) writes only what fits and
+           never runs past w->pix. */
+        int dx = (int)fr->x, dy = (int)fr->y, fw = (int)fr->w, fh = (int)fr->h;
+        if (w->pix && dx >= 0 && dy >= 0 && fw > 0 && fh > 0) {
+            int cw = fw, ch = fh;
+            if (dx + cw > w->w) cw = w->w - dx;
+            if (dy + ch > w->h) ch = w->h - dy;
+            for (int row = 0; row < ch; row++)
+                memcpy(w->pix + (size_t)(dy + row) * w->w + dx,
+                       src + (size_t)row * fw, (size_t)cw * 4);
+        }
         g_dirty = 1;
     }
     /* GMSG_CLOSE is handled by the caller (returns drop); others ignored. */

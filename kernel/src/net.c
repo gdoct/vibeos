@@ -427,8 +427,13 @@ typedef enum {
 } tcp_state_t;
 
 #define TCP_PCB_N   32
-#define TCP_RXBUF   16384
-#define TCP_SNDBUF  16384
+/* 64 KiB buffers: the receive window is advertised in a 16-bit field with no
+   window scaling (see tcp_output), so 0xFFFF is the hard wire ceiling — sizing
+   the buffers at 64 KiB lets a single advertised window cover the whole space.
+   Going larger only burns static RAM (these are fixed arrays in each of the
+   TCP_PCB_N PCBs) for window the wire can never use. */
+#define TCP_RXBUF   65536
+#define TCP_SNDBUF  65536
 #define TCP_MSS     1460
 #define TCP_ACCEPTQ 8
 #define TCP_OOO_N   8                 /* out-of-order reassembly slots */

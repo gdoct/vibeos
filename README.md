@@ -118,4 +118,4 @@ try the bundled test binaries — e.g. `mhello`, `sigtest`, `nettest`, or
 - If you want to inspect or modify the filesystem image from the host,
 	use the disk utility under [interop/tools/diskutil/](interop/tools/diskutil/).
 - For the detailed implementation sequence and deferred work, read
-	[ROADMAP.md](ROADMAP.md).
+	[ROADMAP.md](docs/ROADMAP.md).
