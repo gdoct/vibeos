@@ -48,6 +48,8 @@ project state. The major pieces that are available today are:
 - Userspace loading from disk (static and dynamically-linked musl), per-process
 	address spaces, `fork`, `execve`, `wait4`, and an interactive `/bin/sh`.
 
+<img width="1440" height="1304" alt="image" src="https://github.com/user-attachments/assets/97be2029-1b5b-4897-a5d0-7a61534f7aa7" />
+
 ## Repository Layout
 
 - [boot/](boot/) - UEFI bootloader and ESP image builder.
