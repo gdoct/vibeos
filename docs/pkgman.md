@@ -1,4 +1,4 @@
-# package manger
+# package manager `pkg`
 
  - installs userspace packages
     - a package is a tarball of files, with an optional post-install script
@@ -6,6 +6,8 @@
 ```
 name: examplepkg
 version: 1.0.0
+author: anonymous [anon@some.email]
+description: An example package for MyOS
 dependencies:
   - libc
   - examplelib >= 1.0.0
@@ -22,7 +24,7 @@ syminks:
     - the package manager will be used to install a basic set of userspace tools
     - the package manager will also be used to install a basic set of userspace libraries, including libc and libm
     - there will be a set of prebuilt packages available in the repo, and users can also create their own packages from source
-    add this file/folder layot to the repository to keep the packages separate from the other code in the repo:
+    add this file/folder layout to the repository to keep the packages separate from the other code in the repo:
 ```
     + packages
         + Makefile
@@ -51,7 +53,7 @@ syminks:
 
 the built packages should be available in the filesystem at /dist/packages. by default a package should be an archive file (.pkg) in a folder, until the user "installs" it so it can be unpacked and we can create the symlinks to the executables in the bin directory.
 
-we then need a package manager program `pkg` that can read the package_list.yml file, which contains a list of available packages and their dependencies, and then install the packages in the correct order. the package manager should also be able to uninstall packages, which involves removing the symlinks that were installed by the package and updating the package_list.yml file accordingly.
+therefore, we need a package manager program `pkg` that can read the package_list.yml file, which contains a list of available packages and their dependencies, and then install the packages in the correct order. the package manager should also be able to uninstall packages, which involves removing the symlinks that were installed by the package and updating the package_list.yml file accordingly.
 
 examples:
 ```
