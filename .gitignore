@@ -50,3 +50,4 @@ toolchain/vibeos.specs
 
 # host build-time font tool (binary)
 gui/client/tools/genfont
+vendor/
