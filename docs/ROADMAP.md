@@ -29,11 +29,13 @@ Detail lives in the code and git history; this file is the map, not the manual.
   [usermode.S](kernel/src/usermode.S), [isr.S](kernel/src/isr.S)); APs enable
   SYSCALL + SSE. Cross-CPU IPIs + TLB shootdown ([apic.c](kernel/src/apic.c)).
   **Per-CPU run queues with work-stealing** (ROADMAP §3): each CPU owns a FIFO of
-  ready tasks (home-CPU affinity), and an idle core steals a *kernel* task from a
-  busy core's queue — O(1) pick + a much shorter critical section than the old
-  global ready-scan. **Kernel tasks run on every core; user tasks are pinned to
-  the BSP** — the ring-3 syscall / tty-line / pipe / fd-table paths are
-  deliberately lock-free on that assumption, so user tasks are never stolen.
+  ready tasks (home-CPU affinity), and an idle core steals a task from a busy
+  core's queue — O(1) pick + a much shorter critical section than the old global
+  ready-scan. **Both kernel and user tasks run on every core**: the ring-3
+  syscall / fd-table / pipe / address-space paths carry their own locks (atomic
+  refcounts, a per-fdtable spinlock, a per-vmspace spinlock + cross-core TLB
+  shootdown, `sched_lock` for the blocking IPC), so user tasks are freely stolen.
+  See [docs/smp-userspace-audit.md](smp-userspace-audit.md) for the lock map.
 - **Memory** — own 4-level paging + direct map + guarded kstacks
   ([paging.c](kernel/src/paging.c)); bump+freelist PMM; slab/large kmalloc.
   **Copy-on-write fork** with per-page refcounts; **validated `copy_to/from_user`**
@@ -187,6 +189,8 @@ paths are implemented but only structurally exercised — loopback/SLIRP is
 lossless and in-order, so loss-recovery awaits verification against a real host
 once outbound connectivity is available.
 
+A non-crypto xorshift/RDRAND RNG ([random.c](kernel/src/random.c)) remains for plumbing
+variety.
 ---
 
 ## What's next
@@ -227,13 +231,17 @@ What remains:
 - **USB follow-on for GUI.** Optional xHCI/EHCI + USB hub support (UHCI already
   drives the HID devices).
 - **Audio.** An audio subsystem + virtio-sound.
-- **User tasks on all cores.** Today user tasks are pinned to the BSP for simplicity
-  (the ring-3 syscall / tty-line / pipe / fd-table paths are deliberately lock-free
-  on that assumption, so user tasks are never stolen). The scheduler is fully
-  SMP-aware and kernel tasks run on every core; the remaining work is to make
-  user tasks stealable too, which will require some locking in the syscall/tty/pipe
-  paths. This will unlock real multi-threaded workloads and let the net stack run
-  on a different core from the shell.
+- **User tasks on all cores.** *(Done.)* User tasks are no longer pinned to the
+  BSP — they are scheduled and work-stolen onto every core. The ring-3 paths that
+  were lock-free on the single-core assumption were hardened: atomic file/page/
+  vmspace/fdtable refcounts, a per-fdtable spinlock (fd install/close/dup), a
+  per-vmspace spinlock guarding page-table mutation + COW repair, cross-core TLB
+  shootdown wired into munmap/mprotect/fork for shared address spaces, pipes moved
+  onto `sched_lock`, the `/dev/input` ring given a consumer lock + barriers, and
+  the net PCB pools given an allocation lock. Verified under `-smp 4`: 4 CPU-bound
+  user processes distribute across all 4 cores, and a 4-thread shared-address-space
+  workload (`threadtest`) reaches the correct shared-counter total. The full
+  lock-by-lock map is in [docs/smp-userspace-audit.md](smp-userspace-audit.md).
 
 *Known issue:* unclean-`fsck` drops `/bin/init` on diskutil volumes (workaround =
 clean image per build); root-cause before relying on crash persistence. Other

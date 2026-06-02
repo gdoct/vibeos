@@ -214,11 +214,21 @@ static uint64_t sys_brk(uint64_t newbrk) {
 
 /* ---- fork ---- */
 
+/* After changing the current address space's mappings (removing or demoting
+   pages), flush the other cores' TLBs — but only if this AS is shared by sibling
+   threads that may be running elsewhere. A single-threaded process (the common
+   case) has ref==1 and never pays for the IPI; its own core was flushed locally. */
+static inline void mm_flush_shared(task_t *t) {
+    if (t->vm && __atomic_load_n(&t->vm->ref, __ATOMIC_ACQUIRE) > 1)
+        tlb_shootdown_user();
+}
+
 static int64_t sys_fork(syscall_frame_t *f) {
     task_t *parent = task_current();
     if (!parent->vm) return -38;                /* kernel thread can't fork */
     vmspace_t *cvm = vmspace_fork(parent->vm);
     if (!cvm) return -12;                        /* -ENOMEM */
+    mm_flush_shared(parent);                     /* sibling threads: drop stale W entries */
     task_t *child = task_fork("user", cvm, f);
     if (!child) { vmspace_destroy(cvm); return -11; }  /* -EAGAIN */
     return child->id;                            /* parent gets child's pid */
@@ -313,19 +323,54 @@ static void sys_exit_thread(void) {
 /* ---- per-process fd helpers ---- */
 
 /* Resolve a user fd to its open-file object, or NULL if it is out of range,
-   closed, or one of the implicit console fds (0/1/2). */
+   closed, or one of the implicit console fds (0/1/2). A bare read for transient
+   in-syscall use; concurrently closing an fd you are still using is an app-level
+   race (POSIX-unspecified), and the file pool is static so it cannot fault. */
 static file_t *fd_get(int fd) {
     if (fd < 0 || fd >= VFS_MAX_FD) return nullptr;
     return task_current()->files->fd[fd];
 }
 
+/* Like fd_get but takes a reference under the table lock, so the returned file
+   cannot be closed out from under the caller before it is consumed (dup family,
+   which persists the new reference). The caller balances it with file_unref. */
+static file_t *fd_get_ref(int fd) {
+    if (fd < 0 || fd >= VFS_MAX_FD) return nullptr;
+    fdtable_t *ft = task_current()->files;
+    spin_lock(&ft->lock);
+    file_t *f = ft->fd[fd];
+    if (f) file_ref(f);
+    spin_unlock(&ft->lock);
+    return f;
+}
+
 /* Install `f` at the lowest free descriptor >= 3 (0/1/2 are the console).
-   Returns the fd, or -EMFILE if the table is full. */
+   Returns the fd, or -EMFILE if the table is full. The scan-and-claim is under
+   the table lock so two cores can't hand out the same slot. */
 static int fd_install(file_t *f) {
-    task_t *t = task_current();
+    fdtable_t *ft = task_current()->files;
+    spin_lock(&ft->lock);
     for (int i = 3; i < VFS_MAX_FD; i++)
-        if (!t->files->fd[i]) { t->files->fd[i] = f; t->files->cloexec[i] = 0; return i; }
+        if (!ft->fd[i]) {
+            ft->fd[i] = f; ft->cloexec[i] = 0;
+            spin_unlock(&ft->lock);
+            return i;
+        }
+    spin_unlock(&ft->lock);
     return -EMFILE_;
+}
+
+/* Detach the file at `fd` from the current task's table (under the lock) and
+   return it for the caller to unref, or NULL if the slot was empty. */
+static file_t *fd_take(int fd) {
+    if (fd < 0 || fd >= VFS_MAX_FD) return nullptr;
+    fdtable_t *ft = task_current()->files;
+    spin_lock(&ft->lock);
+    file_t *f = ft->fd[fd];
+    ft->fd[fd] = nullptr;
+    ft->cloexec[fd] = 0;
+    spin_unlock(&ft->lock);
+    return f;
 }
 
 /* ---- basic I/O / exit ---- */
@@ -347,13 +392,22 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
     }
     if (f->kind == FD_DEV || f->kind == FD_PROC) return synth_write(f, buf, (uint32_t)n);
     if (f->kind != FD_FILE) return -EISDIR_;
+    /* Snapshot the offset under the file lock (not held across the blocking fs
+       call), so a fork/dup-shared description's `off` can't be lost-updated by a
+       writer on another core. */
+    uint64_t off;
+    spin_lock(&f->off_lock);
+    off = f->off;
+    spin_unlock(&f->off_lock);
     if (f->flags & O_APPEND) {                  /* append: write at EOF */
         fs_stat_t st;
-        if (fs_istat(f->ino, &st) == FS_OK) f->off = st.size;
+        if (fs_istat(f->ino, &st) == FS_OK) off = st.size;
     }
-    int r = fs_pwrite(f->ino, f->off, buf, (uint32_t)n);
+    int r = fs_pwrite(f->ino, off, buf, (uint32_t)n);
     if (r < 0) return fs_to_errno(r);
-    f->off += (uint64_t)r;
+    spin_lock(&f->off_lock);
+    f->off = off + (uint64_t)r;
+    spin_unlock(&f->off_lock);
     return r;
 }
 
@@ -371,9 +425,15 @@ static int64_t sys_read(int fd, void *buf, uint64_t n) {
     if (f->kind == FD_DEV || f->kind == FD_PROC) return synth_read(f, buf, (uint32_t)n);
     if (f->kind == FD_DEVDIR) return -EISDIR_;
     if (f->kind != FD_FILE) return -EISDIR_;
-    int r = fs_pread(f->ino, f->off, buf, (uint32_t)n);
+    uint64_t off;
+    spin_lock(&f->off_lock);                    /* see sys_write: snapshot, then advance */
+    off = f->off;
+    spin_unlock(&f->off_lock);
+    int r = fs_pread(f->ino, off, buf, (uint32_t)n);
     if (r < 0) return fs_to_errno(r);
-    f->off += (uint64_t)r;
+    spin_lock(&f->off_lock);
+    f->off = off + (uint64_t)r;
+    spin_unlock(&f->off_lock);
     return r;
 }
 
@@ -460,15 +520,15 @@ static int64_t sys_execve(const char *upath, char *const uargv[], char *const ue
     }
     vmspace_destroy(oldvm);                     /* committed; old AS now idle */
     kfree(a);
-    /* Close descriptors marked FD_CLOEXEC (ROADMAP §4). */
+    /* Close descriptors marked FD_CLOEXEC (ROADMAP §4). Detach each under the
+       table lock, then unref outside it (unref may take other locks). */
     for (int i = 3; i < VFS_MAX_FD; i++) {
-        if (t->files->cloexec[i] && t->files->fd[i]) {
-            file_t *cf = t->files->fd[i];
-            if (cf->kind == FD_SOCKET && cf->refcount == 1) ksock_close(cf->sock);
-            t->files->fd[i] = nullptr;
-            file_unref(cf);
-        }
+        spin_lock(&t->files->lock);
+        file_t *cf = (t->files->cloexec[i] && t->files->fd[i]) ? t->files->fd[i] : nullptr;
+        if (cf) t->files->fd[i] = nullptr;
         t->files->cloexec[i] = 0;
+        spin_unlock(&t->files->lock);
+        if (cf) file_unref(cf);         /* closes the socket at the last ref */
     }
     signals_exec(t);                            /* reset caught handlers to default */
     t->fs_base = 0;                             /* fresh image: TLS reset until arch_prctl */
@@ -518,8 +578,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags,
     int anon = (flags & MAP_ANONYMOUS);
 
     task_t *t = task_current();
-    uint64_t base = ((flags & MAP_FIXED) && addr) ? PAGE_ALIGN_DOWN(addr)
-                                                  : (t->mmap_next += mlen) - mlen;
+    uint64_t base = ((flags & MAP_FIXED) && addr)
+        ? PAGE_ALIGN_DOWN(addr)
+        : __atomic_fetch_add(&t->vm->mmap_next, mlen, __ATOMIC_RELAXED);
     if (anon && prot == 0) return (int64_t)base;     /* PROT_NONE: reserve VA only */
 
     file_t *fl = nullptr;
@@ -582,6 +643,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t len) {
         if (vmspace_query(t->vm, va, &pa)) paging_unref_page(pa);  /* COW-aware free */
     }
     vmspace_unmap(t->vm, addr, len / PAGE_SIZE);
+    mm_flush_shared(t);                          /* other cores: drop the dead mappings */
     return 0;
 }
 
@@ -611,7 +673,7 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_len, uint64_t new_len,
 
     /* grow: relocate (we can't trust the VA above the region to be free). */
     if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM_;
-    uint64_t base = (t->mmap_next += new_pg) - new_pg;
+    uint64_t base = __atomic_fetch_add(&t->vm->mmap_next, new_pg, __ATOMIC_RELAXED);
     for (uint64_t va = base; va < base + new_pg; va += PAGE_SIZE) {
         uint64_t pa = pmm_alloc_page();                     /* zeroed by the PMM */
         if (!pa) return -ENOMEM_;
@@ -646,9 +708,10 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot) {
             if (!vmspace_query(t->vm, va, &pa)) continue;  /* pa may have moved */
             vmspace_map(t->vm, va, pa, 1, PTE_P | PTE_U | PTE_W);
         } else {
-            vmspace_map(t->vm, va, pa, 1, PTE_P | PTE_U);
+            vmspace_map(t->vm, va, pa, 1, PTE_P | PTE_U);   /* may drop write */
         }
     }
+    mm_flush_shared(t);          /* other cores: honor any write-permission downgrade */
     return 0;
 }
 
@@ -781,12 +844,9 @@ static int64_t sys_openat(int dirfd, const char *upath, int flags, int mode) {
 }
 
 static int64_t sys_close(int fd) {
-    file_t *f = fd_get(fd);
+    file_t *f = fd_take(fd);                 /* detach under the table lock */
     if (!f) return (fd >= 0 && fd <= 2) ? 0 : -EBADF_;   /* bare console: no-op */
-    if (f->kind == FD_SOCKET && f->refcount == 1) ksock_close(f->sock);  /* last ref */
-    task_current()->files->fd[fd] = nullptr;
-    task_current()->files->cloexec[fd] = 0;
-    file_unref(f);
+    file_unref(f);                           /* closes pipe/socket at the last ref */
     return 0;
 }
 
@@ -1127,7 +1187,8 @@ static int64_t sys_pipe2(int *ufds, int flags) {
     if (rfd < 0) { file_unref(rf); file_unref(wf); return rfd; }
     int wfd = fd_install(wf);
     if (wfd < 0) {
-        task_current()->files->fd[rfd] = nullptr; file_unref(rf);
+        file_t *taken = fd_take(rfd);            /* undo the read-end install */
+        if (taken) file_unref(taken);
         file_unref(wf);
         return wfd;
     }
@@ -1140,9 +1201,8 @@ static int64_t sys_pipe(int *ufds) { return sys_pipe2(ufds, 0); }
 
 /* dup the open-file at `oldfd` into the lowest free descriptor >= 3. */
 static int64_t sys_dup(int oldfd) {
-    file_t *f = fd_get(oldfd);
+    file_t *f = fd_get_ref(oldfd);            /* ref taken under the table lock */
     if (!f) return (oldfd >= 0 && oldfd <= 2) ? oldfd : -EBADF_;  /* bare console: identity */
-    file_ref(f);
     int fd = fd_install(f);
     if (fd < 0) { file_unref(f); return fd; }
     return fd;
@@ -1151,17 +1211,19 @@ static int64_t sys_dup(int oldfd) {
 /* dup oldfd onto newfd exactly, closing whatever newfd held. */
 static int64_t sys_dup2(int oldfd, int newfd) {
     if (newfd < 0 || newfd >= VFS_MAX_FD) return -EBADF_;
-    file_t *f = fd_get(oldfd);
+    file_t *f = fd_get_ref(oldfd);                    /* ref taken under the lock */
     if (!f) {                                         /* oldfd is the bare console */
         if ((oldfd == 0 || oldfd == 1 || oldfd == 2) && oldfd == newfd) return newfd;
         return -EBADF_;
     }
-    if (oldfd == newfd) return newfd;
-    task_t *t = task_current();
-    if (t->files->fd[newfd]) file_unref(t->files->fd[newfd]);  /* redirect 0/1/2 -> a file */
-    file_ref(f);
-    t->files->fd[newfd] = f;
-    t->files->cloexec[newfd] = 0;                     /* dup2 clears CLOEXEC (POSIX) */
+    if (oldfd == newfd) { file_unref(f); return newfd; }   /* drop the extra ref */
+    fdtable_t *ft = task_current()->files;
+    spin_lock(&ft->lock);
+    file_t *victim = ft->fd[newfd];                   /* whatever newfd held */
+    ft->fd[newfd] = f;                                /* f already carries our ref */
+    ft->cloexec[newfd] = 0;                           /* dup2 clears CLOEXEC (POSIX) */
+    spin_unlock(&ft->lock);
+    if (victim) file_unref(victim);                   /* close the displaced fd */
     return newfd;
 }
 

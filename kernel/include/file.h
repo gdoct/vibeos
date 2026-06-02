@@ -2,6 +2,7 @@
 #define VIBEOS_FILE_H
 
 #include <stdint.h>
+#include "spinlock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,7 +36,7 @@ typedef enum {
 struct pipe;            /* kernel/include/pipe.h */
 
 typedef struct file {
-    int       refcount;     /* 0 == free slot */
+    int       refcount;     /* 0 == free slot; touched only with __atomic ops (SMP) */
     fd_kind_t kind;
     uint32_t  ino;          /* backing VibeFS inode (FD_FILE/FD_DIR); pid (FD_PROC) */
     uint64_t  off;          /* file: byte offset; dir: dirent cursor */
@@ -43,6 +44,8 @@ typedef struct file {
     int       dev;          /* synthetic device/proc subtype (FD_DEV/DEVDIR/PROC) */
     struct pipe *pipe;      /* pipe object (FD_PIPE_RD/WR) */
     void     *sock;         /* socket object (FD_SOCKET) */
+    spinlock_t off_lock;    /* guards `off` read-modify-write across cores (a fork/
+                               dup-shared description is touched by several tasks) */
 } file_t;
 
 file_t *file_alloc(void);          /* refcount = 1, or NULL if the pool is full */

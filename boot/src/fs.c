@@ -5,7 +5,7 @@ static EFI_GUID gLoadedImageGuid       = EFI_LOADED_IMAGE_PROTOCOL_GUID;
 static EFI_GUID gSimpleFileSystemGuid  = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
 static EFI_GUID gFileInfoGuid          = EFI_FILE_INFO_GUID;
 
-EFI_STATUS fs_read_file(CHAR16 *path, VOID **buffer_out, UINTN *size_out) {
+EFI_STATUS fs_read_file(const CHAR16 *path, VOID **buffer_out, UINTN *size_out) {
     EFI_STATUS s;
 
     EFI_LOADED_IMAGE_PROTOCOL *loaded = 0;
@@ -21,7 +21,7 @@ EFI_STATUS fs_read_file(CHAR16 *path, VOID **buffer_out, UINTN *size_out) {
     if (EFI_ERROR(s)) return s;
 
     EFI_FILE_PROTOCOL *file = 0;
-    s = root->Open(root, &file, path, EFI_FILE_MODE_READ, 0);
+    s = root->Open(root, &file, (CHAR16 *)path, EFI_FILE_MODE_READ, 0);
     if (EFI_ERROR(s)) {
         root->Close(root);
         return s;

@@ -88,7 +88,7 @@ void tty_input(char c) {
     uint32_t next = (g_inj_head + 1) % INJ_N;
     if (next == g_inj_tail) return;          /* full: drop */
     g_inject[g_inj_head] = c;
-    __asm__ volatile("" ::: "memory");
+    __atomic_thread_fence(__ATOMIC_RELEASE); /* publish the byte before the head */
     g_inj_head = next;
 }
 
@@ -96,6 +96,7 @@ void tty_poll(void) {
     while (serial_rx_ready())
         input_char(serial_getc());
     while (g_inj_tail != g_inj_head) {        /* drain injected (USB) keystrokes */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);  /* head seen -> byte is valid */
         input_char(g_inject[g_inj_tail]);
         g_inj_tail = (g_inj_tail + 1) % INJ_N;
     }

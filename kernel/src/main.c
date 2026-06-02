@@ -57,14 +57,11 @@ static void smp_worker(void *arg) {
     }
 }
 
-/* Create the initial task set: /bin/init (the user shell, pinned to the BSP)
-   plus a few kernel workers that exercise multi-CPU scheduling. */
+/* Create the initial task set: /bin/init (the user shell) plus a few kernel
+   workers that exercise multi-CPU scheduling. User tasks now run on any core
+   (ROADMAP §"User tasks on all cores"), so init is not pinned. */
 static void create_initial_tasks(void) {
-    /* init becomes a user task inside init_launch; pin it to the BSP up front so
-       no AP steals it during the window before it sets its address space (§3).
-       Safe to set here: the APs are not scheduling yet. */
-    task_t *it = task_create("init", init_launch, nullptr);
-    it->bsp_only = 1;
+    task_create("init", init_launch, nullptr);
     for (int i = 0; i < 4; i++)
         task_create("worker", smp_worker, (void *)(intptr_t)i);
 }

@@ -261,39 +261,68 @@ static inline int rc_index(uint64_t pa, uint64_t *idx) {
     return 1;
 }
 
+/* Atomically decrement g_refcnt[i] only while it is > 0; returns 1 if it
+   decremented (the page is still shared by someone else), 0 if it was already 0
+   (the caller is the sole owner). The CAS loop makes the read-test-decrement one
+   indivisible step, so two cores dropping/COWing the same shared page can't both
+   take the "still shared" branch and underflow the count. */
+static int rc_dec_if_positive(uint64_t i) {
+    uint16_t cur = __atomic_load_n(&g_refcnt[i], __ATOMIC_ACQUIRE);
+    while (cur > 0) {
+        if (__atomic_compare_exchange_n(&g_refcnt[i], &cur, (uint16_t)(cur - 1),
+                                        true, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return 1;
+    }
+    return 0;
+}
+
 /* Add a shared reference to `pa` (called when a second PTE starts pointing at
    it, e.g. fork sharing). Pages outside the arena (none, in practice) are
    silently ignored. */
 static void page_ref(uint64_t pa) {
     uint64_t i;
-    if (rc_index(pa, &i)) g_refcnt[i]++;
+    if (rc_index(pa, &i)) __atomic_add_fetch(&g_refcnt[i], 1, __ATOMIC_ACQ_REL);
 }
 
 void paging_unref_page(uint64_t pa) {
     uint64_t i;
-    if (rc_index(pa, &i) && g_refcnt[i] > 0) { g_refcnt[i]--; return; }
+    if (rc_index(pa, &i) && rc_dec_if_positive(i)) return;  /* still shared */
     pmm_free_page(pa);                          /* last (or untracked) reference */
 }
 
 int paging_cow_fault(vmspace_t *vm, uint64_t va) {
     va &= ~PAGE_MASK;
+    /* Serialize repair of this address space's tables so two threads faulting the
+       same (or neighbouring) page on different cores can't both rewrite the PTE
+       off a stale read. The PTE is re-read under the lock. */
+    spin_lock(&vm->lock);
     uint64_t *pte = leaf_pte(vm->pml4_phys, va);
-    if (!pte) return 0;
+    if (!pte) { spin_unlock(&vm->lock); return 0; }
     uint64_t e = *pte;
-    if (!(e & PTE_U) || !(e & PTE_COW)) return 0;   /* not a COW page */
+    if (!(e & PTE_U) || !(e & PTE_COW)) {           /* already repaired / not COW */
+        spin_unlock(&vm->lock);
+        return (e & PTE_W) ? 1 : 0;                 /* another core fixed it: retry */
+    }
 
     uint64_t old = e & PTE_ADDR;
     uint64_t i;
-    if (rc_index(old, &i) && g_refcnt[i] > 0) {     /* still shared: private copy */
+    int shared = rc_index(old, &i) &&
+                 __atomic_load_n(&g_refcnt[i], __ATOMIC_ACQUIRE) > 0;
+    if (shared) {                                   /* possibly shared: private copy */
         uint64_t neu = pmm_alloc_page();
-        if (!neu) return 0;                         /* OOM: caller kills the task */
+        if (!neu) { spin_unlock(&vm->lock); return 0; }  /* OOM: caller kills task */
         kmemcpy(phys_to_virt(neu), phys_to_virt(old), PAGE_SIZE);
-        g_refcnt[i]--;
-        *pte = (neu & PTE_ADDR) | (e & ~PTE_ADDR & ~PTE_COW) | PTE_W;
+        if (rc_dec_if_positive(i)) {                /* won the drop: keep the copy */
+            *pte = (neu & PTE_ADDR) | (e & ~PTE_ADDR & ~PTE_COW) | PTE_W;
+        } else {                                    /* lost the race: now sole owner */
+            pmm_free_page(neu);
+            *pte = (e & ~PTE_COW) | PTE_W;
+        }
     } else {                                        /* sole owner: just re-grant W */
         *pte = (e & ~PTE_COW) | PTE_W;
     }
     invlpg(va);
+    spin_unlock(&vm->lock);
     return 1;
 }
 
@@ -393,11 +422,13 @@ vmspace_t *vmspace_create(void) {
     uint64_t *kpml4 = table(g_pml4_phys);
     for (int i = 256; i < ENTRIES; i++) npml4[i] = kpml4[i];   /* share kernel half */
     vm->pml4_phys = p;
+    vm->mmap_next = 0;                           /* set by the loader (elf64) */
     vm->ref = 1;
+    spin_lock_init(&vm->lock);
     return vm;
 }
 
-void vmspace_ref(vmspace_t *vm) { if (vm) vm->ref++; }
+void vmspace_ref(vmspace_t *vm) { if (vm) __atomic_add_fetch(&vm->ref, 1, __ATOMIC_ACQ_REL); }
 
 void vmspace_switch(vmspace_t *vm) {
     uint64_t cr3 = vm ? vm->pml4_phys : g_pml4_phys;
@@ -405,7 +436,9 @@ void vmspace_switch(vmspace_t *vm) {
 }
 
 void vmspace_map(vmspace_t *vm, uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
+    spin_lock(&vm->lock);
     map_at(vm->pml4_phys, va, pa, pages, flags);
+    spin_unlock(&vm->lock);
 }
 
 int vmspace_query(vmspace_t *vm, uint64_t va, uint64_t *pa_out) {
@@ -413,7 +446,9 @@ int vmspace_query(vmspace_t *vm, uint64_t va, uint64_t *pa_out) {
 }
 
 void vmspace_unmap(vmspace_t *vm, uint64_t va, size_t pages) {
+    spin_lock(&vm->lock);
     unmap_at(vm->pml4_phys, va, pages);
+    spin_unlock(&vm->lock);
 }
 
 /* Copy-on-write fork: share the parent's user pages with the child read-only
@@ -425,6 +460,11 @@ void vmspace_unmap(vmspace_t *vm, uint64_t va, size_t pages) {
 vmspace_t *vmspace_fork(vmspace_t *parent) {
     vmspace_t *child = vmspace_create();
     if (!child) return nullptr;
+    child->mmap_next = parent->mmap_next;       /* inherit the mmap arena position */
+    /* Lock the parent across the walk: it demotes the parent's writable PTEs to
+       COW, which must not race a sibling thread's COW fault on the same core's
+       address space. The child is still private (ref==1), so it needs no lock. */
+    spin_lock(&parent->lock);
     uint64_t *ppml4 = table(parent->pml4_phys);
     for (uint64_t i = 0; i < 256; i++) {
         if (!(ppml4[i] & PTE_P)) continue;
@@ -450,9 +490,12 @@ vmspace_t *vmspace_fork(vmspace_t *parent) {
             }
         }
     }
-    /* Flush the parent's TLB: its writable pages just became read-only COW.
-       (Parent is the active address space during fork.) */
+    /* Flush this core's TLB: the parent's writable pages just became read-only
+       COW (parent is the active address space during fork). If the parent is
+       multithreaded, sibling threads on other cores hold stale writable entries;
+       the fork syscall issues a cross-core shootdown after this returns. */
     __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+    spin_unlock(&parent->lock);
     return child;
 }
 
@@ -463,7 +506,8 @@ vmspace_t *vmspace_fork(vmspace_t *parent) {
    caller must not be running on this address space. */
 void vmspace_destroy(vmspace_t *vm) {
     if (!vm) return;
-    if (--vm->ref > 0) return;          /* still shared by another thread */
+    if (__atomic_sub_fetch(&vm->ref, 1, __ATOMIC_ACQ_REL) > 0)
+        return;                         /* still shared by another thread */
     uint64_t *pml4 = table(vm->pml4_phys);
     for (uint64_t i = 0; i < 256; i++) {
         if (!(pml4[i] & PTE_P)) continue;

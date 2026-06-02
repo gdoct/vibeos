@@ -37,7 +37,10 @@
  * so the IF baton must follow the CPU, not the lock word.
  *
  * Scope: kernel and user tasks both run on any CPU (per-CPU TSS/GS + swapgs,
- * §2), so any ready task is stealable by any core.
+ * §2), so any ready task is stealable by any core. The ring-3 syscall / fd-table
+ * / pipe / address-space paths carry their own locks (atomics, per-fdtable and
+ * per-vmspace spinlocks, sched_lock for the blocking IPC), which is what makes
+ * running user tasks on every core safe (ROADMAP §"User tasks on all cores").
  */
 
 #define KSTACK_PAGES   4   /* 16 KiB kernel stack per task */
@@ -84,28 +87,16 @@ static task_t *runq_pop(int cpu) {
     return t;
 }
 
-/* Mark a task READY and enqueue it on a run queue (lock held). User tasks
-   (bsp_only) always go on CPU 0's queue; kernel tasks go on their home CPU. */
+/* Mark a task READY and enqueue it on its home CPU's run queue (lock held). */
 static void enqueue_ready(task_t *t) {
     t->state = TASK_READY;
-    runq_push(t->bsp_only ? 0 : t->home_cpu, t);
+    runq_push(t->home_cpu, t);
 }
 
-/* Steal the first *kernel* task from `cpu`'s run queue (lock held). User tasks
-   are BSP-pinned, so they are never stolen — we walk past them. */
+/* Steal the head task from `cpu`'s run queue (lock held). Both kernel and user
+   tasks are stealable now (ROADMAP §"User tasks on all cores"). */
 static task_t *runq_steal(int cpu) {
-    task_t *prev = nullptr, *t = g_runq_head[cpu];
-    while (t) {
-        if (!t->bsp_only) {
-            if (prev) prev->rq_next = t->rq_next;
-            else      g_runq_head[cpu] = t->rq_next;
-            if (g_runq_tail[cpu] == t) g_runq_tail[cpu] = prev;
-            t->rq_next = nullptr;
-            return t;
-        }
-        prev = t; t = t->rq_next;
-    }
-    return nullptr;
+    return runq_pop(cpu);
 }
 
 /* Tasks asleep in ksleep, linked through wq_next; under sched_lock. */
@@ -157,11 +148,13 @@ static fdtable_t *fdtable_alloc(void) {
     if (!ft) panic("fdtable: out of memory");
     kmemset(ft, 0, sizeof *ft);
     ft->ref = 1;
+    spin_lock_init(&ft->lock);
     return ft;
 }
 static void fdtable_unref(fdtable_t *ft) {
     if (!ft) return;
-    if (--ft->ref > 0) return;              /* still shared by another thread */
+    if (__atomic_sub_fetch(&ft->ref, 1, __ATOMIC_ACQ_REL) > 0)
+        return;                             /* still shared by another thread */
     for (int i = 0; i < VFS_MAX_FD; i++)
         if (ft->fd[i]) file_unref(ft->fd[i]);
     kfree(ft);
@@ -217,7 +210,6 @@ task_t *task_create(const char *name, void (*entry)(void *), void *arg) {
 void task_set_vmspace(struct vmspace *vm) {
     task_t *t = task_current();
     t->vm = vm;
-    if (vm) t->bsp_only = 1;          /* became a user task: pin to the BSP (§3) */
     uint64_t cr3 = vm ? vm->pml4_phys : paging_kernel_pml4();
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
 }
@@ -233,17 +225,19 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     t->brk_cur   = parent->brk_cur;
     t->brk_max   = parent->brk_max;
     t->fs_base   = parent->fs_base;     /* child shares the TLS layout (AS copied) */
-    t->mmap_next = parent->mmap_next;
     signals_fork(t, parent);            /* inherit handlers + mask (not pending) */
 
     /* Dup the fd table: the child shares each open-file object (and thus its
        offset) with the parent, à la Linux fork. The per-fd FD_CLOEXEC bit is a
-       descriptor property, so it is copied too. */
+       descriptor property, so it is copied too. The parent's table is locked
+       across the snapshot so a sibling thread can't mutate it mid-copy. */
+    spin_lock(&parent->files->lock);
     for (int i = 0; i < VFS_MAX_FD; i++) {
         t->files->fd[i] = parent->files->fd[i];
         t->files->cloexec[i] = parent->files->cloexec[i];
         if (t->files->fd[i]) file_ref(t->files->fd[i]);
     }
+    spin_unlock(&parent->files->lock);
     for (unsigned i = 0; i < sizeof t->cwd; i++) t->cwd[i] = parent->cwd[i];  /* inherit cwd */
 
     /* Craft the child stack: context_switch -> fork_child_return, which finds a
@@ -271,8 +265,7 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     for (int j = 0; j < 6; j++) *--sp = 0;
     t->saved_rsp = (uint64_t)sp;
 
-    t->bsp_only = (vm != nullptr);    /* user process: BSP-pinned (§3) */
-    t->home_cpu = 0;
+    t->home_cpu = smp_cpu_index();    /* prefer the forking core; stealing rebalances */
     t->tgid = 0;                      /* a new process: tgid == its own id */
     enqueue_ready(t);
     int id = t->id, pid = parent->id;
@@ -295,7 +288,6 @@ task_t *task_clone(const char *name, struct vmspace *vm,
     t->brk_cur   = parent->brk_cur;
     t->brk_max   = parent->brk_max;
     t->fs_base   = tls ? tls : parent->fs_base; /* CLONE_SETTLS */
-    t->mmap_next = parent->mmap_next;
     t->is_thread = is_thread;
     t->tgid      = is_thread ? task_tgid(parent) : 0;
     signals_fork(t, parent);
@@ -303,13 +295,15 @@ task_t *task_clone(const char *name, struct vmspace *vm,
     if (share_files) {                          /* CLONE_FILES: share the fdtable */
         fdtable_unref(t->files);                /* drop the fresh empty one */
         t->files = parent->files;
-        t->files->ref++;
+        __atomic_add_fetch(&t->files->ref, 1, __ATOMIC_ACQ_REL);
     } else {
+        spin_lock(&parent->files->lock);
         for (int i = 0; i < VFS_MAX_FD; i++) {
             t->files->fd[i] = parent->files->fd[i];
             t->files->cloexec[i] = parent->files->cloexec[i];
             if (t->files->fd[i]) file_ref(t->files->fd[i]);
         }
+        spin_unlock(&parent->files->lock);
     }
     for (unsigned i = 0; i < sizeof t->cwd; i++) t->cwd[i] = parent->cwd[i];
 
@@ -327,8 +321,7 @@ task_t *task_clone(const char *name, struct vmspace *vm,
     for (int j = 0; j < 6; j++) *--sp = 0;
     t->saved_rsp = (uint64_t)sp;
 
-    t->bsp_only = 1;                            /* user task: BSP-pinned (§3) */
-    t->home_cpu = 0;
+    t->home_cpu = smp_cpu_index();              /* prefer the cloning core */
     enqueue_ready(t);
     int id = t->id;
     sched_unlock();
@@ -353,8 +346,8 @@ static void apply_task_mm(task_t *t) {
 
 /* Pick a READY task for CPU `cpu`: prefer this CPU's own run queue (warm cache),
    and only when it is empty steal one ready task from another CPU's queue
-   (explicit work-stealing, ROADMAP §3). §2 user tasks run on any core, so any
-   task is stealable. Lock held. */
+   (explicit work-stealing, ROADMAP §3). User tasks run on any core, so any task
+   is stealable. Lock held. */
 static task_t *pick_ready(int cpu) {
     task_t *t = runq_pop(cpu);
     if (t) return t;
@@ -532,9 +525,12 @@ task_t *task_by_id(int id) {
 }
 
 int task_running_cpu(task_t *t) {
+    sched_lock();                     /* g_cpu_cur[] is updated under the lock */
+    int cpu = -1;
     for (int c = 0; c < SMP_MAX_CPUS; c++)
-        if (g_cpu_cur[c] == t) return c;
-    return -1;
+        if (g_cpu_cur[c] == t) { cpu = c; break; }
+    sched_unlock();
+    return cpu;
 }
 
 /* Nudge a task that may be asleep so it returns to userspace and delivers a

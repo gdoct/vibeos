@@ -272,7 +272,7 @@ static void tablet_report(const uint8_t *r) {
 
 /* Current pointer position + button bitmask (bit0=L,1=R,2=M). For the GUI. */
 extern "C" void usb_mouse_get(int *x, int *y, int *buttons) {
-    if (x) *x = g_mx; if (y) *y = g_my; if (buttons) *buttons = g_mbtn;
+    if (x) { *x = g_mx; } if (y) { *y = g_my; } if (buttons) { *buttons = g_mbtn; }
 }
 
 /* Arm a HID device's interrupt-IN TD (re-used each poll). */

@@ -270,7 +270,7 @@ int user_load_path(vmspace_t *vm, const char *path,
        the dynamic linker (and malloc) draw from (also ASLR-slid). */
     uint64_t brk_start = PAGE_ALIGN_UP(brk_base);
     user_heap_init(brk_start, brk_start + USER_HEAP_MAX);
-    task_current()->mmap_next = USER_MMAP_BASE + aslr_off(ASLR_MMAP_SPAN);
+    task_current()->vm->mmap_next = USER_MMAP_BASE + aslr_off(ASLR_MMAP_SPAN);
 
     *entry_out = real_entry;
     return 0;

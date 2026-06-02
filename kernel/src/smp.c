@@ -64,6 +64,29 @@ void tlb_shootdown_all(void) {
         __asm__ volatile("pause");
 }
 
+/* Serialize concurrent shootdown senders. g_tlb_acks is a single shared counter,
+   so only one broadcast may be in flight at a time. The lock is taken with
+   interrupts ENABLED (see tlb_shootdown_user) so a sender waiting for it still
+   services another core's shootdown IPI — otherwise two cores shooting each other
+   would deadlock. */
+static volatile uint32_t g_sd_lock = 0;
+
+/* Cross-core TLB flush from a syscall path (ROADMAP §"User tasks on all cores").
+   Syscalls run with IF cleared (SFMASK), but the ack-wait needs interrupts on, so
+   enable them around the shootdown and restore the prior IF afterwards. Only the
+   memory syscalls that demote/remove mappings on a *shared* (multithreaded)
+   address space call this; single-threaded processes never need it. */
+void tlb_shootdown_user(void) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; pop %0" : "=r"(fl));   /* save caller IF */
+    __asm__ volatile("sti");
+    while (__atomic_exchange_n(&g_sd_lock, 1u, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
+    tlb_shootdown_all();
+    __atomic_store_n(&g_sd_lock, 0u, __ATOMIC_RELEASE);
+    if (!(fl & (1ull << 9))) __asm__ volatile("cli");   /* restore IF=off if it was */
+}
+
 /* Boot-time check that the IPI path works: every other online CPU should ack a
    broadcast shootdown. Runs on the BSP with interrupts enabled (after smp_init,
    before the scheduler loop), where the APs are idling in scheduler(). */

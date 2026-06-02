@@ -1,5 +1,4 @@
 #include "kernel.h"
-#include "irq.h"
 #include "task.h"
 #include "kmalloc.h"
 #include "file.h"
@@ -9,10 +8,12 @@
  * Anonymous pipes (ROADMAP §4 rung 2). See pipe.h for the model.
  *
  * A byte ring with reader/writer wait queues, mirroring the serial TTY's
- * blocking discipline: the buffer check and the sleep run with interrupts off
- * (irq_save) so a writer's wakeup can't slip in between, and wait_queue_sleep
- * returns with IF still off to keep the loop atomic. User tasks are BSP-pinned,
- * so the only contention is same-CPU preemption, which IF-off closes.
+ * blocking discipline. Now that user tasks run on every core (ROADMAP §"User
+ * tasks on all cores"), a reader and writer can touch one pipe from two CPUs at
+ * once, so local interrupt masking is no longer enough: the whole ring + the
+ * counts + the wait queues are guarded by sched_lock, and the condition check,
+ * the sleep, and the wake all share it (the *_locked wait-queue ops), which
+ * closes the cross-core lost-wakeup race the same way the TTY and net stack do.
  */
 
 #define PIPE_CAP   4096          /* ring capacity (one page) */
@@ -45,25 +46,25 @@ void pipe_free(pipe_t *p) { if (p) kfree(p); }
 void pipe_detach(file_t *f) {
     pipe_t *p = f->pipe;
     if (!p) return;
-    uint64_t fl = irq_save();
+    sched_lock();
     if (f->kind == FD_PIPE_RD) {
-        if (--p->readers == 0) wait_queue_wake_all(&p->wwq);  /* writers -> EPIPE */
+        if (--p->readers == 0) wait_queue_wake_all_locked(&p->wwq);  /* writers -> EPIPE */
     } else {
-        if (--p->writers == 0) wait_queue_wake_all(&p->rwq);  /* readers -> EOF */
+        if (--p->writers == 0) wait_queue_wake_all_locked(&p->rwq);  /* readers -> EOF */
     }
     int gone = (p->readers == 0 && p->writers == 0);
-    irq_restore(fl);
+    sched_unlock();
     if (gone) pipe_free(p);
 }
 
 int pipe_read(pipe_t *p, void *buf, uint32_t n, int flags) {
     if (n == 0) return 0;
     uint8_t *out = (uint8_t *)buf;
-    uint64_t fl = irq_save();
+    sched_lock();
     while (p->count == 0) {
-        if (p->writers == 0) { irq_restore(fl); return 0; }   /* EOF */
-        if (flags & 04000 /* O_NONBLOCK */) { irq_restore(fl); return -EAGAIN_; }
-        wait_queue_sleep(&p->rwq);                             /* returns IF off */
+        if (p->writers == 0) { sched_unlock(); return 0; }   /* EOF */
+        if (flags & 04000 /* O_NONBLOCK */) { sched_unlock(); return -EAGAIN_; }
+        wait_queue_sleep_locked(&p->rwq);                    /* re-checks under lock */
     }
     uint32_t i = 0;
     while (i < n && p->count > 0) {
@@ -71,27 +72,27 @@ int pipe_read(pipe_t *p, void *buf, uint32_t n, int flags) {
         p->tail = (p->tail + 1) % PIPE_CAP;
         p->count--;
     }
-    wait_queue_wake_all(&p->wwq);        /* freed space for writers */
-    irq_restore(fl);
+    wait_queue_wake_all_locked(&p->wwq);        /* freed space for writers */
+    sched_unlock();
     return (int)i;
 }
 
 int pipe_write(pipe_t *p, const void *buf, uint32_t n, int flags) {
     if (n == 0) return 0;
     const uint8_t *in = (const uint8_t *)buf;
-    uint64_t fl = irq_save();
+    sched_lock();
     uint32_t done = 0;
     while (done < n) {
         if (p->readers == 0) {           /* no SIGPIPE: just report the error */
-            irq_restore(fl);
+            sched_unlock();
             return done ? (int)done : -EPIPE_;
         }
         if (p->count == PIPE_CAP) {      /* full: block (or report progress) */
             if (flags & 04000 /* O_NONBLOCK */) {
-                irq_restore(fl);
+                sched_unlock();
                 return done ? (int)done : -EAGAIN_;
             }
-            wait_queue_sleep(&p->wwq);
+            wait_queue_sleep_locked(&p->wwq);
             continue;
         }
         while (done < n && p->count < PIPE_CAP) {
@@ -99,8 +100,8 @@ int pipe_write(pipe_t *p, const void *buf, uint32_t n, int flags) {
             p->head = (p->head + 1) % PIPE_CAP;
             p->count++;
         }
-        wait_queue_wake_all(&p->rwq);    /* data available for readers */
+        wait_queue_wake_all_locked(&p->rwq);    /* data available for readers */
     }
-    irq_restore(fl);
+    sched_unlock();
     return (int)done;
 }

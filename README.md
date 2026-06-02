@@ -3,9 +3,9 @@
 
 
 VibeOS is a small x86_64 operating system built around a UEFI boot
-chain, a higher-half kernel, an SMP scheduler that runs user processes on every
-core, a writable on-disk filesystem, an IPv4/TCP network stack, and a
-serial-backed userspace. The current tree boots end-to-end in QEMU + OVMF,
+chain, a higher-half kernel, an SMP scheduler with per-CPU run queues and
+work-stealing, a writable on-disk filesystem, a WAN-grade IPv4/TCP network stack,
+and a serial-backed userspace. The current tree boots end-to-end in QEMU + OVMF,
 mounts a VibeFS volume, loads `/bin/init` from disk, and runs a shell in userspace.
 
 VibeOS is implemented from scratch in C++ (C-style, freestanding) and assembly,
@@ -22,7 +22,7 @@ All features were vibe coded, and the project is licensed under MIT.
 
 ## What is implemented
 
-The roadmap in [ROADMAP.md](ROADMAP.md) is the source of truth for the
+The roadmap in [ROADMAP.md](docs/ROADMAP.md) is the source of truth for the
 project state. The major pieces that are available today are:
 
 - UEFI bootloader that loads `kernel.elf` from the ESP, gathers GOP,
@@ -31,22 +31,40 @@ project state. The major pieces that are available today are:
 	half left free for userspace.
 - Core x86_64 plumbing: per-CPU GDT/TSS, IDT, exception handling, SYSCALL /
 	SYSRET, and APIC-based interrupt handling.
-- SMP with user tasks scheduled on every core — per-CPU TSS + GS base with
-	`swapgs` on kernel entry, cross-CPU IPIs, and TLB shootdown.
+- SMP with per-CPU run queues and work-stealing — per-CPU TSS + GS base with
+	`swapgs` on kernel entry, cross-CPU IPIs, and TLB shootdown. Both kernel and
+	user tasks run on every core; the ring-3 syscall / fd-table / pipe / address-
+	space paths carry their own locks (atomic refcounts, per-fdtable and
+	per-vmspace spinlocks, cross-core TLB shootdown) so user threads are safe to
+	steal across cores.
 - Preemptive scheduler with blocking sleep and wait queues.
 - Physical memory management and a slab-style `kmalloc` / `kfree`;
 	copy-on-write `fork` with per-page refcounts and validated user/kernel copies.
 - POSIX signals: handlers, blocked/pending masks, default actions,
 	`kill`/`sigaltstack`/`sigreturn`; CPU faults are turned into signals.
-- Framebuffer graphics, serial logging, and a basic text console.
+- Threads: `clone`/`futex` over a refcounted address space + fd table, running
+	unmodified musl pthreads.
+- ASLR per-`execve` (PIE image, dynamic linker, stack, mmap arena) backed by a
+	ChaCha20 CSPRNG seeded from RDRAND, RDTSC jitter, and virtio-rng.
+- USB input: a UHCI host-controller driver enumerating a USB keyboard and mouse
+	for the console and GUI.
+- A graphical stack: a userspace windowing system (`guiwm` over mmap'd
+	`/dev/fb0` + `/dev/input`, with one-process-per-window clients over loopback
+	TCP), plus a legacy in-kernel compositor. Framebuffer graphics, serial
+	logging, and a basic text console.
 - RAM disk and virtio-blk drivers, virtio-net, plus PCI enumeration.
-- A compact IPv4 network stack (ARP, IP, ICMP, UDP, TCP) with BSD sockets
-	(`socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`/`poll`) and a
-	ported `wget`.
-- VibeFS, a small writable filesystem with directories, files, and
+- A WAN-grade IPv4 network stack (ARP, IP, ICMP, UDP, and TCP with congestion
+	control, retransmission, and reassembly) with BSD sockets
+	(`socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`/`poll`,
+	`O_NONBLOCK`/`MSG_DONTWAIT`) and a ported `wget`.
+- VibeFS, a small writable filesystem with directories, files, symlinks, and
 	crash-safe ordered updates.
 - Userspace loading from disk (static and dynamically-linked musl), per-process
-	address spaces, `fork`, `execve`, `wait4`, and an interactive `/bin/sh`.
+	address spaces and cwd, `fork`, `execve`, `wait4`, and an interactive
+	`/bin/sh`.
+- A `/config`-driven, service-managed init (PID 1) that starts and supervises
+	services from `/config/services/`, plus an `x86_64-vibeos-musl` cross
+	toolchain for building target binaries.
 
 <img width="1440" height="1304" alt="image" src="https://github.com/user-attachments/assets/97be2029-1b5b-4897-a5d0-7a61534f7aa7" />
 
@@ -55,6 +73,9 @@ project state. The major pieces that are available today are:
 - [boot/](boot/) - UEFI bootloader and ESP image builder.
 - [kernel/](kernel/) - kernel, drivers, memory management, scheduler,
 	filesystem, and userspace support.
+- [gui/](gui/) - the graphical stack: [gui/client/](gui/client/) is the
+	userspace windowing system (`guiwm` + per-window client apps);
+	[gui/core/](gui/core/) is the legacy in-kernel compositor.
 - [user/](user/) - userspace programs: the freestanding `init`/`sh`/`hello`,
 	plus static and dynamic musl test binaries under [user/musl/](user/musl/)
 	(`sigtest`, `cputest`, `nettest`, `wget`, `dynhello`, …).
@@ -72,8 +93,9 @@ project state. The major pieces that are available today are:
 	 devices, and the filesystem.
 5. The kernel mounts the VibeFS volume and launches `/bin/init` from
 	 disk.
-6. `init` execs `/bin/sh`, giving an interactive shell over the serial
-	 console.
+6. `init` (a service-managed PID 1) reads `/config/services/`, brings up the
+	 userspace window manager (`/bin/guiwm`) and `/bin/sh`, and supervises them —
+	 giving an interactive shell over the serial console.
 
 ## Building
 

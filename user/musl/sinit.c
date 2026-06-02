@@ -61,6 +61,15 @@ typedef struct {
 static svc_t g_svc[MAX_SVC];
 static int   g_nsvc;
 
+static int copy_cstr(char *dst, size_t dst_size, const char *src) {
+    size_t len;
+    if (!dst_size) return -1;
+    len = strlen(src);
+    if (len >= dst_size) return -1;
+    memcpy(dst, src, len + 1);
+    return 0;
+}
+
 static long mono(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (long)ts.tv_sec; }
 
 static void logmsg(const char *msg, const char *arg) {
@@ -88,12 +97,13 @@ static void load_one(const char *dir, const char *fname) {
     svc_t *s = &g_svc[g_nsvc];
     memset(s, 0, sizeof *s);
     s->enabled = 1;
-    snprintf(s->name, sizeof s->name, "%s", fname);
+    if (copy_cstr(s->name, sizeof s->name, fname) != 0) return;
     char *dot = strrchr(s->name, '.');
     if (dot && (!strcmp(dot, ".yaml") || !strcmp(dot, ".yml") || !strcmp(dot, ".conf"))) *dot = 0;
 
     char path[300];
-    snprintf(path, sizeof path, "%s/%s", dir, fname);
+    int path_len = snprintf(path, sizeof path, "%s/%s", dir, fname);
+    if (path_len < 0 || path_len >= (int)sizeof path) return;
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[256];
@@ -126,7 +136,7 @@ static int load_services(void) {
     struct dirent *de;
     while ((de = readdir(d)) && nn < MAX_SVC) {
         if (de->d_name[0] == '.') continue;
-        snprintf(names[nn++], 64, "%s", de->d_name);
+        if (copy_cstr(names[nn], sizeof names[nn], de->d_name) == 0) nn++;
     }
     closedir(d);
     for (int i = 0; i < nn; i++)

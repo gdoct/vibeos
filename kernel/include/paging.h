@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "../../boot/include/bootinfo.h"
+#include "spinlock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,8 +63,15 @@ uint64_t kva_to_phys(const volatile void *va);
  * A vmspace owns a PML4 whose upper (kernel) half is shared with the master
  * tables; the lower half holds the process's private user mappings. */
 typedef struct vmspace {
-    uint64_t pml4_phys;
-    int      ref;          /* threads (CLONE_VM) share one vmspace; freed at 0 */
+    uint64_t   pml4_phys;
+    uint64_t   mmap_next;  /* bump pointer for anonymous mmap(); shared by all threads
+                              of the process so concurrent mmaps don't collide on a VA */
+    int        ref;        /* threads (CLONE_VM) share one vmspace; freed at 0 (atomic) */
+    spinlock_t lock;       /* serializes page-table mutation + COW-fault repair within
+                              this address space, so threads on different cores don't
+                              corrupt a shared page table (ROADMAP §"User tasks on all
+                              cores"). Cross-AS page sharing is covered by the atomic
+                              page refcounts instead. */
 } vmspace_t;
 
 uint64_t   paging_kernel_pml4(void);                 /* master PML4 (phys) */

@@ -16,3 +16,5 @@
     .long   12          /* block size: 8 (header) + 2 entries × 2 bytes */
     .word   0           /* type=ABSOLUTE, offset=0 (ignored at runtime) */
     .word   0           /* padding entry to keep block size 4-aligned */
+
+   .section .note.GNU-stack,"",@progbits

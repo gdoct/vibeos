@@ -49,20 +49,21 @@ void panic(const CHAR16 *msg, EFI_STATUS status) {
 }
 
 void *bmemset(void *dst, int c, UINTN n) {
-    UINT8 *d = dst;
+    UINT8 *d = (UINT8 *)dst;
     for (UINTN i = 0; i < n; i++) d[i] = (UINT8)c;
     return dst;
 }
 
 void *bmemcpy(void *dst, const void *src, UINTN n) {
-    UINT8 *d = dst;
-    const UINT8 *s = src;
+    UINT8 *d = (UINT8 *)dst;
+    const UINT8 *s = (const UINT8 *)src;
     for (UINTN i = 0; i < n; i++) d[i] = s[i];
     return dst;
 }
 
 int bmemcmp(const void *a, const void *b, UINTN n) {
-    const UINT8 *x = a, *y = b;
+    const UINT8 *x = (const UINT8 *)a;
+    const UINT8 *y = (const UINT8 *)b;
     for (UINTN i = 0; i < n; i++) {
         if (x[i] != y[i]) return (int)x[i] - (int)y[i];
     }

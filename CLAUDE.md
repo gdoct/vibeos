@@ -9,9 +9,9 @@ conventions to respect when changing code.
 
 VibeOS — a from-scratch x86-64 OS: UEFI boot → higher-half kernel with its own
 paging → preemptive SMP scheduler → isolated user processes → writable on-disk
-filesystem (VibeFS) → runs **real static `x86_64-linux-musl` binaries** over a
-serial shell. Linux syscall numbering from day one, so cross-compiled musl runs
-with no translation layer.
+filesystem (VibeFS) → runs **real static and dynamically-linked
+`x86_64-linux-musl` binaries** over a serial shell. Linux syscall numbering from
+day one, so cross-compiled musl runs with no translation layer.
 
 ## Build & run
 
@@ -58,8 +58,14 @@ reasoning; the short version for editing code:
   half is userspace.
 - **`sched_lock` is held across context switches** (xv6 baton). Interrupt state
   is per-CPU (`push_off`/`pop_off`) and never stored in the lock.
-- **User tasks are BSP-pinned** for now (no `swapgs` yet) — don't assume user
-  tasks run on APs.
+- **User tasks run on every core** (work-stolen like kernel tasks; `swapgs` +
+  per-CPU GS/TSS make ring-3 entry per-CPU). The ring-3 paths are therefore *not*
+  lock-free — keep them safe when editing: file/page/vmspace/fdtable refcounts are
+  atomic, the fd table has a per-`fdtable_t` spinlock (install/close/dup), the
+  address space has a per-`vmspace_t` spinlock guarding page-table mutation + COW
+  repair, `munmap`/`mprotect`/`fork` on a *shared* (multithreaded) AS issue a
+  cross-core TLB shootdown (`tlb_shootdown_user`), and pipes/tty/net block under
+  `sched_lock`. Lock map: [docs/smp-userspace-audit.md](docs/smp-userspace-audit.md).
 - **EOI before the handler** — a handler that context-switches must not strand
   the line.
 - **Fixed-size task/file/stack pools** — exhaustion is a panic by design; grow
@@ -69,7 +75,10 @@ reasoning; the short version for editing code:
 
 ## When picking up work
 
-The ordered backlog and the "best bang-for-effort next five" live in
-[ROADMAP.md](ROADMAP.md) — start there rather than inferring priorities from the
-code. Also noted there: open ABI simplifications (eager fork, unvalidated
-`copy_to/from_user`, cwd fixed at `/`, no symlinks, `FD_CLOEXEC` not enforced).
+The ordered backlog and the milestones ("can VibeOS run bash / Rust / a C
+compiler / OpenSSH?") live in [ROADMAP.md](docs/ROADMAP.md) — start there rather
+than inferring priorities from the code. Also noted there: the ABI
+simplifications still open (dirs open read-only; no hard links / `rename`; mode
+bits cosmetic; `fchdir` unsupported) and the shared prerequisites that block the
+milestones (file-mutation syscalls, credentials, a real timebase, PTYs/termios,
+more multiplexing).

@@ -3,6 +3,6 @@
 
 #include "../include/efi.h"
 
-EFI_STATUS fs_read_file(CHAR16 *path, VOID **buffer, UINTN *size);
+EFI_STATUS fs_read_file(const CHAR16 *path, VOID **buffer, UINTN *size);
 
 #endif

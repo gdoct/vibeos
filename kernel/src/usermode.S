@@ -17,8 +17,9 @@ syscall_entry:
        rcx = user return RIP, r11 = user RFLAGS. Syscall number in rax, args
        in rdi,rsi,rdx,r10,r8,r9 (Linux x86_64 ABI). SYSCALL does NOT switch
        stacks or GS, so we do both: swapgs to reach this CPU's percpu block,
-       stash the user rsp in its scratch slot, and load the kernel stack. This
-       is per-CPU now (ROADMAP §2), so user tasks run on any core. */
+       stash the user rsp in its scratch slot, and load the kernel stack. The
+       percpu block is per-CPU, so user tasks run on any core (ROADMAP §"User
+       tasks on all cores"). */
     swapgs
     movq    %rsp, %gs:PCPU_USER_SCRATCH
     movq    %gs:PCPU_KERNEL_RSP, %rsp

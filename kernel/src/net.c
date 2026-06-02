@@ -291,6 +291,18 @@ typedef struct {
 static udp_pcb_t g_udp[UDP_PCB_N];
 static uint16_t  g_ephemeral = 49152;
 
+/* Guards the PCB/socket slot pools (tcp_alloc/udp_bind/sk_alloc) against two user
+   tasks allocating on different cores at once (ROADMAP §"User tasks on all
+   cores"). A dedicated leaf lock — taken either alone (user context) or nested
+   inside sched_lock (the net worker), always in that order, so never deadlocks. */
+static spinlock_t g_net_lock = SPINLOCK_INIT;
+
+/* Hand out the next ephemeral port; atomic so concurrent connects/binds on
+   different cores never collide on the counter. */
+static inline uint16_t next_ephemeral(void) {
+    return __atomic_fetch_add(&g_ephemeral, 1, __ATOMIC_RELAXED);
+}
+
 static uint16_t udp_checksum(uint32_t src, uint32_t dst, const uint8_t *udp, uint32_t len) {
     uint32_t sum = 0;
     sum += (src >> 16) & 0xFFFF; sum += src & 0xFFFF;
@@ -304,17 +316,23 @@ static uint16_t udp_checksum(uint32_t src, uint32_t dst, const uint8_t *udp, uin
 }
 
 static udp_pcb_t *udp_bind(uint16_t port) {
+    spin_lock(&g_net_lock);
     if (port != 0) {
         for (int i = 0; i < UDP_PCB_N; i++)
-            if (g_udp[i].used && g_udp[i].local_port == port) return nullptr;  /* in use */
+            if (g_udp[i].used && g_udp[i].local_port == port) {
+                spin_unlock(&g_net_lock);
+                return nullptr;                 /* in use */
+            }
     }
     for (int i = 0; i < UDP_PCB_N; i++) {
         if (g_udp[i].used) continue;
         kmemset(&g_udp[i], 0, sizeof g_udp[i]);
         g_udp[i].used = 1;
-        g_udp[i].local_port = port ? port : g_ephemeral++;
+        g_udp[i].local_port = port ? port : next_ephemeral();
+        spin_unlock(&g_net_lock);
         return &g_udp[i];
     }
+    spin_unlock(&g_net_lock);
     return nullptr;
 }
 
@@ -532,6 +550,7 @@ static uint32_t tcp_snd_free(tcp_pcb_t *t) { return TCP_SNDBUF - t->snd_buf_len;
 static uint32_t tcp_flight(tcp_pcb_t *t) { return t->snd_nxt - t->snd_una; }
 
 static tcp_pcb_t *tcp_alloc(void) {
+    spin_lock(&g_net_lock);
     for (int i = 0; i < TCP_PCB_N; i++) {
         if (g_tcp[i].used) continue;
         kmemset(&g_tcp[i], 0, sizeof g_tcp[i]);
@@ -540,8 +559,10 @@ static tcp_pcb_t *tcp_alloc(void) {
         g_tcp[i].cwnd = 4 * TCP_MSS;           /* RFC 6928-ish initial window */
         g_tcp[i].ssthresh = 0xFFFF;
         g_tcp[i].rto = TCP_RTO_INIT;
+        spin_unlock(&g_net_lock);
         return &g_tcp[i];
     }
+    spin_unlock(&g_net_lock);
     return nullptr;
 }
 
@@ -744,7 +765,7 @@ static tcp_pcb_t *tcp_connect(uint32_t dip, uint16_t dport) {
     if (!t) return nullptr;
     t->state = T_SYN_SENT;
     t->local_ip = is_loopback(dip) ? dip : LOCAL_IP;
-    t->local_port = g_ephemeral++;
+    t->local_port = next_ephemeral();
     t->remote_ip = dip; t->remote_port = dport;
     t->iss = csprng_tcp_isn(t->local_ip, t->local_port, t->remote_ip, t->remote_port);
     t->snd_una = t->snd_nxt = t->iss;
@@ -1205,8 +1226,14 @@ typedef struct ksocket {
 static ksocket_t g_sock[KSOCK_N];
 
 static ksocket_t *sk_alloc(void) {
+    spin_lock(&g_net_lock);
     for (int i = 0; i < KSOCK_N; i++)
-        if (!g_sock[i].used) { kmemset(&g_sock[i], 0, sizeof g_sock[i]); g_sock[i].used = 1; return &g_sock[i]; }
+        if (!g_sock[i].used) {
+            kmemset(&g_sock[i], 0, sizeof g_sock[i]); g_sock[i].used = 1;
+            spin_unlock(&g_net_lock);
+            return &g_sock[i];
+        }
+    spin_unlock(&g_net_lock);
     return nullptr;
 }
 

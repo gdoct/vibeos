@@ -39,6 +39,11 @@ void ap_entry(void);
    a syscall (IF=0) or under sched_lock, or the ack-wait can deadlock. */
 void tlb_shootdown_all(void);
 
+/* Cross-core TLB flush callable from a syscall (IF cleared): serializes senders
+   and enables interrupts around the ack-wait, restoring IF on return. Used by the
+   memory syscalls when they change a shared/threaded address space's mappings. */
+void tlb_shootdown_user(void);
+
 /* Boot-time IPI sanity check (BSP, interrupts enabled). */
 void smp_ipi_selftest(void);
 

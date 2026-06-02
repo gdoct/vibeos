@@ -143,7 +143,9 @@ void signals_raise(task_t *t, int sig) {
         default_disp(sig) == DFL_IGN)
         return;                                   /* default-ignored: drop */
 
-    t->sig.pending |= SIGBIT(sig);
+    /* Atomic: a kill on another core must not lose a concurrent set/clear of the
+       target's pending mask (ROADMAP §"User tasks on all cores"). */
+    __atomic_or_fetch(&t->sig.pending, SIGBIT(sig), __ATOMIC_ACQ_REL);
 
     /* Nudge the target so it delivers promptly. If it sleeps in an
        interruptible wait it bails with -EINTR and delivers on the way out; if it
@@ -223,7 +225,7 @@ static int deliver(task_t *t, mctx_t *m) {
     for (;;) {
         int sig = pick_signal(t);
         if (!sig) return 0;
-        t->sig.pending &= ~SIGBIT(sig);
+        __atomic_and_fetch(&t->sig.pending, ~SIGBIT(sig), __ATOMIC_ACQ_REL);
         ksigaction_t *sa = &t->sig.act[sig - 1];
 
         if (sa->handler == SIG_IGN) continue;     /* shouldn't be pending, but be safe */
@@ -262,7 +264,7 @@ void signals_deliver_regs(regs_t *r) {
 
 void signals_raise_fault(regs_t *r, int sig) {
     task_t *t = task_current();
-    t->sig.pending |= SIGBIT(sig);
+    __atomic_or_fetch(&t->sig.pending, SIGBIT(sig), __ATOMIC_ACQ_REL);
     mctx_t m;
     mctx_from_regs(r, &m);
     /* A synchronous fault can't be ignored away: if the handler is default or

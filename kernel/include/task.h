@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "signal.h"
+#include "spinlock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,13 +56,11 @@ typedef struct task {
     /* Per-CPU run-queue link + affinity (ROADMAP §3). rq_next threads this task
        through its home CPU's ready queue; only meaningful when state==READY.
        home_cpu is the CPU it last ran on — its scheduler re-queues it there, and
-       an idle CPU steals it only when its own queue is empty. */
+       an idle CPU steals it only when its own queue is empty. Both kernel and
+       user tasks are stealable now (ROADMAP §"User tasks on all cores"); the
+       ring-3 syscall/fd/pipe/mm paths carry their own locks. */
     struct task  *rq_next;
     int           home_cpu;
-    int           bsp_only;     /* user tasks: the ring-3 syscall/tty/pipe/fd path
-                                   is lock-free on the assumption it only runs on
-                                   the BSP, so a task with an address space is
-                                   pinned to CPU 0 and never stolen (ROADMAP §3). */
 
     /* User-process fields (NULL/0 for kernel threads). The scheduler loads
        `vm`'s CR3 on switch; brk_* track the heap; parent/exit_code/child_wq
@@ -69,7 +68,6 @@ typedef struct task {
     struct vmspace *vm;
     uint64_t      brk_start, brk_cur, brk_max;
     uint64_t      fs_base;      /* TLS base (arch_prctl ARCH_SET_FS); per-task FS_BASE MSR */
-    uint64_t      mmap_next;    /* bump pointer for anonymous mmap() in the user half */
     struct task  *parent;
     int           exit_code;
     int           term_signal;  /* nonzero if killed by a signal (wait4 status) */
@@ -97,9 +95,13 @@ typedef struct task {
     char          cwd[256];
 } task_t;
 
-/* A refcounted descriptor table so threads (CLONE_FILES) can share one. */
+/* A refcounted descriptor table so threads (CLONE_FILES) can share one. `ref` is
+   touched with atomics; `lock` guards the fd[]/cloexec[] slot arrays so two
+   threads of one process can install/close/dup descriptors on different cores
+   without corrupting the table or double-unref'ing a slot. */
 typedef struct fdtable {
     int           ref;
+    spinlock_t    lock;
     struct file  *fd[VFS_MAX_FD];
     uint8_t       cloexec[VFS_MAX_FD];
 } fdtable_t;
