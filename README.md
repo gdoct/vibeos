@@ -55,13 +55,19 @@ project state. The major pieces that are available today are:
 - RAM disk and virtio-blk drivers, virtio-net, plus PCI enumeration.
 - A WAN-grade IPv4 network stack (ARP, IP, ICMP, UDP, and TCP with congestion
 	control, retransmission, and reassembly) with BSD sockets
-	(`socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`/`poll`,
+	(`socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`,
 	`O_NONBLOCK`/`MSG_DONTWAIT`) and a ported `wget`.
+- I/O multiplexing over a unified readiness layer: `poll`/`select`/`pselect6`/
+	`ppoll` across files, ttys, pipes, sockets, plus `eventfd` and `timerfd`.
+- Real wall-clock time from the CMOS RTC, anchored to the timer tick:
+	`clock_gettime` (REALTIME + MONOTONIC) / `gettimeofday` and wall-clock `stat`
+	timestamps. Hardcoded-root credentials (`getuid`/`geteuid`/`getgid`/`getegid`).
 - VibeFS, a small writable filesystem with directories, files, symlinks, and
-	crash-safe ordered updates.
+	crash-safe ordered updates, with in-place mutation (`unlink`/`unlinkat`/
+	`rmdir`/`rename`/`truncate`/`ftruncate`).
 - Userspace loading from disk (static and dynamically-linked musl), per-process
 	address spaces and cwd, `fork`, `execve`, `wait4`, and an interactive
-	`/bin/sh`.
+	`/bin/sh` (with `mkdir`/`touch`/`rm`/`rmdir`/`mv`/`id` builtins).
 - A `/config`-driven, service-managed init (PID 1) that starts and supervises
 	services from `/config/services/`, plus an `x86_64-vibeos-musl` cross
 	toolchain for building target binaries.
