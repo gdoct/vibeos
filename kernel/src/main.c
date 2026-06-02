@@ -6,6 +6,7 @@
 #include "idt.h"
 #include "irq.h"
 #include "timer.h"
+#include "rtc.h"
 #include "task.h"
 #include "kmalloc.h"
 #include "paging.h"
@@ -237,6 +238,7 @@ extern "C" void kmain(BootInfo *bi) {
     if (!apic_init(bi, 100)) {
         timer_start_pit();          /* fallback: PIT drives IRQ 0 via 8259 */
     }
+    rtc_init();                     /* anchor wall-clock epoch to the timer tick */
 
     /* 256 KiB RAM disk = 512 sectors of 512 bytes. Useful as a baseline
        check that the block_device_t interface works even when no real

@@ -33,6 +33,8 @@ file_t *file_alloc(void) {
             f->dev = 0;
             f->pipe = nullptr;
             f->sock = nullptr;
+            f->aux1 = 0;
+            f->aux2 = 0;
             spin_lock_init(&f->off_lock);
             return f;
         }

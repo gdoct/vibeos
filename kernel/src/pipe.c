@@ -57,6 +57,22 @@ void pipe_detach(file_t *f) {
     if (gone) pipe_free(p);
 }
 
+/* Non-destructive readiness for poll/select. Returns POLL* bits (0x1 IN, 0x4
+   OUT, 0x8 ERR, 0x10 HUP). `is_writer` selects which end of the pipe. */
+int pipe_poll(pipe_t *p, int is_writer) {
+    int r = 0;
+    sched_lock();
+    if (is_writer) {
+        if (p->readers == 0)        r |= 0x8;            /* POLLERR (broken pipe) */
+        if (p->count < PIPE_CAP)    r |= 0x4;            /* POLLOUT: room to write */
+    } else {
+        if (p->count > 0)           r |= 0x1;            /* POLLIN: data ready */
+        if (p->writers == 0)        r |= 0x1 | 0x10;     /* EOF: readable + POLLHUP */
+    }
+    sched_unlock();
+    return r;
+}
+
 int pipe_read(pipe_t *p, void *buf, uint32_t n, int flags) {
     if (n == 0) return 0;
     uint8_t *out = (uint8_t *)buf;

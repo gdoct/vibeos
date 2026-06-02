@@ -102,6 +102,14 @@ void tty_poll(void) {
     }
 }
 
+/* Non-destructive: is there a committed line ready to read? (poll/select) */
+int tty_readable(void) {
+    sched_lock();
+    int r = (g_head != g_tail);
+    sched_unlock();
+    return r;
+}
+
 int tty_read(char *buf, uint32_t n) {
     if (n == 0) return 0;
     /* Check emptiness and sleep under sched_lock, paired with commit_line's

@@ -38,6 +38,10 @@ void    pipe_detach(struct file *f);
 int     pipe_read (pipe_t *p, void *buf, uint32_t n, int flags);
 int     pipe_write(pipe_t *p, const void *buf, uint32_t n, int flags);
 
+/* Non-destructive readiness for poll/select: POLL* bits (0x1 IN, 0x4 OUT,
+   0x8 ERR, 0x10 HUP). `is_writer` selects the write end. */
+int     pipe_poll (pipe_t *p, int is_writer);
+
 #ifdef __cplusplus
 }
 #endif

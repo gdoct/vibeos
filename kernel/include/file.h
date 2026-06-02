@@ -31,6 +31,8 @@ typedef enum {
     FD_DEV,         /* synthetic /dev char device (subtype in `dev`); §4 */
     FD_DEVDIR,      /* synthetic directory (/dev, /proc, /proc/<pid>); §4 */
     FD_PROC,        /* synthetic /proc/<pid>/<file> (pid in `ino`, file in `dev`); §4 */
+    FD_EVENT,       /* eventfd: 64-bit counter in `aux1`; EFD_SEMAPHORE in `dev` */
+    FD_TIMER,       /* timerfd: next-expiry tick in `aux1`, interval ticks in `aux2` */
 } fd_kind_t;
 
 struct pipe;            /* kernel/include/pipe.h */
@@ -44,6 +46,7 @@ typedef struct file {
     int       dev;          /* synthetic device/proc subtype (FD_DEV/DEVDIR/PROC) */
     struct pipe *pipe;      /* pipe object (FD_PIPE_RD/WR) */
     void     *sock;         /* socket object (FD_SOCKET) */
+    uint64_t  aux1, aux2;   /* eventfd counter / timerfd (next-tick, interval-ticks) */
     spinlock_t off_lock;    /* guards `off` read-modify-write across cores (a fork/
                                dup-shared description is touched by several tasks) */
 } file_t;

@@ -133,7 +133,8 @@ KERNEL_C_SRCS = \
 	kernel/src/drivers/virtio_blk.c \
 	kernel/src/drivers/virtio_rng.c \
 	kernel/src/drivers/usb_uhci.c \
-	kernel/src/drivers/timer.c
+	kernel/src/drivers/timer.c \
+	kernel/src/drivers/rtc.c
 KERNEL_S_SRCS = kernel/src/start.S kernel/src/gdt.S kernel/src/isr.S kernel/src/context_switch.S kernel/src/usermode.S kernel/src/ap_boot.S
 
 # GUI core (gui/core) — the kernel-side windowing lib (libdraw + libwin + libwm),
@@ -170,6 +171,7 @@ USER_INIT  = user/build/init.elf
 USER_HELLO = user/build/hello.elf
 USER_SH    = user/build/sh.elf
 USER_TRUNTEST = user/build/truntest.elf
+USER_MULTEST = user/build/multest.elf
 
 # A real static musl binary, cross-built on the host (ROADMAP §4). This is the
 # §4 proof: an unmodified Linux/musl ELF that runs under the Linux ABI. Built
@@ -280,7 +282,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_TRUNTEST) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK) $(USER_GTERM) $(USER_GUIHELLO)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_TRUNTEST) $(USER_MULTEST) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK) $(USER_GTERM) $(USER_GUIHELLO)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -474,6 +476,12 @@ user/build/truntest.o: user/truntest.c | user/build
 
 $(USER_TRUNTEST): user/build/crt0.o user/build/truntest.o user/user.ld
 	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/truntest.o -o $@
+
+user/build/multest.o: user/multest.c | user/build
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_MULTEST): user/build/crt0.o user/build/multest.o user/user.ld
+	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/multest.o -o $@
 
 # --- Disk image ---
 

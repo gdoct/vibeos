@@ -7,6 +7,7 @@
 #include "pipe.h"
 #include "fs.h"
 #include "timer.h"
+#include "rtc.h"
 #include "tty.h"
 #include "usermode.h"
 #include "smp.h"
@@ -53,6 +54,8 @@ extern "C" void syscall_entry(void);
 /* errno values returned to userspace (negated). */
 #define EPERM_      1
 #define ENOENT_     2
+#define EINTR_      4
+#define EAGAIN_     11
 #define ENOTEMPTY_  39
 #define EBADF_      9
 #define ENOMEM_     12
@@ -378,6 +381,11 @@ static file_t *fd_take(int fd) {
 
 /* ---- basic I/O / exit ---- */
 
+/* eventfd/timerfd read-write helpers live with the poll machinery below. */
+static int64_t eventfd_read(file_t *f, uint64_t ubuf, uint64_t n);
+static int64_t eventfd_write(file_t *f, uint64_t ubuf, uint64_t n);
+static int64_t timerfd_read(file_t *f, uint64_t ubuf, uint64_t n);
+
 static int64_t sys_write(int fd, const void *buf, uint64_t n) {
     if (n && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)buf, n, 0))
         return -EFAULT_;                        /* bad user buffer: no kernel fault */
@@ -393,6 +401,8 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
         if (r == -11) return -11;               /* -EAGAIN: send buffer full (non-blocking) */
         return r < 0 ? -EPIPE_ : r;
     }
+    if (f->kind == FD_EVENT) return eventfd_write(f, (uint64_t)(uintptr_t)buf, n);
+    if (f->kind == FD_TIMER) return -EINVAL_;   /* timerfd is read-only */
     if (f->kind == FD_DEV || f->kind == FD_PROC) return synth_write(f, buf, (uint32_t)n);
     if (f->kind != FD_FILE) return -EISDIR_;
     /* Snapshot the offset under the file lock (not held across the blocking fs
@@ -425,6 +435,8 @@ static int64_t sys_read(int fd, void *buf, uint64_t n) {
     if (f->kind == FD_PIPE_RD) return pipe_read(f->pipe, buf, (uint32_t)n, f->flags);
     if (f->kind == FD_PIPE_WR) return -EBADF_;  /* read from write end */
     if (f->kind == FD_SOCKET) return ksock_recv(f->sock, buf, (uint32_t)n, (f->flags & 04000) ? 1 : 0);
+    if (f->kind == FD_EVENT) return eventfd_read(f, (uint64_t)(uintptr_t)buf, n);
+    if (f->kind == FD_TIMER) return timerfd_read(f, (uint64_t)(uintptr_t)buf, n);
     if (f->kind == FD_DEV || f->kind == FD_PROC) return synth_read(f, buf, (uint32_t)n);
     if (f->kind == FD_DEVDIR) return -EISDIR_;
     if (f->kind != FD_FILE) return -EISDIR_;
@@ -777,9 +789,10 @@ static void fill_stat(struct linux_stat *st, uint32_t ino, const fs_stat_t *s) {
     st->st_size  = (int64_t)s->size;
     st->st_blksize = FS_BLOCK_SIZE;
     st->st_blocks  = (int64_t)((s->size + 511) / 512);
-    st->st_mtime = s->mtime / 100;   /* 100 Hz ticks -> seconds */
-    st->st_ctime = s->ctime / 100;
-    st->st_atime = s->mtime / 100;
+    uint64_t ep = rtc_boot_epoch();  /* ticks are boot-relative; anchor to wall clock */
+    st->st_mtime = (int64_t)(ep + s->mtime / 100);
+    st->st_ctime = (int64_t)(ep + s->ctime / 100);
+    st->st_atime = (int64_t)(ep + s->mtime / 100);
 }
 
 /* A char-device stat for the console fds (0/1/2). */
@@ -1490,38 +1503,327 @@ static int64_t sys_recvfrom(int fd, uint64_t ubuf, uint64_t len, int flags,
     return r;
 }
 
-/* Minimal poll: report immediately-ready socket fds; one coarse retry on the
-   given timeout. Enough for simple readiness checks. */
-static int64_t sys_poll(uint64_t ufds, uint32_t nfds, int timeout_ms) {
+/* poll(2)/select(2) revents bits. */
+#define POLLIN_   0x01
+#define POLLOUT_  0x04
+#define POLLERR_  0x08
+#define POLLHUP_  0x10
+#define POLLNVAL_ 0x20
+
+/* eventfd/timerfd flags. */
+#define EFD_SEMAPHORE 1
+#define O_NONBLOCK_   04000
+
+/* Non-destructive readiness of a single fd, as raw POLL* bits (ignores which
+   events the caller wants; the poll/select layer masks). The one place that
+   knows how every fd kind signals readiness. */
+static int fd_ready(int fd) {
+    file_t *f = fd_get(fd);
+    if (!f) {                                          /* bare console fds */
+        if (fd == 0) return tty_readable() ? POLLIN_ : 0;
+        if (fd == 1 || fd == 2) return POLLOUT_;
+        return POLLNVAL_;
+    }
+    int r = 0;
+    switch (f->kind) {
+    case FD_SOCKET: {
+        int got = ksock_poll(f->sock, NET_POLLIN | NET_POLLOUT);
+        if (got & NET_POLLIN)  r |= POLLIN_;
+        if (got & NET_POLLOUT) r |= POLLOUT_;
+        break;
+    }
+    case FD_PIPE_RD: r = pipe_poll(f->pipe, 0); break;
+    case FD_PIPE_WR: r = pipe_poll(f->pipe, 1); break;
+    case FD_EVENT:
+        spin_lock(&f->off_lock);
+        if (f->aux1 > 0)                       r |= POLLIN_;
+        if (f->aux1 < 0xFFFFFFFFFFFFFFFEULL)   r |= POLLOUT_;
+        spin_unlock(&f->off_lock);
+        break;
+    case FD_TIMER:
+        spin_lock(&f->off_lock);
+        if (f->aux1 != 0 && timer_ticks() >= f->aux1) r |= POLLIN_;
+        spin_unlock(&f->off_lock);
+        break;
+    default:                                           /* files/dirs/synthetic: always ready */
+        r = POLLIN_ | POLLOUT_;
+        break;
+    }
+    return r;
+}
+
+/* Sleep one polling quantum, capped by the deadline. Returns 0 normally, -EINTR_
+   if a signal is pending. timeout_ms < 0 means block indefinitely. */
+static int poll_wait_quantum(int64_t timeout_ms, uint64_t start_tick) {
+    if (signals_pending_current()) return -EINTR_;
+    uint32_t hz = timer_hz() ? timer_hz() : 100;
+    if (timeout_ms >= 0) {
+        uint64_t elapsed_ms = (timer_ticks() - start_tick) * 1000 / hz;
+        if (elapsed_ms >= (uint64_t)timeout_ms) return 1;       /* deadline reached */
+        uint64_t left = (uint64_t)timeout_ms - elapsed_ms;
+        ksleep_ms(left > 50 ? 50 : left);
+    } else {
+        ksleep_ms(50);
+    }
+    return 0;
+}
+
+static int64_t sys_poll(uint64_t ufds, uint32_t nfds, int64_t timeout_ms) {
     struct pollfd { int fd; int16_t events; int16_t revents; };
-    if (nfds == 0) return 0;
-    if (nfds > 64) return -EINVAL_;
-    struct pollfd fds[64];
+    if (nfds == 0) { if (timeout_ms > 0) ksleep_ms((uint64_t)timeout_ms); return 0; }
+    if (nfds > 128) return -EINVAL_;
+    struct pollfd fds[128];
     if (copy_from_user(fds, cur_vm(), ufds, nfds * sizeof(struct pollfd)) < 0) return -EFAULT_;
-    int waited = 0;
+    uint64_t start = timer_ticks();
     for (;;) {
         int ready = 0;
         for (uint32_t i = 0; i < nfds; i++) {
             fds[i].revents = 0;
-            void *ks = sock_get(fds[i].fd);
-            if (ks) {
-                int want = ((fds[i].events & 0x1) ? NET_POLLIN : 0) |
-                           ((fds[i].events & 0x4) ? NET_POLLOUT : 0);
-                int got = ksock_poll(ks, want);
-                if (got & NET_POLLIN)  fds[i].revents |= 0x1;
-                if (got & NET_POLLOUT) fds[i].revents |= 0x4;
-            } else if (fds[i].fd >= 1 && fds[i].fd <= 2) {
-                fds[i].revents |= (fds[i].events & 0x4);   /* console always writable */
-            }
-            if (fds[i].revents) ready++;
+            if (fds[i].fd < 0) continue;
+            int rdy = fd_ready(fds[i].fd);
+            int rev = rdy & (fds[i].events | POLLERR_ | POLLHUP_ | POLLNVAL_);
+            fds[i].revents = (int16_t)rev;
+            if (rev) ready++;
         }
-        if (ready || timeout_ms == 0 || waited) {
-            copy_to_user(cur_vm(), ufds, fds, nfds * sizeof(struct pollfd));
+        if (ready || timeout_ms == 0) {
+            if (copy_to_user(cur_vm(), ufds, fds, nfds * sizeof(struct pollfd)) < 0) return -EFAULT_;
             return ready;
         }
-        ksleep_ms(timeout_ms > 50 ? 50 : (uint64_t)timeout_ms);
-        waited = 1;
+        int w = poll_wait_quantum(timeout_ms, start);
+        if (w < 0) return w;
+        if (w > 0) {
+            if (copy_to_user(cur_vm(), ufds, fds, nfds * sizeof(struct pollfd)) < 0) return -EFAULT_;
+            return 0;
+        }
     }
+}
+
+/* ppoll(fds, nfds, timespec*, sigmask, sigsetsize). The sigmask is ignored (we
+   don't atomically swap the blocked set for the wait); timeout comes from the
+   timespec (NULL = block indefinitely). */
+static int64_t sys_ppoll(uint64_t ufds, uint32_t nfds, uint64_t uts) {
+    int64_t timeout_ms = -1;
+    if (uts) {
+        struct { int64_t sec, nsec; } ts;
+        if (copy_from_user(&ts, cur_vm(), uts, sizeof ts) < 0) return -EFAULT_;
+        timeout_ms = ts.sec * 1000 + ts.nsec / 1000000;
+    }
+    return sys_poll(ufds, nfds, timeout_ms);
+}
+
+/* select(2): bitmap-based readiness over [0,nfds). Up to 256 fds (4 words). */
+static int64_t do_select(int nfds, uint64_t ur, uint64_t uw, uint64_t ue, int64_t timeout_ms) {
+    if (nfds < 0 || nfds > 256) return -EINVAL_;
+    int words = (nfds + 63) / 64;
+    uint64_t inr[4] = {0}, inw[4] = {0}, ine[4] = {0};
+    if (ur && copy_from_user(inr, cur_vm(), ur, (uint64_t)words * 8) < 0) return -EFAULT_;
+    if (uw && copy_from_user(inw, cur_vm(), uw, (uint64_t)words * 8) < 0) return -EFAULT_;
+    if (ue && copy_from_user(ine, cur_vm(), ue, (uint64_t)words * 8) < 0) return -EFAULT_;
+    uint64_t start = timer_ticks();
+    for (;;) {
+        uint64_t outr[4] = {0}, outw[4] = {0}, oute[4] = {0};
+        int count = 0;
+        for (int fd = 0; fd < nfds; fd++) {
+            uint64_t bit = 1ULL << (fd & 63); int w = fd >> 6;
+            int wr = (inr[w] & bit) != 0, ww = (inw[w] & bit) != 0, we = (ine[w] & bit) != 0;
+            if (!(wr || ww || we)) continue;
+            int rdy = fd_ready(fd);
+            if (rdy & POLLNVAL_) return -EBADF_;
+            if (wr && (rdy & (POLLIN_ | POLLHUP_)))   { outr[w] |= bit; count++; }
+            if (ww && (rdy & POLLOUT_))               { outw[w] |= bit; count++; }
+            if (we && (rdy & POLLERR_))               { oute[w] |= bit; count++; }
+        }
+        if (count || timeout_ms == 0) {
+            if (ur && copy_to_user(cur_vm(), ur, outr, (uint64_t)words * 8) < 0) return -EFAULT_;
+            if (uw && copy_to_user(cur_vm(), uw, outw, (uint64_t)words * 8) < 0) return -EFAULT_;
+            if (ue && copy_to_user(cur_vm(), ue, oute, (uint64_t)words * 8) < 0) return -EFAULT_;
+            return count;
+        }
+        int wq = poll_wait_quantum(timeout_ms, start);
+        if (wq < 0) return wq;                                  /* -EINTR */
+        if (wq > 0) {                                           /* timed out: clear sets */
+            uint64_t z[4] = {0};
+            if (ur && copy_to_user(cur_vm(), ur, z, (uint64_t)words * 8) < 0) return -EFAULT_;
+            if (uw && copy_to_user(cur_vm(), uw, z, (uint64_t)words * 8) < 0) return -EFAULT_;
+            if (ue && copy_to_user(cur_vm(), ue, z, (uint64_t)words * 8) < 0) return -EFAULT_;
+            return 0;
+        }
+    }
+}
+
+static int64_t sys_select(int nfds, uint64_t ur, uint64_t uw, uint64_t ue, uint64_t utv) {
+    int64_t timeout_ms = -1;
+    if (utv) {
+        struct { int64_t sec, usec; } tv;
+        if (copy_from_user(&tv, cur_vm(), utv, sizeof tv) < 0) return -EFAULT_;
+        timeout_ms = tv.sec * 1000 + tv.usec / 1000;
+    }
+    return do_select(nfds, ur, uw, ue, timeout_ms);
+}
+
+static int64_t sys_pselect6(int nfds, uint64_t ur, uint64_t uw, uint64_t ue, uint64_t uts) {
+    int64_t timeout_ms = -1;
+    if (uts) {
+        struct { int64_t sec, nsec; } ts;
+        if (copy_from_user(&ts, cur_vm(), uts, sizeof ts) < 0) return -EFAULT_;
+        timeout_ms = ts.sec * 1000 + ts.nsec / 1000000;
+    }
+    return do_select(nfds, ur, uw, ue, timeout_ms);   /* sigmask ignored */
+}
+
+/* ---- eventfd / timerfd ---- */
+
+static int64_t eventfd_read(file_t *f, uint64_t ubuf, uint64_t n) {
+    if (n < 8) return -EINVAL_;
+    for (;;) {
+        spin_lock(&f->off_lock);
+        uint64_t c = f->aux1;
+        if (c != 0) {
+            uint64_t out = (f->dev & EFD_SEMAPHORE) ? 1 : c;
+            f->aux1 = (f->dev & EFD_SEMAPHORE) ? c - 1 : 0;
+            spin_unlock(&f->off_lock);
+            if (copy_to_user(cur_vm(), ubuf, &out, 8) < 0) return -EFAULT_;
+            return 8;
+        }
+        spin_unlock(&f->off_lock);
+        if (f->flags & O_NONBLOCK_) return -EAGAIN_;
+        if (signals_pending_current()) return -EINTR_;
+        ksleep_ms(5);
+    }
+}
+
+static int64_t eventfd_write(file_t *f, uint64_t ubuf, uint64_t n) {
+    if (n < 8) return -EINVAL_;
+    uint64_t v;
+    if (copy_from_user(&v, cur_vm(), ubuf, 8) < 0) return -EFAULT_;
+    if (v == 0xFFFFFFFFFFFFFFFFULL) return -EINVAL_;
+    for (;;) {
+        spin_lock(&f->off_lock);
+        if (f->aux1 <= 0xFFFFFFFFFFFFFFFEULL - v) {            /* fits below the max */
+            f->aux1 += v;
+            spin_unlock(&f->off_lock);
+            return 8;
+        }
+        spin_unlock(&f->off_lock);
+        if (f->flags & O_NONBLOCK_) return -EAGAIN_;
+        if (signals_pending_current()) return -EINTR_;
+        ksleep_ms(5);
+    }
+}
+
+/* Expirations elapsed since the last read; advances the schedule. off_lock held. */
+static uint64_t timerfd_expirations_locked(file_t *f) {
+    if (f->aux1 == 0) return 0;                                /* disarmed */
+    uint64_t now = timer_ticks();
+    if (now < f->aux1) return 0;
+    if (f->aux2 == 0) { f->aux1 = 0; return 1; }               /* one-shot */
+    uint64_t exp = 1 + (now - f->aux1) / f->aux2;
+    f->aux1 += exp * f->aux2;
+    return exp;
+}
+
+static int64_t timerfd_read(file_t *f, uint64_t ubuf, uint64_t n) {
+    if (n < 8) return -EINVAL_;
+    for (;;) {
+        spin_lock(&f->off_lock);
+        uint64_t exp = timerfd_expirations_locked(f);
+        spin_unlock(&f->off_lock);
+        if (exp) {
+            if (copy_to_user(cur_vm(), ubuf, &exp, 8) < 0) return -EFAULT_;
+            return 8;
+        }
+        if (f->flags & O_NONBLOCK_) return -EAGAIN_;
+        if (signals_pending_current()) return -EINTR_;
+        ksleep_ms(5);
+    }
+}
+
+static int64_t sys_eventfd(unsigned initval, int flags) {
+    file_t *f = file_alloc();
+    if (!f) return -ENFILE_;
+    f->kind = FD_EVENT;
+    f->aux1 = initval;
+    f->dev  = (flags & EFD_SEMAPHORE) ? EFD_SEMAPHORE : 0;
+    f->flags = (flags & O_NONBLOCK_) ? O_NONBLOCK_ : 0;
+    int fd = fd_install(f);
+    if (fd < 0) { file_unref(f); return fd; }
+    if (flags & O_CLOEXEC) task_current()->files->cloexec[fd] = 1;
+    return fd;
+}
+
+static int64_t sys_timerfd_create(int clockid, int flags) {
+    (void)clockid;                                  /* REALTIME vs MONOTONIC: ticks either way */
+    file_t *f = file_alloc();
+    if (!f) return -ENFILE_;
+    f->kind = FD_TIMER;
+    f->aux1 = 0; f->aux2 = 0;
+    f->flags = (flags & O_NONBLOCK_) ? O_NONBLOCK_ : 0;
+    int fd = fd_install(f);
+    if (fd < 0) { file_unref(f); return fd; }
+    if (flags & O_CLOEXEC) task_current()->files->cloexec[fd] = 1;
+    return fd;
+}
+
+/* timespec -> ticks (round a nonzero interval up to >= 1 tick so it can fire). */
+static uint64_t ts_to_ticks(int64_t sec, int64_t nsec) {
+    uint32_t hz = timer_hz() ? timer_hz() : 100;
+    uint64_t t = (uint64_t)sec * hz + ((uint64_t)nsec * hz) / 1000000000ULL;
+    if (t == 0 && (sec || nsec)) t = 1;
+    return t;
+}
+static void ticks_to_ts(uint64_t t, int64_t *sec, int64_t *nsec) {
+    uint32_t hz = timer_hz() ? timer_hz() : 100;
+    *sec = (int64_t)(t / hz);
+    *nsec = (int64_t)((t % hz) * (1000000000ULL / hz));
+}
+
+#define TFD_TIMER_ABSTIME 1
+static int64_t sys_timerfd_settime(int fd, int flags, uint64_t unew, uint64_t uold) {
+    file_t *f = fd_get(fd);
+    if (!f || f->kind != FD_TIMER) return -EBADF_;
+    struct { int64_t it_sec, it_nsec, val_sec, val_nsec; } nv;
+    if (copy_from_user(&nv, cur_vm(), unew, sizeof nv) < 0) return -EFAULT_;
+
+    spin_lock(&f->off_lock);
+    if (uold) {                                     /* report the previous setting */
+        struct { int64_t it_sec, it_nsec, val_sec, val_nsec; } ov;
+        uint64_t now = timer_ticks();
+        uint64_t rem = (f->aux1 > now) ? f->aux1 - now : 0;
+        ticks_to_ts(rem, &ov.val_sec, &ov.val_nsec);
+        ticks_to_ts(f->aux2, &ov.it_sec, &ov.it_nsec);
+        spin_unlock(&f->off_lock);
+        if (copy_to_user(cur_vm(), uold, &ov, sizeof ov) < 0) return -EFAULT_;
+        spin_lock(&f->off_lock);
+    }
+    if (nv.val_sec == 0 && nv.val_nsec == 0) {
+        f->aux1 = 0; f->aux2 = 0;                   /* disarm */
+    } else {
+        uint64_t delay = ts_to_ticks(nv.val_sec, nv.val_nsec);
+        if (flags & TFD_TIMER_ABSTIME) {
+            uint64_t abs = ts_to_ticks(nv.val_sec, nv.val_nsec);
+            uint64_t now = timer_ticks();
+            f->aux1 = abs > now ? abs : now + 1;    /* clamp past deadlines to "soon" */
+        } else {
+            f->aux1 = timer_ticks() + delay;
+        }
+        f->aux2 = ts_to_ticks(nv.it_sec, nv.it_nsec);
+    }
+    spin_unlock(&f->off_lock);
+    return 0;
+}
+
+static int64_t sys_timerfd_gettime(int fd, uint64_t ucur) {
+    file_t *f = fd_get(fd);
+    if (!f || f->kind != FD_TIMER) return -EBADF_;
+    struct { int64_t it_sec, it_nsec, val_sec, val_nsec; } cv;
+    spin_lock(&f->off_lock);
+    uint64_t now = timer_ticks();
+    uint64_t rem = (f->aux1 > now) ? f->aux1 - now : 0;
+    ticks_to_ts(rem, &cv.val_sec, &cv.val_nsec);
+    ticks_to_ts(f->aux2, &cv.it_sec, &cv.it_nsec);
+    spin_unlock(&f->off_lock);
+    if (copy_to_user(cur_vm(), ucur, &cv, sizeof cv) < 0) return -EFAULT_;
+    return 0;
 }
 
 static uint64_t do_syscall(syscall_frame_t *f) {
@@ -1566,7 +1868,16 @@ static uint64_t do_syscall(syscall_frame_t *f) {
                                  : (uint64_t)(int64_t)-EPERM_;
     case 56:  return (uint64_t)sys_clone(f);                   /* clone */
     case 202: return (uint64_t)sys_futex(f->rdi, (int)f->rsi, (int)f->rdx);  /* futex */
-    case 7:   return (uint64_t)sys_poll(f->rdi, (uint32_t)f->rsi, (int)f->rdx);  /* poll */
+    case 7:   return (uint64_t)sys_poll(f->rdi, (uint32_t)f->rsi, (int64_t)(int)f->rdx);  /* poll */
+    case 271: return (uint64_t)sys_ppoll(f->rdi, (uint32_t)f->rsi, f->rdx);  /* ppoll */
+    case 23:  return (uint64_t)sys_select((int)f->rdi, f->rsi, f->rdx, f->r10, f->r8); /* select */
+    case 270: return (uint64_t)sys_pselect6((int)f->rdi, f->rsi, f->rdx, f->r10, f->r8); /* pselect6 */
+    case 284: return (uint64_t)sys_eventfd((unsigned)f->rdi, 0);          /* eventfd */
+    case 290: return (uint64_t)sys_eventfd((unsigned)f->rdi, (int)f->rsi); /* eventfd2 */
+    case 283: return (uint64_t)sys_timerfd_create((int)f->rdi, (int)f->rsi);   /* timerfd_create */
+    case 286: return (uint64_t)sys_timerfd_settime((int)f->rdi, (int)f->rsi,
+                                                   f->rdx, f->r10);            /* timerfd_settime */
+    case 287: return (uint64_t)sys_timerfd_gettime((int)f->rdi, f->rsi);       /* timerfd_gettime */
     case 41:  return (uint64_t)sys_socket((int)f->rdi, (int)f->rsi, (int)f->rdx); /* socket */
     case 42:  return (uint64_t)sys_connect((int)f->rdi, f->rsi, (uint32_t)f->rdx); /* connect */
     case 43:  return (uint64_t)sys_accept((int)f->rdi, f->rsi, f->rdx);  /* accept */
@@ -1663,15 +1974,27 @@ static uint64_t do_syscall(syscall_frame_t *f) {
         if (copy_to_user(cur_vm(), f->rdi, &u, sizeof u) < 0) return (uint64_t)(int64_t)-EFAULT_;
         return 0;
     }
-    case 228: {                                                /* clock_gettime */
-        uint64_t t = timer_ticks();                            /* 100 Hz */
-        struct { int64_t sec, nsec; } ts = { (int64_t)(t / 100), (int64_t)((t % 100) * 10000000) };
+    case 228: {                                                /* clock_gettime(clockid, ts) */
+        uint64_t sec, nsec;
+        switch ((int)f->rdi) {
+        case 1: case 4: case 6: case 7: {                      /* MONOTONIC[_RAW/_COARSE]/BOOTTIME */
+            uint32_t hz = timer_hz() ? timer_hz() : 100;
+            uint64_t t = timer_ticks();
+            sec = t / hz; nsec = (t % hz) * (1000000000ULL / hz);
+            break;
+        }
+        default:                                               /* REALTIME[_COARSE] + fallback */
+            rtc_realtime(&sec, &nsec);
+            break;
+        }
+        struct { int64_t sec, nsec; } ts = { (int64_t)sec, (int64_t)nsec };
         if (copy_to_user(cur_vm(), f->rsi, &ts, sizeof ts) < 0) return (uint64_t)(int64_t)-EFAULT_;
         return 0;
     }
-    case 96: {                                                 /* gettimeofday */
-        uint64_t t = timer_ticks();
-        struct { int64_t sec, usec; } tv = { (int64_t)(t / 100), (int64_t)((t % 100) * 10000) };
+    case 96: {                                                 /* gettimeofday(tv, tz) */
+        uint64_t sec, nsec;
+        rtc_realtime(&sec, &nsec);
+        struct { int64_t sec, usec; } tv = { (int64_t)sec, (int64_t)(nsec / 1000) };
         if (f->rdi && copy_to_user(cur_vm(), f->rdi, &tv, sizeof tv) < 0) return (uint64_t)(int64_t)-EFAULT_;
         return 0;
     }

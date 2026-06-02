@@ -271,13 +271,19 @@ milestone is mostly about closing specific syscall/ABI gaps, not new subsystems.
   `getegid` (102/107/104/108) return 0; `setuid`/`setgid` (105/106) accept 0 and
   return `-EPERM` otherwise. No per-task uid/gid storage yet — revisit when a real
   permission model lands. (`sh id` prints them.)
-- **Real timekeeping** — `clock_gettime`/`gettimeofday` are 100 Hz and fake the
-  wall clock (`sec = ticks/100`). A proper timebase is quietly needed everywhere.
+- ~~**Real timekeeping**~~ — *done.* The CMOS RTC ([rtc.c](kernel/src/drivers/rtc.c))
+  is read once at boot and anchored to the timer tick; `clock_gettime`
+  (CLOCK_REALTIME + MONOTONIC) and `gettimeofday` now return real wall-clock
+  time, and `stat` timestamps are wall-clock too. (`multest` prints the epoch.)
 - **Interactive I/O** — `ioctl` always returns `-ENOTTY`; no PTYs
   (`/dev/ptmx`/pts); no sessions/job control (`setsid`/`setpgid`/`tcsetpgrp`).
   Gateway to any interactive program.
-- **More multiplexing** — only `poll` exists; no `select`/`pselect`/`ppoll`/
-  `epoll`/`eventfd`/`timerfd`.
+- **More multiplexing** — *mostly done.* `select`/`pselect6` (23/270),
+  `ppoll` (271), `eventfd`/`eventfd2` (284/290), `timerfd_create`/`settime`/
+  `gettime` (283/286/287) are wired up, and `poll` was rebuilt over a unified
+  `fd_ready` readiness helper covering files/tty/pipe/socket/eventfd/timerfd.
+  Still missing: `epoll`. (Readiness is coarse poll-with-sleep, 50 ms quantum —
+  not event-driven; fine until something needs sub-tick latency.)
 
 1. **Run `bash`** *(closest — file-mutation + credentials + a little tty work).*
    Scripted (non-interactive) bash needs little beyond what we have plus

@@ -54,6 +54,8 @@ fi
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/hello.elf /bin/hello
 [ -f user/build/truntest.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/truntest.elf /bin/truntest
+[ -f user/build/multest.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/multest.elf /bin/multest
 [ -f user/build/mhello.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/mhello.elf /bin/mhello
 [ -f user/build/ftest.elf ] && \

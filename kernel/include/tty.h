@@ -21,6 +21,7 @@ extern "C" {
  */
 void tty_poll(void);
 int  tty_read(char *buf, uint32_t n);
+int  tty_readable(void);   /* non-destructive: cooked line ready? (poll/select) */
 
 /* Inject a character into the console input stream (e.g. from a USB keyboard).
    Safe to call from any CPU; the BSP's tty_poll drains it through the line
