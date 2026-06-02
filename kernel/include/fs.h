@@ -162,6 +162,8 @@ int fs_istat  (uint32_t ino, fs_stat_t *out);
 int fs_symlink(const char *target, const char *linkpath);   /* create a symlink */
 int fs_readlink(uint32_t ino, char *buf, uint32_t bufsz);   /* read a symlink target (no NUL); bytes or FS errno */
 int fs_truncate_ino(uint32_t ino);                   /* drop to zero length */
+int fs_truncate_to(uint32_t ino, uint64_t len);      /* set length (zero-extends on grow) */
+int fs_rename(const char *oldpath, const char *newpath);   /* move file or directory */
 int fs_pread  (uint32_t ino, uint64_t off, void *buf, uint32_t n);
 int fs_pwrite (uint32_t ino, uint64_t off, const void *buf, uint32_t n);
 /* Read one directory entry at byte cursor *pos (advances it). Returns 1 on a

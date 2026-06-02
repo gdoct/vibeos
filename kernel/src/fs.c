@@ -228,6 +228,43 @@ static void inode_truncate(uint32_t ino, inode_t *in) {
     inode_write(ino, in);
 }
 
+/* Free just the leaf data block backing file-block index `fbn`, turning it into
+   a sparse hole. Intermediate index blocks are deliberately left referenced
+   (they are reclaimed only when the whole inode is freed); only data blocks are
+   returned to the allocator. Used by partial fs_truncate_to shrinks. */
+static void bfree_at(inode_t *in, uint32_t fbn) {
+    if (fbn < FS_NDIRECT) {
+        if (in->direct[fbn]) { data_free(in->direct[fbn]); in->direct[fbn] = 0; }
+        return;
+    }
+    fbn -= FS_NDIRECT;
+    uint32_t root; int level; uint32_t idx;
+    if (fbn < FS_NINDIRECT)                                  { root = in->indirect;  level = 1; idx = fbn; }
+    else if ((fbn -= FS_NINDIRECT), (uint64_t)fbn < FS_NDOUBLE)
+                                                             { root = in->indirect2; level = 2; idx = fbn; }
+    else if ((fbn -= (uint32_t)FS_NDOUBLE), (uint64_t)fbn < FS_NTRIPLE)
+                                                             { root = in->indirect3; level = 3; idx = fbn; }
+    else return;                                            /* past triple-indirect reach */
+    if (!root) return;                                      /* already a hole */
+
+    uint8_t buf[FS_BLOCK_SIZE];
+    uint32_t blk = root;
+    for (int lvl = level;; lvl--) {
+        bread(blk, buf);
+        uint32_t *ptrs = (uint32_t *)buf;
+        uint32_t per = 1;
+        for (int i = 1; i < lvl; i++) per *= FS_NPTR_PER_BLOCK;
+        uint32_t ci = idx / per;
+        idx %= per;
+        if (lvl == 1) {
+            if (ptrs[ci]) { data_free(ptrs[ci]); ptrs[ci] = 0; bwrite(blk, buf); }
+            return;
+        }
+        if (!ptrs[ci]) return;                              /* hole somewhere above */
+        blk = ptrs[ci];
+    }
+}
+
 /* Release an inode entirely: free its blocks, clear the record, free the slot. */
 static void inode_free(uint32_t ino, inode_t *in) {
     blocks_free(in);
@@ -957,6 +994,132 @@ int fs_unlink(const char *path) {
     return FS_OK;
 }
 
+/* ------------------------------------------------------------------- rename */
+
+/* Rewrite directory `dir`'s ".." entry to point at `new_parent`. */
+static int dir_set_dotdot(inode_t *dir, uint32_t new_parent) {
+    uint8_t buf[FS_BLOCK_SIZE];
+    uint32_t nblk = dir->size / FS_BLOCK_SIZE;
+    for (uint32_t fbn = 0; fbn < nblk; fbn++) {
+        uint32_t b = bmap(dir, fbn, 0);
+        if (!b) continue;
+        bread(b, buf);
+        uint32_t off = 0;
+        while (off < FS_BLOCK_SIZE) {
+            dirent_disk_t *de = (dirent_disk_t *)(buf + off);
+            uint32_t rlen = de->rec_len;
+            if (rlen < FS_DIRENT_HDR || off + rlen > FS_BLOCK_SIZE) break;
+            if (de->inode != 0 && de->name_len == 2 &&
+                buf[off + FS_DIRENT_HDR] == '.' && buf[off + FS_DIRENT_HDR + 1] == '.') {
+                de->inode = new_parent;
+                bwrite(b, buf);
+                return FS_OK;
+            }
+            off += rlen;
+        }
+    }
+    return FS_ENOENT;
+}
+
+/* Move the entry named by `oldpath` to `newpath`, replacing an existing target
+   if compatible (POSIX rename). Handles cross-directory moves of directories
+   (rewrites "..", adjusts parent link counts) and refuses to move a directory
+   into its own subtree. Both paths are absolute and pre-normalized. */
+int fs_rename(const char *oldpath, const char *newpath) {
+    if (!g.mounted) return FS_EINVAL;
+
+    uint32_t op, np, oln, nln;
+    const char *on, *nn;
+    int r = path_parent(oldpath, &op, &on, &oln);
+    if (r != FS_OK) return r;
+    r = path_parent(newpath, &np, &nn, &nln);
+    if (r != FS_OK) return r;
+
+    inode_t opdir;
+    inode_read(op, &opdir);
+    if (opdir.type != FT_DIR) return FS_ENOTDIR;
+    uint32_t cino = dir_lookup(&opdir, on, oln);
+    if (!cino) return FS_ENOENT;
+
+    inode_t npdir;
+    inode_read(np, &npdir);
+    if (npdir.type != FT_DIR) return FS_ENOTDIR;
+
+    inode_t cin;
+    inode_read(cino, &cin);
+
+    uint32_t dino = dir_lookup(&npdir, nn, nln);    /* existing target, if any */
+    if (dino == cino) return FS_OK;                 /* same entry: nothing to do */
+
+    /* Refuse to move a directory into itself or a descendant (would orphan a
+       cycle). Walk new-parent's ancestry up to the root looking for the source. */
+    if (cin.type == FT_DIR && np != op) {
+        uint32_t anc = np;
+        for (;;) {
+            if (anc == cino) return FS_EINVAL;
+            if (anc == g.sb.root_inode) break;
+            inode_t a;
+            inode_read(anc, &a);
+            uint32_t up = dir_lookup(&a, "..", 2);
+            if (!up || up == anc) break;
+            anc = up;
+        }
+    }
+
+    int target_was_dir = 0;
+    if (dino) {
+        inode_t din;
+        inode_read(dino, &din);
+        if (din.type == FT_DIR) {
+            if (cin.type != FT_DIR) return FS_EISDIR;       /* file onto directory */
+            if (!dir_empty(&din))   return FS_ENOTEMPTY;
+            target_was_dir = 1;
+        } else if (cin.type == FT_DIR) {
+            return FS_ENOTDIR;                              /* directory onto file */
+        }
+        uint32_t rem = 0;
+        r = dir_remove(np, &npdir, nn, nln, &rem);
+        if (r != FS_OK) return r;
+        if (din.type == FT_DIR) {
+            inode_free(dino, &din);
+        } else {
+            din.links -= 1;
+            if (din.links == 0) inode_free(dino, &din);
+            else                inode_write(dino, &din);
+        }
+    }
+
+    /* Link the entry in under its new name, then drop the old name. */
+    inode_read(np, &npdir);
+    r = dir_add(np, &npdir, nn, nln, cino, (uint8_t)cin.type);
+    if (r != FS_OK) return r;
+
+    inode_read(op, &opdir);
+    uint32_t rem2 = 0;
+    r = dir_remove(op, &opdir, on, oln, &rem2);
+    if (r != FS_OK) return r;
+
+    /* A directory that changed parents needs its ".." and both parents' link
+       counts updated. */
+    if (cin.type == FT_DIR && np != op)
+        dir_set_dotdot(&cin, np);
+
+    int op_delta = 0, np_delta = 0;
+    if (target_was_dir)                       np_delta -= 1;   /* lost target's ".." */
+    if (cin.type == FT_DIR && np != op)     { op_delta -= 1; np_delta += 1; }
+
+    if (op == np) {
+        int d = op_delta + np_delta;
+        if (d) { inode_t t; inode_read(op, &t); t.links = (uint16_t)((int)t.links + d); inode_write(op, &t); }
+    } else {
+        if (op_delta) { inode_t t; inode_read(op, &t); t.links = (uint16_t)((int)t.links + op_delta); inode_write(op, &t); }
+        if (np_delta) { inode_t t; inode_read(np, &t); t.links = (uint16_t)((int)t.links + np_delta); inode_write(np, &t); }
+    }
+
+    flush_meta();
+    return FS_OK;
+}
+
 /* ---------------------------------------------------------------- open/close */
 
 int fs_open(const char *path, int flags) {
@@ -1149,6 +1312,47 @@ int fs_truncate_ino(uint32_t ino) {
     inode_read(ino, &in);
     if (in.type == FT_DIR) return FS_EISDIR;
     inode_truncate(ino, &in);
+    flush_meta();
+    return FS_OK;
+}
+
+/* Set inode `ino` to exactly `len` bytes. Shrinking frees the now-unused data
+   blocks and zeroes the tail of the last surviving block (so a later grow reads
+   back zeros, not stale data); growing is a pure size bump — unallocated blocks
+   read back as zeros (sparse holes), matching POSIX ftruncate semantics. */
+int fs_truncate_to(uint32_t ino, uint64_t len) {
+    if (!g.mounted) return FS_EINVAL;
+    if (len > FS_MAXFILEBLKS * (uint64_t)FS_BLOCK_SIZE) return FS_EFBIG;
+    inode_t in;
+    inode_read(ino, &in);
+    if (in.type == FT_NONE) return FS_ENOENT;
+    if (in.type == FT_DIR)  return FS_EISDIR;
+    if (len == in.size) return FS_OK;
+
+    if (len < in.size) {
+        if (len == 0) {
+            blocks_free(&in);
+        } else {
+            /* drop whole blocks beyond the new length */
+            uint32_t first    = (uint32_t)((len + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE);
+            uint32_t old_nblk = (uint32_t)((in.size + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE);
+            for (uint32_t fbn = first; fbn < old_nblk; fbn++) bfree_at(&in, fbn);
+            /* zero the tail of the partial last block so a future grow sees zeros */
+            uint32_t tail = (uint32_t)(len % FS_BLOCK_SIZE);
+            if (tail) {
+                uint32_t b = bmap(&in, (uint32_t)(len / FS_BLOCK_SIZE), 0);
+                if (b) {
+                    uint8_t blk[FS_BLOCK_SIZE];
+                    bread(b, blk);
+                    kmemset(blk + tail, 0, FS_BLOCK_SIZE - tail);
+                    bwrite(b, blk);
+                }
+            }
+        }
+    }
+    in.size  = len;
+    in.mtime = (uint32_t)timer_ticks();
+    inode_write(ino, &in);
     flush_meta();
     return FS_OK;
 }

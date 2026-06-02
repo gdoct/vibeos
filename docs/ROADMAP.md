@@ -260,13 +260,17 @@ milestone is mostly about closing specific syscall/ABI gaps, not new subsystems.
 
 **Shared prerequisites (block most of the below):**
 
-- **File mutation syscalls** — `unlink`/`unlinkat`, `rename`, `rmdir`,
-  `ftruncate` are not wired up (note: `fs_unlink` already exists in
-  [fs.c](kernel/src/fs.c) — just unexposed). Nearly everything that writes temp
-  files needs these. Cheapest, highest-leverage gap.
-- **Credentials** — no `getuid`/`geteuid`/`getgid`/`getegid` (and no
-  `setuid`/`setgid`). musl startup and most tools expect them; hardcoding to 0 is
-  enough to start.
+- ~~**File mutation syscalls**~~ — *done.* `unlink`/`unlinkat` (87/263),
+  `rmdir` (84), `rename`/`renameat`/`renameat2` (82/264/316), `truncate`/
+  `ftruncate` (76/77) are wired up in [syscall.c](kernel/src/syscall.c) over new
+  `fs_rename`/`fs_truncate_to` primitives in [fs.c](kernel/src/fs.c) (cross-dir
+  dir moves fix up `..`/link counts; truncate shrinks free indirect blocks and
+  zero-extend grows are sparse). `sh` gained `mkdir`/`touch`/`rm`/`rmdir`/`mv`;
+  `/bin/truntest` is the ftruncate regression test.
+- ~~**Credentials**~~ — *done (hardcoded root).* `getuid`/`geteuid`/`getgid`/
+  `getegid` (102/107/104/108) return 0; `setuid`/`setgid` (105/106) accept 0 and
+  return `-EPERM` otherwise. No per-task uid/gid storage yet — revisit when a real
+  permission model lands. (`sh id` prints them.)
 - **Real timekeeping** — `clock_gettime`/`gettimeofday` are 100 Hz and fake the
   wall clock (`sec = ticks/100`). A proper timebase is quietly needed everywhere.
 - **Interactive I/O** — `ioctl` always returns `-ENOTTY`; no PTYs

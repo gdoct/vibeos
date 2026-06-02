@@ -169,6 +169,7 @@ USER_LDFLAGS = -nostdlib -static -no-pie -T user/user.ld
 USER_INIT  = user/build/init.elf
 USER_HELLO = user/build/hello.elf
 USER_SH    = user/build/sh.elf
+USER_TRUNTEST = user/build/truntest.elf
 
 # A real static musl binary, cross-built on the host (ROADMAP §4). This is the
 # §4 proof: an unmodified Linux/musl ELF that runs under the Linux ABI. Built
@@ -279,7 +280,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK) $(USER_GTERM) $(USER_GUIHELLO)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_TRUNTEST) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK) $(USER_GTERM) $(USER_GUIHELLO)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -467,6 +468,12 @@ $(USER_HELLO): user/build/crt0.o user/build/hello.o user/user.ld
 
 $(USER_SH): user/build/crt0.o user/build/sh.o user/user.ld
 	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/sh.o -o $@
+
+user/build/truntest.o: user/truntest.c | user/build
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_TRUNTEST): user/build/crt0.o user/build/truntest.o user/user.ld
+	$(LD) $(USER_LDFLAGS) user/build/crt0.o user/build/truntest.o -o $@
 
 # --- Disk image ---
 

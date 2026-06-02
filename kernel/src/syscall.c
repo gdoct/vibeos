@@ -51,7 +51,9 @@ extern "C" void syscall_entry(void);
 #define EFER_SCE    (1u << 0)
 
 /* errno values returned to userspace (negated). */
+#define EPERM_      1
 #define ENOENT_     2
+#define ENOTEMPTY_  39
 #define EBADF_      9
 #define ENOMEM_     12
 #define ENOTDIR_    20
@@ -86,6 +88,7 @@ static inline vmspace_t *cur_vm(void) { return task_current()->vm; }
 #define AT_FDCWD       (-100)
 #define AT_EMPTY_PATH  0x1000
 #define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR   0x200
 
 /* lseek whence. */
 #define SEEK_SET 0
@@ -998,6 +1001,73 @@ static int64_t sys_readlink(const char *upath, char *ubuf, uint64_t bufsz) {
     return (int64_t)n;
 }
 
+/* unlink(path): remove a name for a regular file/symlink (never a directory). */
+static int64_t sys_unlink(const char *upath) {
+    char path[256];
+    resolve_path(path, sizeof path, upath);
+    if (synth_classify(path, nullptr) != SYNTH_NONE) return -EACCES_;   /* /dev,/proc read-only */
+    int ino = fs_lresolve(path);                     /* operate on the link itself */
+    if (ino < 0) return fs_to_errno(ino);
+    fs_stat_t s;
+    if (fs_istat((uint32_t)ino, &s) == FS_OK && s.type == FT_DIR) return -EISDIR_;
+    int r = fs_unlink(path);
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
+/* rmdir(path): remove an empty directory. */
+static int64_t sys_rmdir(const char *upath) {
+    char path[256];
+    resolve_path(path, sizeof path, upath);
+    if (synth_classify(path, nullptr) != SYNTH_NONE) return -EACCES_;
+    int ino = fs_lresolve(path);
+    if (ino < 0) return fs_to_errno(ino);
+    fs_stat_t s;
+    if (fs_istat((uint32_t)ino, &s) != FS_OK) return -ENOENT_;
+    if (s.type != FT_DIR) return -ENOTDIR_;
+    int r = fs_unlink(path);                          /* enforces emptiness -> ENOTEMPTY */
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
+/* unlinkat(dirfd, path, flags): unlink, or rmdir when AT_REMOVEDIR is set. */
+static int64_t sys_unlinkat(int dirfd, const char *upath, int flags) {
+    (void)dirfd;                                      /* AT_FDCWD / cwd-relative only */
+    return (flags & AT_REMOVEDIR) ? sys_rmdir(upath) : sys_unlink(upath);
+}
+
+/* rename(old, new) / renameat: move a file or directory. */
+static int64_t sys_rename(const char *uold, const char *unew) {
+    char oldp[256], newp[256];
+    resolve_path(oldp, sizeof oldp, uold);
+    resolve_path(newp, sizeof newp, unew);
+    if (synth_classify(oldp, nullptr) != SYNTH_NONE ||
+        synth_classify(newp, nullptr) != SYNTH_NONE) return -EACCES_;
+    int r = fs_rename(oldp, newp);
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
+/* ftruncate(fd, len): resize an open, writable regular file. */
+static int64_t sys_ftruncate(int fd, int64_t len) {
+    if (len < 0) return -EINVAL_;
+    file_t *f = fd_get(fd);
+    if (!f) return (fd >= 0 && fd <= 2) ? -EINVAL_ : -EBADF_;
+    if (f->kind != FD_FILE) return -EINVAL_;
+    if ((f->flags & 3) == 0) return -EINVAL_;         /* O_RDONLY: not writable */
+    int r = fs_truncate_to(f->ino, (uint64_t)len);
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
+/* truncate(path, len): resize a regular file by path. */
+static int64_t sys_truncate(const char *upath, int64_t len) {
+    if (len < 0) return -EINVAL_;
+    char path[256];
+    resolve_path(path, sizeof path, upath);
+    if (synth_classify(path, nullptr) != SYNTH_NONE) return -EACCES_;
+    int ino = fs_resolve(path);
+    if (ino < 0) return fs_to_errno(ino);
+    int r = fs_truncate_to((uint32_t)ino, (uint64_t)len);
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
 static int64_t sys_newfstatat(int dirfd, const char *upath,
                               struct linux_stat *st, int flag) {
     struct linux_stat ks;
@@ -1487,6 +1557,13 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 32:  return (uint64_t)sys_dup((int)f->rdi);           /* dup */
     case 33:  return (uint64_t)sys_dup2((int)f->rdi, (int)f->rsi);  /* dup2 */
     case 39:  return (uint64_t)task_tgid(task_current());      /* getpid (== tgid) */
+    case 102: return 0;                                        /* getuid  (single-user root) */
+    case 104: return 0;                                        /* getgid */
+    case 107: return 0;                                        /* geteuid */
+    case 108: return 0;                                        /* getegid */
+    case 105:                                                  /* setuid */
+    case 106: return f->rdi == 0 ? 0                           /* setgid: only root (0) is real */
+                                 : (uint64_t)(int64_t)-EPERM_;
     case 56:  return (uint64_t)sys_clone(f);                   /* clone */
     case 202: return (uint64_t)sys_futex(f->rdi, (int)f->rsi, (int)f->rdx);  /* futex */
     case 7:   return (uint64_t)sys_poll(f->rdi, (uint32_t)f->rsi, (int)f->rdx);  /* poll */
@@ -1529,6 +1606,18 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 88:  return (uint64_t)sys_symlink((const char *)f->rdi, (const char *)f->rsi); /* symlink */
     case 89:  return (uint64_t)sys_readlink((const char *)f->rdi, (char *)f->rsi, f->rdx); /* readlink */
     case 267: return (uint64_t)sys_readlink((const char *)f->rsi, (char *)f->rdx, f->r10); /* readlinkat */
+    case 87:  return (uint64_t)sys_unlink((const char *)f->rdi);        /* unlink */
+    case 263: return (uint64_t)sys_unlinkat((int)f->rdi, (const char *)f->rsi,
+                                            (int)f->rdx);              /* unlinkat */
+    case 84:  return (uint64_t)sys_rmdir((const char *)f->rdi);         /* rmdir */
+    case 82:  return (uint64_t)sys_rename((const char *)f->rdi,
+                                          (const char *)f->rsi);       /* rename */
+    case 264: return (uint64_t)sys_rename((const char *)f->rsi,
+                                          (const char *)f->r10);       /* renameat(olddir,old,newdir,new) */
+    case 316: return f->r8 ? (uint64_t)(int64_t)-EINVAL_                /* renameat2: no flags supported */
+                           : (uint64_t)sys_rename((const char *)f->rsi, (const char *)f->r10);
+    case 76:  return (uint64_t)sys_truncate((const char *)f->rdi, (int64_t)f->rsi);  /* truncate */
+    case 77:  return (uint64_t)sys_ftruncate((int)f->rdi, (int64_t)f->rsi);          /* ftruncate */
     case 217: return (uint64_t)sys_getdents64((int)f->rdi, (void *)f->rsi, f->rdx); /* getdents64 */
     case 257: return (uint64_t)sys_openat((int)f->rdi, (const char *)f->rsi,
                                           (int)f->rdx, (int)f->r10);   /* openat */

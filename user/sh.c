@@ -61,6 +61,26 @@ static long sys_readlink(const char *path, char *buf, unsigned long n) {
                      : "a"(89L), "D"(path), "S"(buf), "d"(n) : "rcx", "r11", "memory");
     return r;
 }
+static long sys_mkdir(const char *path, long mode) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(83L), "D"(path), "S"(mode) : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_unlink(const char *path) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(87L), "D"(path) : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_rmdir(const char *path) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(84L), "D"(path) : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_rename(const char *old, const char *neww) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(82L), "D"(old), "S"(neww) : "rcx", "r11", "memory");
+    return r;
+}
 static long sys_fork(void) {
     long r;
     __asm__ volatile("syscall" : "=a"(r) : "a"(57L) : "rcx", "r11", "memory");
@@ -128,7 +148,8 @@ int main(void) {
 
         if (streq(argv[0], "exit")) { puts1("bye\n"); sys_exit(0); }
         if (streq(argv[0], "help")) {
-            puts1("builtins: help, exit, cd, pwd, echo, cat, ls, ln -s, readlink\n"
+            puts1("builtins: help, exit, cd, pwd, echo, cat, ls, ln -s, readlink,\n"
+                  "          mkdir, touch, rm, rmdir, mv\n"
                   "run a program by name (hello) or path (/bin/hello)\n");
             continue;
         }
@@ -154,6 +175,46 @@ int main(void) {
                 if (m >= 0) { tgt[m] = 0; puts1(tgt); puts1("\n"); }
                 else puts1("readlink: not a symlink\n");
             }
+            continue;
+        }
+        if (streq(argv[0], "id")) {
+            long uid, gid;
+            __asm__ volatile("syscall" : "=a"(uid) : "a"(102L) : "rcx", "r11", "memory");
+            __asm__ volatile("syscall" : "=a"(gid) : "a"(104L) : "rcx", "r11", "memory");
+            puts1("uid="); put_uint((unsigned long)uid);
+            puts1(" gid="); put_uint((unsigned long)gid); puts1("\n");
+            continue;
+        }
+        if (streq(argv[0], "mkdir")) {
+            if (argc < 2) { puts1("usage: mkdir dir...\n"); continue; }
+            for (int i = 1; i < argc; i++)
+                if (sys_mkdir(argv[i], 0755) < 0) { puts1("mkdir: "); puts1(argv[i]); puts1(": failed\n"); }
+            continue;
+        }
+        if (streq(argv[0], "touch")) {
+            if (argc < 2) { puts1("usage: touch file...\n"); continue; }
+            for (int i = 1; i < argc; i++) {
+                long fd = sys_openat(-100, argv[i], 0x41 /*O_WRONLY|O_CREAT*/, 0644);
+                if (fd < 0) { puts1("touch: "); puts1(argv[i]); puts1(": failed\n"); }
+                else sys_close((int)fd);
+            }
+            continue;
+        }
+        if (streq(argv[0], "rm")) {
+            if (argc < 2) { puts1("usage: rm file...\n"); continue; }
+            for (int i = 1; i < argc; i++)
+                if (sys_unlink(argv[i]) < 0) { puts1("rm: "); puts1(argv[i]); puts1(": failed\n"); }
+            continue;
+        }
+        if (streq(argv[0], "rmdir")) {
+            if (argc < 2) { puts1("usage: rmdir dir...\n"); continue; }
+            for (int i = 1; i < argc; i++)
+                if (sys_rmdir(argv[i]) < 0) { puts1("rmdir: "); puts1(argv[i]); puts1(": failed\n"); }
+            continue;
+        }
+        if (streq(argv[0], "mv")) {
+            if (argc != 3) { puts1("usage: mv old new\n"); continue; }
+            if (sys_rename(argv[1], argv[2]) < 0) puts1("mv: failed\n");
             continue;
         }
         if (streq(argv[0], "echo")) {
