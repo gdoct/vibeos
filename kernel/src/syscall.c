@@ -1355,12 +1355,13 @@ static int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
     }
 }
 
-#define WNOHANG 1
+/* options: WNOHANG(1) | WUNTRACED(2) | WCONTINUED(8) — passed through to task_wait,
+   which reports WIFSTOPPED/WIFCONTINUED job-control events as well as exits. */
 static int64_t sys_wait4(int pid, int *ustatus, int options, void *rusage) {
     (void)rusage;
     int code = 0;
     /* pid > 0: that child; pid <= 0: any child (process-group wait unsupported). */
-    int got = task_wait(&code, options & WNOHANG, pid > 0 ? pid : 0);
+    int got = task_wait(&code, options, pid > 0 ? pid : 0);
     if (got <= 0) return got;                    /* -ECHILD, or 0 = none ready (WNOHANG) */
     if (ustatus &&
         copy_to_user(cur_vm(), (uint64_t)(uintptr_t)ustatus, &code, sizeof code) < 0)

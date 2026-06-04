@@ -310,9 +310,30 @@ int tty_read(char *buf, uint32_t n) {
 
 /* ---- terminal ioctls ---- */
 
+/* POSIX: a process in a background process group that mutates the terminal
+   (tcsetpgrp / tcsetattr / window size) is sent SIGTTOU, which stops its group —
+   unless SIGTTOU is blocked or ignored (as a shell does during its own handoff),
+   in which case the operation proceeds. Returns 1 if the caller should stop. */
+static int bg_ttou(task_t *t) {
+    if (!g_fg_pgrp || !t) return 0;               /* no job control configured */
+    if (task_pgid(t) == g_fg_pgrp) return 0;      /* foreground: allowed */
+    if (t->sig.blocked & SIGBIT(SIGTTOU)) return 0;
+    if (t->sig.act[SIGTTOU - 1].handler == SIG_IGN) return 0;
+    return 1;
+}
+
 int tty_ioctl(unsigned cmd, uint64_t arg) {
     task_t *t = task_current();
     vmspace_t *vm = t ? t->vm : nullptr;
+
+    /* Background terminal-control ops raise SIGTTOU and stop the caller's group. */
+    switch (cmd) {
+    case TCSETS: case TCSETSW: case TCSETSF:
+    case TIOCSPGRP: case TIOCSWINSZ:
+        if (bg_ttou(t)) { tasks_signal_pgrp(task_pgid(t), SIGTTOU); return -EINTR; }
+        break;
+    default: break;
+    }
 
     switch (cmd) {
     case TCGETS:

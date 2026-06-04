@@ -72,6 +72,8 @@ typedef struct task {
     int           exit_code;
     int           term_signal;  /* nonzero if killed by a signal (wait4 status) */
     int           stopped;      /* job-control stop (SIGSTOP/SIGTSTP) in effect */
+    int           stop_sig;     /* signal that caused the current stop (WSTOPSIG) */
+    int           stop_change;  /* unreported job-control event: 1=stopped, 2=continued */
     wait_queue_t  child_wq;
 
     /* Signal disposition table, masks, pending set, altstack (ROADMAP §3). */
@@ -186,8 +188,8 @@ void    task_exit_signal(int sig);
 task_t *task_by_id(int id);          /* live task with this pid, or NULL */
 int     task_running_cpu(task_t *t); /* CPU index if RUNNING, else -1 */
 void    task_signal_wake(task_t *t); /* nudge a blocked task so it can deliver */
-void    task_stop_current(void);     /* job-control stop until task_cont */
-void    task_cont(task_t *t);        /* undo a stop */
+void    task_stop_current(int sig);  /* job-control stop (by `sig`) until task_cont */
+void    task_cont(task_t *t);        /* undo a stop (reports WCONTINUED to the parent) */
 
 /* Reap one ZOMBIE child of the current task, freeing its address space and
    slot and returning its pid (with *status set to the exit code). Blocks if

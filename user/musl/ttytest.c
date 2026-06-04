@@ -11,6 +11,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -59,8 +60,87 @@ static int run_sigint(void) {
     return 0;
 }
 
+/* Idle child: a nanosleep loop, so a delivered signal lands on a syscall
+   boundary (and a job-control stop parks it cleanly). Never returns. */
+static void idle_child(void) {
+    for (;;) {
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* `ttytest stop`: the full ^Z/stop/cont cycle the kernel must support for a
+   shell's job control — a stopped child is reported to waitpid(WUNTRACED) as
+   WIFSTOPPED, SIGCONT resumes it and is reported as WIFCONTINUED. Driven by
+   kill() (deterministic; no input-timing dependence). */
+static int run_stop(void) {
+    printf("ttytest: stop/cont cycle\n");
+    pid_t pid = fork();
+    if (pid == 0) { idle_child(); _exit(0); }
+    if (pid < 0) { check("fork", 0); goto done; }
+
+    int st;
+    if (kill(pid, SIGTSTP) != 0) check("kill(SIGTSTP)", 0);
+    pid_t w = waitpid(pid, &st, WUNTRACED);
+    check("waitpid(WUNTRACED) returns child", w == pid);
+    check("WIFSTOPPED", WIFSTOPPED(st));
+    check("WSTOPSIG == SIGTSTP", WIFSTOPPED(st) && WSTOPSIG(st) == SIGTSTP);
+
+    if (kill(pid, SIGCONT) != 0) check("kill(SIGCONT)", 0);
+    w = waitpid(pid, &st, WCONTINUED);
+    check("waitpid(WCONTINUED) returns child", w == pid);
+    check("WIFCONTINUED", WIFCONTINUED(st));
+
+    kill(pid, SIGKILL);
+    w = waitpid(pid, &st, 0);
+    check("waitpid reaps killed child", w == pid && WIFSIGNALED(st));
+done:
+    printf("ttytest: %d passed, %d failed\n", passes, fails);
+    return fails ? 1 : 0;
+}
+
+/* `ttytest ttou`: a background process group mutating the terminal (tcsetpgrp)
+   must be sent SIGTTOU (which stops it). The parent becomes the foreground group,
+   forks a child into its own (background) group, and confirms the child stops on
+   SIGTTOU rather than completing the mutation. */
+static int run_ttou(void) {
+    printf("ttytest: background SIGTTOU\n");
+    pid_t fg0 = tcgetpgrp(0);
+    /* A shell blocks/ignores SIGTTOU around its own terminal handoff; otherwise
+       moving itself out of the foreground group and then calling tcsetpgrp would
+       stop the shell. Mirror that. */
+    signal(SIGTTOU, SIG_IGN);
+    setpgid(0, 0);                       /* parent: own group */
+    tcsetpgrp(0, getpid());              /* parent: foreground (SIGTTOU ignored) */
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        signal(SIGTTOU, SIG_DFL);        /* child keeps default disposition -> stops */
+        setpgid(0, 0);                   /* child: own (background) group */
+        tcsetpgrp(0, getpid());          /* background mutation -> SIGTTOU -> stop */
+        _exit(42);                       /* only reached if SIGTTOU did NOT fire */
+    }
+    if (pid < 0) { check("fork", 0); goto restore; }
+
+    int st;
+    pid_t w = waitpid(pid, &st, WUNTRACED);
+    check("child stopped, not exited", w == pid && WIFSTOPPED(st));
+    check("WSTOPSIG == SIGTTOU", WIFSTOPPED(st) && WSTOPSIG(st) == SIGTTOU);
+
+    kill(pid, SIGCONT);
+    kill(pid, SIGKILL);
+    waitpid(pid, &st, 0);
+restore:
+    tcsetpgrp(0, fg0 > 0 ? fg0 : getpgrp());
+    setpgid(0, fg0 > 0 ? fg0 : 0);
+    printf("ttytest: %d passed, %d failed\n", passes, fails);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "sigint") == 0) return run_sigint();
+    if (argc > 1 && strcmp(argv[1], "stop") == 0)   return run_stop();
+    if (argc > 1 && strcmp(argv[1], "ttou") == 0)   return run_ttou();
 
     printf("ttytest: interactive-I/O ABI\n");
 
