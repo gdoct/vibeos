@@ -7,6 +7,7 @@
 #include "irq.h"
 #include "timer.h"
 #include "rtc.h"
+#include "tty.h"
 #include "task.h"
 #include "kmalloc.h"
 #include "paging.h"
@@ -199,6 +200,7 @@ extern "C" void kmain(BootInfo *bi) {
     bi = (BootInfo *)phys_to_virt((uint64_t)(uintptr_t)bi);
 
     serial_init();
+    tty_init();        /* default termios + window size for the console line discipline */
     kprintf("\n[kernel] VibeOS booting (BootInfo @ %p)\n", bi);
 
     gdt_init();

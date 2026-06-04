@@ -16,11 +16,6 @@
  * cross-core running target gets delivered by its own next timer tick).
  */
 
-/* Additional stop signals (numbers not in signal.h's named set). */
-#define SIGTSTP 20
-#define SIGTTIN 21
-#define SIGTTOU 22
-
 /* ---- canonical register snapshot (matches sigcontext greg order) ---- */
 typedef struct {
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
@@ -390,6 +385,18 @@ int64_t sys_sigaltstack(const void *uss, void *uoldss) {
 
 static int64_t do_kill(int pid, int sig) {
     if (sig < 0 || sig > SIG_NSIG) return -EINVAL_;
+
+    /* Process-group / broadcast targets (ROADMAP §"Interactive I/O"):
+         pid  > 0 : that process
+         pid == 0 : the caller's process group
+         pid <  -1: the process group -pid                                       */
+    if (pid <= 0) {
+        int pgrp = (pid == 0) ? task_pgid(task_current()) : -pid;
+        if (sig == 0) return 0;                    /* existence check (best effort) */
+        tasks_signal_pgrp(pgrp, sig);
+        return 0;
+    }
+
     task_t *target = task_by_id(pid);
     if (!target || !target->vm) return -ESRCH_;
     if (sig == 0) return 0;                        /* existence check */

@@ -183,6 +183,7 @@ USER_MPIPE  = user/build/pipetest.elf
 USER_MFAULT = user/build/faulttest.elf
 USER_MCPU   = user/build/cputest.elf
 USER_MSIG   = user/build/sigtest.elf
+USER_MTTY   = user/build/ttytest.elf
 USER_MDYN   = user/build/dynhello.elf
 USER_MNET   = user/build/nettest.elf
 USER_MWGET  = user/build/wget.elf
@@ -282,7 +283,7 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel/linker.ld
 # tool (build.sh / diskutil-cli) — the kernel loads /bin/init from disk at boot,
 # so nothing is embedded in the kernel image.
 
-user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_TRUNTEST) $(USER_MULTEST) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK) $(USER_GTERM) $(USER_GUIHELLO)
+user: $(USER_INIT) $(USER_HELLO) $(USER_SH) $(USER_TRUNTEST) $(USER_MULTEST) $(USER_MHELLO) $(USER_MFTEST) $(USER_MPIPE) $(USER_MFAULT) $(USER_MCPU) $(USER_MSIG) $(USER_MTTY) $(USER_MDYN) $(USER_MNET) $(USER_MWGET) $(USER_MPKG) $(USER_VHELLO) $(USER_ABITEST) $(USER_THREAD) $(USER_SYSCONF) $(USER_SINIT) $(USER_HEARTBEAT) $(USER_GUIPROBE) $(USER_GUIWM) $(USER_GMANDEL) $(USER_GCLOCK) $(USER_GTERM) $(USER_GUIHELLO)
 
 # Static musl builds (host cross-compile). Skipped with a note if musl-gcc is
 # absent, so the rest of the build still works.
@@ -324,6 +325,13 @@ endif
 $(USER_MSIG): user/musl/sigtest.c | user/build
 ifeq ($(MUSL_CC),)
 	@echo "warning: musl-gcc not found; skipping $(USER_MSIG)"
+else
+	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
+endif
+
+$(USER_MTTY): user/musl/ttytest.c | user/build
+ifeq ($(MUSL_CC),)
+	@echo "warning: musl-gcc not found; skipping $(USER_MTTY)"
 else
 	$(MUSL_CC) -static -no-pie -O2 -o $@ $<
 endif

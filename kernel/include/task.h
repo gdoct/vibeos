@@ -93,6 +93,13 @@ typedef struct task {
     /* Current working directory (ROADMAP §4): an absolute, normalized path that
        relative path resolution is taken from. Inherited across fork + execve. */
     char          cwd[256];
+
+    /* Job control (ROADMAP §"Interactive I/O"). A process group / session id (0
+       == unset, falling back to the pid via task_pgid/task_sid). Inherited across
+       fork; setpgid/setsid mutate them. The terminal's foreground process group
+       (tcsetpgrp) and tty signal routing are keyed off pgid. */
+    int           pgid;
+    int           sid;
 } task_t;
 
 /* A refcounted descriptor table so threads (CLONE_FILES) can share one. `ref` is
@@ -136,6 +143,18 @@ task_t *task_clone(const char *name, struct vmspace *vm,
 
 /* thread-group id of `t` (== getpid for a thread); falls back to its own id. */
 int     task_tgid(task_t *t);
+
+/* Job control (ROADMAP §"Interactive I/O"). pgid/sid fall back to the pid when
+   unset. The set* helpers back the setpgid/setsid/getpgid/getsid syscalls;
+   tasks_signal_pgrp delivers a signal to every member of a process group (used by
+   the tty for INTR/QUIT/SUSP and by kill(-pgrp)). */
+int     task_pgid(task_t *t);
+int     task_sid(task_t *t);
+int     task_setpgid(int pid, int pgid);   /* 0 / -errno */
+int     task_getpgid(int pid);             /* pgid / -errno */
+int     task_setsid(void);                 /* new sid / -errno */
+int     task_getsid(int pid);              /* sid / -errno */
+void    tasks_signal_pgrp(int pgrp, int sig);
 
 /* Attach a user address space to the current task and switch CR3 to it. */
 void    task_set_vmspace(struct vmspace *vm);

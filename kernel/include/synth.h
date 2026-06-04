@@ -42,6 +42,10 @@ int  synth_open(const char *path, file_t *f);
 int  synth_read(file_t *f, void *buf, uint32_t n);
 int  synth_write(file_t *f, const void *buf, uint32_t n);
 
+/* ioctl on a synthetic device: /dev/tty forwards to the terminal discipline,
+   everything else is -ENOTTY. `arg` is a user pointer. */
+int  synth_ioctl(file_t *f, unsigned cmd, uint64_t arg);
+
 /* Enumerate directory entry #index (0-based) of the synthetic dir `f`.
    Returns 1 and fills name/type (1=file,2=dir), 0 at end. */
 int  synth_readdir(file_t *f, int index, char *name, uint32_t namesz, int *type);
