@@ -1,0 +1,11 @@
+examplepkg 1.0.0
+================
+
+A sample VibeOS package demonstrating the v1 `pkg` archive format.
+Install it with:
+
+    pkg extract /dist/packages/examplepkg-1.0.0.pkg /
+
+List its contents with:
+
+    pkg list /dist/packages/examplepkg-1.0.0.pkg

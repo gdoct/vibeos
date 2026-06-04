@@ -1,0 +1,12 @@
+# Sample VibeOS package (docs/pkgman.md, v1).
+#
+# `pkg create packages/examplepkg` archives package_info.yml plus the staged
+# tree under stage/ into examplepkg-1.0.0.pkg. There is no build command, so
+# `pkg create` archives the pre-staged files directly.
+name: examplepkg
+version: 1.0.0
+stage:
+  from: stage
+  include:
+    - bin/examplepkg
+    - share/doc/examplepkg/README

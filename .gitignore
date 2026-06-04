@@ -46,6 +46,11 @@ dist/
 obj/
 # Generated VibeOS cross-toolchain sysroot (rebuild with: make sysroot)
 toolchain/sysroot/
+
+# Package source trees (docs/pkgman.md) keep their own staged bin/ dirs, which
+# the broad `bin/` rule above would otherwise ignore.
+!packages/**/bin/
+!packages/**/bin/**
 toolchain/vibeos.specs
 
 # host build-time font tool (binary)

@@ -145,9 +145,12 @@ Detail lives in the code and git history; this file is the map, not the manual.
   `fb0`/`input` for the userspace GUI) and a
   tiny **`/proc`** (a dir per live task + `self`, each with a `stat` file)
   ([synth.c](kernel/src/synth.c)); a real **init** (PID 1) that forks + respawns
-  the shell; and a **package tool** ([user/musl/pkg.c](user/musl/pkg.c)) that
-  extracts/lists POSIX ustar tarballs (files, dirs, symlinks). Shell builtins
-  `cd`/`pwd`/`echo`/`cat`/`ls`/`ln -s`/`readlink` exercise it over serial.
+  the shell; and a **package tool** ([user/musl/pkg.c](user/musl/pkg.c), v1 per
+  [docs/pkgman.md](docs/pkgman.md)) that lists/extracts/creates `.pkg` POSIX
+  ustar archives (files, dirs, symlinks) with `..`/absolute-path sanitization and
+  a `package_info.yml` manifest. Prebuilt sample packages ship at
+  `/dist/packages`. Shell builtins `cd`/`pwd`/`echo`/`cat`/`ls`/`ln -s`/`readlink`
+  exercise it over serial.
 - **Randomness** — a **ChaCha20 DRBG** ([csprng.c](kernel/src/csprng.c)) seeded
   from RDRAND, RDTSC timing jitter, and **virtio-rng** hardware entropy
   ([virtio_rng.c](kernel/src/drivers/virtio_rng.c)), with per-request rekey for
@@ -302,18 +305,17 @@ milestone is mostly about closing specific syscall/ABI gaps, not new subsystems.
   Still missing: `epoll`. (Readiness is coarse poll-with-sleep, 50 ms quantum —
   not event-driven; fine until something needs sub-tick latency.)
 
-1. **Run `bash`** *(closest — the prerequisites are now in place).*
-   Scripted (non-interactive) bash needs little beyond what we have plus
-   `getuid`/`geteuid` and `unlink` — *done*. Interactive bash additionally needs
+Final prerequisite: a **package manager**. This is detailed in docs/pkgman.md.
+
+1. **Run `mksh`** *(closest — the prerequisites should be in place).*
+   Scripted (non-interactive) mksh needs little beyond what we have plus
+   `getuid`/`geteuid` and `unlink` — *done*. Interactive mksh additionally needs
    termios `ioctl` (line editing) and `setpgid`/`tcsetpgrp` (job control) — also
    *done* over the serial console (see "Interactive I/O" above). Next step is to
-   cross-build bash itself and shake out the remaining ABI gaps it hits.
-2. **Run a Rust program** *(near — reuse the `x86_64-unknown-linux-musl` target).*
-   A statically-linked Rust binary already matches our ABI; `std` rides on musl +
-   futex/threads, which we have. No custom Rust target needed. A hello-world is
-   roughly bash-level effort (time resolution + a few std-init syscalls).
-   *Out of scope here: running `rustc`/`cargo` on-device — that's LLVM, a separate
-   long-horizon milestone.*
+   cross-build mksh itself and shake out the remaining ABI gaps it hits.
+2. **Run Doom** — a fun first graphics target, but it needs `mmap`/`munmap` (for the
+   framebuffer), `clock_nanosleep` (for timing), and `ppoll` (for input) — all
+   *done.* The next step is to port doomgeneric (https://github.com/ozkl/doomgeneric) to the VibeOS toolchain and see what else shakes out.
 3. **Run a C compiler** *(moderate for tcc, large for gcc).* **TinyCC** is the
    realistic target: single binary, tiny syscall footprint; main blocker is
    `unlink`/`rename` for temp files. **gcc** is a multi-process pipeline (cc1/as/ld)

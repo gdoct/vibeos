@@ -1,0 +1,3 @@
+#!/bin/sh
+# examplepkg — installed by `pkg extract examplepkg-1.0.0.pkg /`
+echo "hello from examplepkg 1.0.0"
