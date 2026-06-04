@@ -7,8 +7,9 @@
 # mksh-<version>.pkg.
 #
 # The build is driven by src/Makefile (the build command is `make`, run in src/):
-# it extracts the vendored mksh source tarball, cross-compiles it static with the
-# x86_64-linux-musl toolchain (musl-gcc), strips it, and installs the binary to
+# it fetches the pinned mksh source tarball (cached locally; not committed, per
+# the repo's *.tgz ignore), cross-compiles it static with the x86_64-linux-musl
+# toolchain (musl-gcc), strips it, and installs the binary to
 # src/build/out/bin/mksh — which stage.include then archives as bin/mksh.
 #
 # build.sh extracts that binary, installs it as /bin/mksh, and symlinks

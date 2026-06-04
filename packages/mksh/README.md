@@ -12,14 +12,15 @@ mksh/
     README.md
     src/
         Makefile          # the build entrypoint (fetch -> extract -> compile -> stage)
-        mksh-R59c.tgz     # vendored upstream distfile (canonical MirBSD tarball)
-        .gitignore        # ignores the extracted tree + build/ outputs
+        .gitignore        # ignores the cached distfile, extracted tree, build/ outputs
+        mksh-R59c.tgz     # cached distfile (fetched on demand; NOT committed)
 ```
 
-The upstream source is **vendored** as `src/mksh-R59c.tgz` so the build is
-reproducible and works offline. The Makefile pins the source URL and SHA-256 and
-re-fetches the tarball only if it is missing, so deleting it falls back to a
-network fetch.
+The upstream tarball is **fetched on demand** by the Makefile, which pins the
+source URL(s) and SHA-256 and caches the download next to itself. It is not
+committed to git — the repo's top-level `.gitignore` excludes `*.tgz`. A build
+host therefore needs network access the first time (the canonical MirBSD mirror,
+https with an http fallback); subsequent builds reuse the cached tarball.
 
 ## How it builds
 

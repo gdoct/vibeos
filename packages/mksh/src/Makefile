@@ -12,9 +12,14 @@
 
 VERSION   := R59c
 DIST      := mksh-$(VERSION).tgz
-# Pinned upstream tarball (canonical MirBSD distribution). The tarball is
-# vendored next to this Makefile; the fetch rule only runs if it is missing.
-DIST_URL  := http://www.mirbsd.org/MirOS/dist/mir/mksh/mksh-R59c.tgz
+# Pinned upstream tarball (canonical MirBSD distribution). It is fetched on
+# demand and cached next to this Makefile (the repo's .gitignore excludes *.tgz,
+# so the distfile is not committed). The fetch only runs if the file is missing.
+# Two mirrors of the *same* bytes (so the pinned SHA-256 stays valid): the https
+# endpoint first, then http for hosts whose TLS stack can't negotiate with the
+# upstream server.
+DIST_URLS := https://www.mirbsd.org/MirOS/dist/mir/mksh/mksh-R59c.tgz \
+             http://www.mirbsd.org/MirOS/dist/mir/mksh/mksh-R59c.tgz
 DIST_SHA  := 77ae1665a337f1c48c61d6b961db3e52119b38e58884d1c89684af31f87bc506
 
 SRCDIR    := mksh
@@ -34,11 +39,14 @@ LDFLAGS   ?= -static
 
 all: $(OUTBIN)
 
-# Fetch the distfile only if it is not already vendored here.
+# Fetch the distfile only if it is not already cached here. Try each mirror in
+# turn; succeed on the first that works.
 $(DIST):
-	@echo "mksh: fetching $(DIST) from $(DIST_URL)"
-	curl -fsSL -o $@.tmp "$(DIST_URL)"
-	@mv $@.tmp $@
+	@for url in $(DIST_URLS); do \
+	  echo "mksh: fetching $(DIST) from $$url"; \
+	  if curl -fsSL -o $@.tmp "$$url"; then mv $@.tmp $@; break; fi; \
+	done
+	@test -f $@ || { echo "mksh: could not fetch $(DIST) from any mirror"; exit 1; }
 
 # Extract, verifying the pinned checksum first.
 $(SRCDIR)/Build.sh: $(DIST)
@@ -58,9 +66,10 @@ $(OUTBIN): $(SRCDIR)/Build.sh
 	@echo "mksh: staged $(OUTBIN)"
 
 clean:
-	rm -rf $(SRCDIR) $(OUTDIR)
+	rm -rf $(SRCDIR) build
 
-# Remove build products but keep the vendored distfile.
+# Also remove the cached distfile.
 distclean: clean
+	rm -f $(DIST)
 
 .PHONY: all clean distclean
