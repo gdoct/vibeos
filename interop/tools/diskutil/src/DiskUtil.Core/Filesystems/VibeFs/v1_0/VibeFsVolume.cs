@@ -163,6 +163,7 @@ public sealed class VibeFsVolume : IDisposable
         BinaryPrimitives.WriteUInt16LittleEndian(rootInodeSpan.Slice(2, 2), 2);
         BinaryPrimitives.WriteUInt64LittleEndian(rootInodeSpan.Slice(4, 8), FsBlockSize);
         BinaryPrimitives.WriteUInt32LittleEndian(rootInodeSpan.Slice(20, 4), dataStartBlock);
+        BinaryPrimitives.WriteUInt32LittleEndian(rootInodeSpan.Slice(84, 4), 0x1ED /* 0755 */);
         WriteBlockStatic(stream, inodeTableBlock, rootInodeBlock);
 
         var rootDirectoryBlock = new byte[FsBlockSize];
@@ -272,7 +273,7 @@ public sealed class VibeFsVolume : IDisposable
         return output;
     }
 
-    public void WriteFile(string path, byte[] content)
+    public void WriteFile(string path, byte[] content, uint mode = 0x1A4 /* 0644 */)
     {
         if (content is null)
         {
@@ -307,9 +308,11 @@ public sealed class VibeFsVolume : IDisposable
             }
 
             inodeNumber = AllocateInode();
-            inode = Inode.Create((ushort)VibeFsNodeType.File, 1);
+            inode = Inode.Create((ushort)VibeFsNodeType.File, 1, mode);
             AddDirectoryEntry(parent.ParentInodeNumber, parent.ParentInode, parent.Name, inodeNumber, (byte)VibeFsNodeType.File);
         }
+
+        inode.Mode = mode;   /* (re)apply on overwrite too, so re-import updates the bits */
 
         var blockBuffer = new byte[FsBlockSize];
         var contentOffset = 0;
@@ -349,7 +352,7 @@ public sealed class VibeFsVolume : IDisposable
 
         var parent = ResolveParentPath(normalizedPath);
         var inodeNumber = AllocateInode();
-        var inode = Inode.Create((ushort)VibeFsNodeType.Directory, 2);
+        var inode = Inode.Create((ushort)VibeFsNodeType.Directory, 2, 0x1ED /* 0755 */);
 
         var firstBlock = AllocateDataBlock();
         inode.Direct[0] = firstBlock;
@@ -408,7 +411,7 @@ public sealed class VibeFsVolume : IDisposable
         }
 
         var inodeNumber = AllocateInode();
-        var inode = Inode.Create((ushort)VibeFsNodeType.Symlink, 1);
+        var inode = Inode.Create((ushort)VibeFsNodeType.Symlink, 1, 0x1FF /* 0777 */);
 
         var blockBuffer = new byte[FsBlockSize];
         Buffer.BlockCopy(targetBytes, 0, blockBuffer, 0, targetBytes.Length);
@@ -450,7 +453,7 @@ public sealed class VibeFsVolume : IDisposable
         }
 
         FreeInodeBlocks(inode);
-        WriteInode(entry.Inode, Inode.Create(0, 0));
+        WriteInode(entry.Inode, Inode.Create(0, 0, 0));
         ClearBit(_inodeBitmap, (int)entry.Inode);
 
         FlushBitmaps();
@@ -669,7 +672,8 @@ public sealed class VibeFsVolume : IDisposable
             Direct = direct,
             Indirect = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(72, 4)),
             Indirect2 = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(76, 4)),
-            Indirect3 = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(80, 4))
+            Indirect3 = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(80, 4)),
+            Mode = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(84, 4))
         };
     }
 
@@ -698,6 +702,7 @@ public sealed class VibeFsVolume : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(span.Slice(72, 4), inode.Indirect);
         BinaryPrimitives.WriteUInt32LittleEndian(span.Slice(76, 4), inode.Indirect2);
         BinaryPrimitives.WriteUInt32LittleEndian(span.Slice(80, 4), inode.Indirect3);
+        BinaryPrimitives.WriteUInt32LittleEndian(span.Slice(84, 4), inode.Mode);
 
         WriteBlock(inodeTableBlock, block);
     }
@@ -1296,8 +1301,9 @@ public sealed class VibeFsVolume : IDisposable
         public uint Indirect { get; set; }
         public uint Indirect2 { get; set; }
         public uint Indirect3 { get; set; }
+        public uint Mode { get; set; }   /* permission bits (low 12) */
 
-        public static Inode Create(ushort type, ushort links)
+        public static Inode Create(ushort type, ushort links, uint mode)
         {
             return new Inode
             {
@@ -1309,7 +1315,8 @@ public sealed class VibeFsVolume : IDisposable
                 Direct = new uint[Ndirect],
                 Indirect = 0,
                 Indirect2 = 0,
-                Indirect3 = 0
+                Indirect3 = 0,
+                Mode = mode
             };
         }
     }

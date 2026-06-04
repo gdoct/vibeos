@@ -157,6 +157,17 @@ extern "C" int signals_pending_current(void) {
     return (t->sig.pending & ~t->sig.blocked) != 0;
 }
 
+/* Replace the current task's blocked mask (KILL/STOP can't be blocked). Used by
+   rt_sigsuspend, which swaps the mask in for the duration of an interruptible
+   wait. Returns the previous mask. */
+extern "C" uint64_t signals_set_blocked_current(uint64_t mask) {
+    task_t *t = task_current();
+    if (!t) return 0;
+    uint64_t old = t->sig.blocked;
+    t->sig.blocked = mask & ~SIG_UNMASKABLE;
+    return old;
+}
+
 /* ---- handler frame setup ---- */
 
 static int pick_signal(task_t *t) {

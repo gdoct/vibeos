@@ -39,8 +39,12 @@ static void puts1(const char *s) { sys_write(1, s, slen(s)); }
 
 int main(void) {
     puts1("init: VibeOS userspace up (PID 1), supervising /bin/sh\n");
-    char *const argv[] = { (char *)"/bin/sh", (char *)0 };
-    char *const envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", (char *)0 };
+    char *const argv[] = { (char *)"/bin/sh", (char *)"-i", (char *)0 };   /* -i: interactive (prompt + rc) */
+    char *const envp[] = {
+        (char *)"PATH=/bin", (char *)"HOME=/", (char *)"TERM=vibeos",
+        (char *)"ENV=/etc/mkshrc",               /* mksh sources this when interactive */
+        (char *)0
+    };
 
     for (;;) {
         long pid = sys_fork();

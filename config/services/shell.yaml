@@ -1,7 +1,8 @@
 # /config/services/shell.yaml — the interactive serial shell.
 # Starts after the welcome banner; respawned whenever it exits.
 description: interactive serial shell
-exec:        /bin/sh
+# -i forces mksh interactive (prompt + $ENV/rc) even if tty autodetect is unsure.
+exec:        /bin/sh -i
 respawn:     yes
 enabled:     yes
 after:       welcome

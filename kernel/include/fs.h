@@ -101,7 +101,8 @@ typedef struct {
     uint32_t indirect;             /* single-indirect: block of 1024 u32 ptrs */
     uint32_t indirect2;            /* double-indirect: block of ptrs to L1 blocks */
     uint32_t indirect3;            /* triple-indirect: block of ptrs to L2 blocks */
-    uint8_t  pad[44];              /* 20 hdr + 52 direct + 12 indirect = 84; +44 = 128 */
+    uint32_t mode;                 /* permission bits (low 12); 0 == unset (legacy) */
+    uint8_t  pad[40];              /* 20 hdr + 52 direct + 12 indirect + 4 mode = 88; +40 = 128 */
 } __attribute__((packed)) inode_t;
 static_assert(sizeof(inode_t) == 128, "inode must be 128 bytes");
 
@@ -154,11 +155,13 @@ typedef struct {
     uint16_t links;
     uint64_t size;
     uint32_t ctime, mtime;   /* timer ticks (100 Hz) */
+    uint32_t mode;           /* permission bits (low 12); 0 == unset (legacy) */
 } fs_stat_t;
 
 int fs_resolve(const char *path);                    /* inode number (>0) or FS errno; follows symlinks */
 int fs_lresolve(const char *path);                   /* like fs_resolve but does NOT follow a final symlink */
 int fs_istat  (uint32_t ino, fs_stat_t *out);
+int fs_chmod  (uint32_t ino, uint32_t mode);                /* set permission bits (low 12) */
 int fs_symlink(const char *target, const char *linkpath);   /* create a symlink */
 int fs_readlink(uint32_t ino, char *buf, uint32_t bufsz);   /* read a symlink target (no NUL); bytes or FS errno */
 int fs_truncate_ino(uint32_t ino);                   /* drop to zero length */

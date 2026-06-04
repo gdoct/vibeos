@@ -119,6 +119,10 @@ uint64_t signals_sigreturn(struct syscall_frame *f);
    Interruptible kernel waits (tty_read) use this to return -EINTR. */
 int signals_pending_current(void);
 
+/* Replace the current task's blocked mask (KILL/STOP excepted); returns the
+   previous mask. Used by rt_sigsuspend for the duration of its wait. */
+uint64_t signals_set_blocked_current(uint64_t mask);
+
 /* Syscalls (wired from syscall_dispatch). */
 int64_t sys_rt_sigaction(int sig, const void *uact, void *uoldact, uint64_t sigsetsize);
 int64_t sys_rt_sigprocmask(int how, const void *uset, void *uoldset, uint64_t sigsetsize);

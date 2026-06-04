@@ -1,0 +1,33 @@
+# /etc/mkshrc — VibeOS default interactive shell environment.
+#
+# Sourced by mksh for every interactive shell via $ENV (init/sinit export
+# ENV=/etc/mkshrc along with PATH and HOME). Keep it POSIX/mksh-safe; it must not
+# error on a freshly booted system. Also safe to `. /etc/mkshrc` from any shell.
+
+# Sane defaults — only set if the caller didn't already export them.
+: "${HOME:=/}"
+: "${PATH:=/bin}"
+: "${PWD:=/}"
+: "${TERM:=vibeos}"
+PAGER=cat
+export HOME PATH TERM PAGER
+
+# Prompt: current directory followed by "$ ". mksh re-expands ${PWD} each prompt.
+PS1='${PWD:-/} $ '
+
+# Persistent command history on the writable VibeFS volume.
+HISTFILE="$HOME/.mksh_history"
+HISTSIZE=500
+
+# Common coreutils aliases. The commands come from toybox (/bin/ls, /bin/cat, …
+# are symlinks to /bin/toybox); harmless if toybox isn't installed yet.
+alias ll='ls -l' la='ls -la' l='ls -CF'
+alias ..='cd ..' ...='cd ../..'
+
+# Greeting shown when an interactive shell starts (this file is only sourced for
+# interactive shells). Prints a welcome banner + version info above the prompt.
+print -r -- ""
+print -r -- "  Welcome to VibeOS"
+print -r -- "  shell: mksh ${KSH_VERSION#*KSH }   ·   coreutils: toybox"
+print -r -- "  try: ls /,  cat /etc/mkshrc,  uname -a"
+print -r -- ""

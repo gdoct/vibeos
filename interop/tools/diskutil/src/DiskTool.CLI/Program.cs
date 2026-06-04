@@ -96,6 +96,15 @@ static int Run(string[] args)
                 CreateSymlink(diskFile, commandArgs[0], commandArgs[1]);
                 return 0;
 
+            case "symlinks":
+                if (commandArgs.Count != 2)
+                {
+                    throw new ArgumentException("Symlinks expects: --symlinks <target> <vibefs-linkdir>  (link names read from stdin)");
+                }
+
+                CreateSymlinks(diskFile, commandArgs[0], commandArgs[1]);
+                return 0;
+
             default:
                 throw new ArgumentException($"Unsupported command '{command}'.");
         }
@@ -123,6 +132,7 @@ static bool TryGetCommandArgs(string[] args, out string command, out List<string
     AddIfPresent(args, commandFlags, "format", "--format");
     AddIfPresent(args, commandFlags, "mkdir", "--mkdir");
     AddIfPresent(args, commandFlags, "mkdir", "-m");
+    AddIfPresent(args, commandFlags, "symlinks", "--symlinks");
     AddIfPresent(args, commandFlags, "symlink", "--symlink");
     AddIfPresent(args, commandFlags, "create-volume", "--create-volume");
 
@@ -194,8 +204,25 @@ static void ImportFile(string diskFile, string localPath, string vibeFsPath)
 
     var bytes = File.ReadAllBytes(localPath);
     using var volume = VibeFsVolume.OpenReadWrite(diskFile);
-    volume.WriteFile(vibeFsPath, bytes);
+    volume.WriteFile(vibeFsPath, bytes, HostFileMode(localPath));
     Console.WriteLine($"Imported '{localPath}' -> '{vibeFsPath}'");
+}
+
+// Map the host file's Unix permission bits to the VibeFS mode, so an executable
+// on the build host (e.g. a compiled binary) lands executable on VibeOS. On
+// platforms without Unix modes, fall back to 0644.
+static uint HostFileMode(string localPath)
+{
+    try
+    {
+        var m = File.GetUnixFileMode(localPath);
+        uint mode = (uint)m & 0xFFFu;     // UnixFileMode flags map 1:1 to the low 12 bits
+        return mode == 0 ? 0x1A4u /* 0644 */ : mode;
+    }
+    catch (PlatformNotSupportedException)
+    {
+        return 0x1A4u; /* 0644 */
+    }
 }
 
 static void ExportFile(string diskFile, string vibeFsPath, string localPath)
@@ -256,6 +283,48 @@ static void CreateSymlink(string diskFile, string target, string linkPath)
     using var volume = VibeFsVolume.OpenReadWrite(diskFile);
     volume.CreateSymlink(linkPath, target);
     Console.WriteLine($"Created symlink '{linkPath}' -> '{target}'.");
+}
+
+// Batch symlink creation for a multicall binary's applet farm (e.g. toybox).
+// Link names are read one per line from stdin; each becomes <linkDir>/<name> ->
+// <target>. Names that already exist in <linkDir> (and the target's own name)
+// are skipped, so this never clobbers existing binaries. One volume open keeps
+// it fast for hundreds of applets.
+static void CreateSymlinks(string diskFile, string target, string linkDir)
+{
+    using var volume = VibeFsVolume.OpenReadWrite(diskFile);
+
+    var existing = new HashSet<string>(StringComparer.Ordinal);
+    foreach (var entry in volume.ListDirectory(linkDir))
+    {
+        existing.Add(entry.Name);
+    }
+
+    var targetName = target.Substring(target.LastIndexOf('/') + 1);
+    var trimmedDir = linkDir.TrimEnd('/');
+
+    int created = 0, skipped = 0;
+    string? line;
+    while ((line = Console.In.ReadLine()) is not null)
+    {
+        var name = line.Trim();
+        if (name.Length == 0)
+        {
+            continue;
+        }
+
+        if (name == targetName || existing.Contains(name))
+        {
+            skipped++;
+            continue;
+        }
+
+        volume.CreateSymlink($"{trimmedDir}/{name}", target);
+        existing.Add(name);
+        created++;
+    }
+
+    Console.WriteLine($"Created {created} symlink(s) in '{linkDir}' -> '{target}' ({skipped} skipped).");
 }
 
 static void CreateVolume(string sizeArg, string outputFile)
@@ -323,6 +392,7 @@ static void PrintUsage()
     Console.WriteLine("  disktool-cli --diskfile <diskfile> --format <total-blocks>");
     Console.WriteLine("  disktool-cli --diskfile <diskfile> --mkdir|-m <vibefs-path>");
     Console.WriteLine("  disktool-cli --diskfile <diskfile> --symlink <target> <vibefs-linkpath>");
+    Console.WriteLine("  disktool-cli --diskfile <diskfile> --symlinks <target> <vibefs-linkdir>   (names on stdin)");
     Console.WriteLine();
     Console.WriteLine("Size examples for --create-volume: 65536, 64K, 128M, 1G");
 }

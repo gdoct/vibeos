@@ -1,0 +1,25 @@
+# toybox — a single-binary coreutils userland for VibeOS.
+#
+# `pkg create packages/toybox` copies this directory into a work area, runs the
+# build command in `build.workdir`, then archives `package_info.yml` plus the
+# staged binary (resolved against `stage.from`) into toybox-<version>.pkg.
+#
+# The build is driven by src/Makefile (the build command is `make`, run in src/):
+# it fetches the pinned toybox source tarball (cached locally; not committed, per
+# the repo's *.tgz ignore), cross-compiles it static with the x86_64-linux-musl
+# toolchain (musl-gcc), strips it, and installs the multicall binary to
+# src/build/out/bin/toybox — which stage.include then archives as bin/toybox.
+#
+# toybox is a *multicall* binary: invoked as `ls`, `cat`, … (via argv[0]) it
+# behaves as that command. build.sh installs /bin/toybox and creates a symlink
+# farm (/bin/ls -> /bin/toybox, …) for every applet, skipping names already in
+# /bin (so it never clobbers init, the shell, or the test binaries).
+name: toybox
+version: 0.8.11
+build:
+  command: make
+  workdir: src
+stage:
+  from: src/build/out
+  include:
+    - bin/toybox

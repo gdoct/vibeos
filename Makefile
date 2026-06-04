@@ -92,6 +92,7 @@ KERNEL_LDFLAGS = \
 	-static \
 	-no-pie \
 	-z max-page-size=0x1000 \
+	--no-warn-rwx-segments \
 	-T kernel/linker.ld
 
 KERNEL_C_SRCS = \

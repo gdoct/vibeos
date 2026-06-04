@@ -796,9 +796,12 @@ static void fill_stat(struct linux_stat *st, uint32_t ino, const fs_stat_t *s) {
     st->st_dev   = 1;
     st->st_ino   = ino;
     st->st_nlink = s->links;
-    st->st_mode  = (s->type == FT_DIR)     ? (S_IFDIR | 0755)
-                 : (s->type == FT_SYMLINK) ? (S_IFLNK | 0777)
-                                           : (S_IFREG | 0644);
+    uint32_t perm = s->mode & 07777u;            /* stored permission bits */
+    if (perm == 0)                               /* legacy inode (pre-mode): synthesize */
+        perm = (s->type == FT_DIR) ? 0755u : (s->type == FT_SYMLINK) ? 0777u : 0644u;
+    st->st_mode  = ((s->type == FT_DIR)     ? S_IFDIR
+                 :  (s->type == FT_SYMLINK) ? S_IFLNK
+                                            : S_IFREG) | perm;
     st->st_size  = (int64_t)s->size;
     st->st_blksize = FS_BLOCK_SIZE;
     st->st_blocks  = (int64_t)((s->size + 511) / 512);
@@ -1091,6 +1094,28 @@ static int64_t sys_truncate(const char *upath, int64_t len) {
     int ino = fs_resolve(path);
     if (ino < 0) return fs_to_errno(ino);
     int r = fs_truncate_to((uint32_t)ino, (uint64_t)len);
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
+/* chmod(path, mode) / fchmodat(dirfd, path, mode, flag) / fchmod(fd, mode):
+   record permission bits. VibeOS has no uid model, so this isn't an access-
+   control gate; it makes mode bits real so stat reflects them and shells'
+   executability checks pass for binaries. */
+static int64_t sys_chmod(const char *upath, uint32_t mode) {
+    char path[256];
+    resolve_path(path, sizeof path, upath);
+    if (synth_classify(path, nullptr) != SYNTH_NONE) return -EACCES_;
+    int ino = fs_resolve(path);
+    if (ino < 0) return fs_to_errno(ino);
+    int r = fs_chmod((uint32_t)ino, mode);
+    return r == FS_OK ? 0 : fs_to_errno(r);
+}
+
+static int64_t sys_fchmod(int fd, uint32_t mode) {
+    file_t *f = fd_get(fd);
+    if (!f) return -EBADF_;
+    if (f->kind != FD_FILE) return -EINVAL_;     /* only on-disk inodes carry a mode */
+    int r = fs_chmod(f->ino, mode);
     return r == FS_OK ? 0 : fs_to_errno(r);
 }
 
@@ -1582,6 +1607,24 @@ static int poll_wait_quantum(int64_t timeout_ms, uint64_t start_tick) {
     return 0;
 }
 
+/* rt_sigsuspend(mask, sigsetsize): atomically install `mask` as the blocked set
+   and block until a deliverable signal arrives, then return -EINTR (the handler
+   runs on the way back to userspace). Interactive shells use this to wait for
+   SIGCHLD without busy-waiting. Simplification: the pre-suspend mask is not
+   auto-restored after the handler (callers like mksh re-set it themselves); this
+   matches the codebase's other sigmask approximations. */
+static int64_t sys_rt_sigsuspend(const void *umask, uint64_t sigsetsize) {
+    if (sigsetsize != sizeof(uint64_t)) return -EINVAL_;
+    uint64_t newmask;
+    if (copy_from_user(&newmask, cur_vm(), (uint64_t)(uintptr_t)umask, sizeof newmask) < 0)
+        return -EFAULT_;
+    signals_set_blocked_current(newmask);
+    uint64_t start = timer_ticks();
+    while (poll_wait_quantum(-1, start) == 0)   /* sleep in quanta until a signal is pending */
+        ;
+    return -EINTR_;
+}
+
 static int64_t sys_poll(uint64_t ufds, uint32_t nfds, int64_t timeout_ms) {
     struct pollfd { int fd; int16_t events; int16_t revents; };
     if (nfds == 0) { if (timeout_ms > 0) ksleep_ms((uint64_t)timeout_ms); return 0; }
@@ -1917,6 +1960,7 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 200: return (uint64_t)sys_kill((int)f->rdi, (int)f->rsi);   /* tkill(tid,sig) */
     case 234: return (uint64_t)sys_tgkill((int)f->rdi, (int)f->rsi, (int)f->rdx); /* tgkill */
     case 127: return (uint64_t)sys_rt_sigpending((void *)f->rdi, f->rsi);  /* rt_sigpending */
+    case 130: return (uint64_t)sys_rt_sigsuspend((const void *)f->rdi, f->rsi); /* rt_sigsuspend */
     case 131: return (uint64_t)sys_sigaltstack((const void *)f->rdi, (void *)f->rsi); /* sigaltstack */
     case 72:  return (uint64_t)sys_fcntl((int)f->rdi, (int)f->rsi, f->rdx);  /* fcntl */
     case 186: return (uint64_t)task_current()->id;             /* gettid (== pid, no threads) */
@@ -1933,6 +1977,9 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 273: return 0;                                        /* set_robust_list (accept) */
     case 324: return 0;                                        /* membarrier (BSP-pinned: a no-op) */
     case 1000: return (uint64_t)sys_sysconfig((int)f->rdi, f->rsi, f->rdx, f->r10); /* sysconfig (VibeOS) */
+    case 90:  return (uint64_t)sys_chmod((const char *)f->rdi, (uint32_t)f->rsi);   /* chmod */
+    case 91:  return (uint64_t)sys_fchmod((int)f->rdi, (uint32_t)f->rsi);           /* fchmod */
+    case 268: return (uint64_t)sys_chmod((const char *)f->rsi, (uint32_t)f->rdx);  /* fchmodat(dirfd,path,mode,flag) */
     case 88:  return (uint64_t)sys_symlink((const char *)f->rdi, (const char *)f->rsi); /* symlink */
     case 89:  return (uint64_t)sys_readlink((const char *)f->rdi, (char *)f->rsi, f->rdx); /* readlink */
     case 267: return (uint64_t)sys_readlink((const char *)f->rsi, (char *)f->rdx, f->r10); /* readlinkat */

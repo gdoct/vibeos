@@ -181,7 +181,11 @@ static void start(svc_t *s) {
     argv[argc] = NULL;
     if (argc == 0) return;
 
-    char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", (char *)"TERM=vibeos", NULL };
+    char *envp[] = {
+        (char *)"PATH=/bin", (char *)"HOME=/", (char *)"TERM=vibeos",
+        (char *)"ENV=/etc/mkshrc",               /* mksh sources this when interactive */
+        NULL
+    };
     pid_t pid = fork();
     if (pid == 0) {
         if (s->logpath[0]) {                   /* redirect stdout+stderr to the log */

@@ -183,6 +183,9 @@ static uint32_t inode_alloc(uint16_t type) {
             inode_t in;
             kmemset(&in, 0, sizeof in);
             in.type  = type;
+            /* Default permission bits by type (dirs/symlinks traversable,
+               regular files non-executable; binaries get +x set at import). */
+            in.mode  = (type == FT_DIR) ? 0755u : (type == FT_SYMLINK) ? 0777u : 0644u;
             in.ctime = in.mtime = (uint32_t)timer_ticks();
             inode_write(i, &in);
             return i;
@@ -661,6 +664,7 @@ static void mkfs(void) {
     kmemset(&root, 0, sizeof root);
     root.type  = FT_DIR;
     root.links = 2;
+    root.mode  = 0755u;
     root.ctime = root.mtime = (uint32_t)timer_ticks();
     uint32_t b = data_alloc();
     if (!b) panic("fs: mkfs cannot allocate root block");
@@ -1303,6 +1307,18 @@ int fs_istat(uint32_t ino, fs_stat_t *out) {
     out->size  = in.size;
     out->ctime = in.ctime;
     out->mtime = in.mtime;
+    out->mode  = in.mode;
+    return FS_OK;
+}
+
+int fs_chmod(uint32_t ino, uint32_t mode) {
+    if (!g.mounted) return FS_EINVAL;
+    inode_t in;
+    inode_read(ino, &in);
+    if (in.type == FT_NONE) return FS_ENOENT;
+    in.mode = mode & 07777u;
+    inode_write(ino, &in);
+    flush_meta();
     return FS_OK;
 }
 

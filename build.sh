@@ -34,10 +34,14 @@ step "Bootstrap $VDISK ($VDISK_SIZE) with /bin"
 rm -f "$VDISK"
 "$DISKUTIL" --create-volume "$VDISK_SIZE" "$VDISK"
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /bin
+"$DISKUTIL" --diskfile "$VDISK" --mkdir /etc
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /config
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /config/services
 "$DISKUTIL" --diskfile "$VDISK" --mkdir /config/logs
 "$DISKUTIL" --diskfile "$VDISK" --import config/system.conf /config/system.conf
+# Default interactive shell environment: mksh sources /etc/mkshrc via $ENV
+# (PATH/HOME/ENV are exported by init/sinit). Sets PATH, prompt, and aliases.
+"$DISKUTIL" --diskfile "$VDISK" --import config/mkshrc /etc/mkshrc
 # Service definitions (ROADMAP: service-managed init) — one discoverable YAML per
 # service, read by the init at boot.
 for svc in config/services/*.yaml; do
@@ -127,9 +131,12 @@ if [ -x "$PKG" ] && [ -d packages ]; then
   for pkgdir in "$(pwd)"/packages/*/; do
     [ -f "$pkgdir/package_info.yml" ] || continue
     name=$(basename "$pkgdir")
-    # pkg create writes <name>-<version>.pkg into the current directory.
-    ( cd "$PKGOUT" && "$PKG" create "$pkgdir" ) >/dev/null || \
-      { echo "warning: pkg create failed for $name"; continue; }
+    # pkg create writes <name>-<version>.pkg into the current directory. Each
+    # package's build (mksh/toybox compile, etc.) is third-party and noisy, so
+    # capture its stdout+stderr to a per-package log and keep this output clean;
+    # on failure point at the log.
+    ( cd "$PKGOUT" && "$PKG" create "$pkgdir" ) >"$PKGOUT/$name-build.log" 2>&1 || \
+      { echo "warning: pkg create failed for $name (see boot/build/packages/$name-build.log)"; continue; }
   done
   for archive in "$PKGOUT"/*.pkg; do
     [ -f "$archive" ] || continue
@@ -164,6 +171,7 @@ done
 if [ -n "$MKSH_PKG" ]; then
   MKSH_TMP="$(mktemp -d)"
   if tar -xf "$MKSH_PKG" -C "$MKSH_TMP" bin/mksh 2>/dev/null && [ -f "$MKSH_TMP/bin/mksh" ]; then
+    chmod +x "$MKSH_TMP/bin/mksh"     # import records the host mode; ensure +x so the shell is executable
     "$DISKUTIL" --diskfile "$VDISK" --import "$MKSH_TMP/bin/mksh" /bin/mksh
     "$DISKUTIL" --diskfile "$VDISK" --symlink /bin/mksh /bin/sh
     echo "default shell: /bin/sh -> /bin/mksh ($(basename "$MKSH_PKG"))"
@@ -175,6 +183,32 @@ if [ -n "$MKSH_PKG" ]; then
 else
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/vsh.elf /bin/sh
   echo "default shell: /bin/sh = /bin/vsh (mksh package not built)"
+fi
+
+# Toybox userland (packages/toybox). toybox is a multicall binary: install it at
+# /bin/toybox, then create a symlink farm (/bin/ls -> /bin/toybox, …) for every
+# applet. The applet list comes from running the freshly built (static, host-
+# runnable) binary; --symlinks skips any name already in /bin, so it never
+# clobbers init, the shell, or the test binaries.
+step "Install toybox userland (/bin coreutils)"
+TOYBOX_PKG=""
+for cand in "${PKGOUT:-/nonexistent}"/toybox-*.pkg; do
+  [ -f "$cand" ] && TOYBOX_PKG="$cand"
+done
+if [ -n "$TOYBOX_PKG" ]; then
+  TB_TMP="$(mktemp -d)"
+  if tar -xf "$TOYBOX_PKG" -C "$TB_TMP" bin/toybox 2>/dev/null && [ -f "$TB_TMP/bin/toybox" ]; then
+    chmod +x "$TB_TMP/bin/toybox"
+    "$DISKUTIL" --diskfile "$VDISK" --import "$TB_TMP/bin/toybox" /bin/toybox
+    # `toybox` with no args prints the space-separated applet list.
+    "$TB_TMP/bin/toybox" | tr ' ' '\n' | grep -v '^$' \
+      | "$DISKUTIL" --diskfile "$VDISK" --symlinks /bin/toybox /bin
+  else
+    echo "warning: $TOYBOX_PKG has no bin/toybox; no coreutils installed"
+  fi
+  rm -rf "$TB_TMP"
+else
+  echo "toybox package not built; /bin has no coreutils (only the shell builtins)"
 fi
 
 step "Volume contents"
