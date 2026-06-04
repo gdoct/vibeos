@@ -68,6 +68,8 @@ fi
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/cputest.elf /bin/cputest
 [ -f user/build/sigtest.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/sigtest.elf /bin/sigtest
+[ -f user/build/ttytest.elf ] && \
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/ttytest.elf /bin/ttytest
 [ -f user/build/nettest.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/nettest.elf /bin/nettest
 [ -f user/build/wget.elf ] && \

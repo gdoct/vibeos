@@ -391,7 +391,7 @@ static int64_t sys_write(int fd, const void *buf, uint64_t n) {
         return -EFAULT_;                        /* bad user buffer: no kernel fault */
     file_t *f = fd_get(fd);
     if (!f) {                                   /* 0/1/2 default to the console... */
-        if (fd == 1 || fd == 2) { serial_write((const char *)buf, (size_t)n); return (int64_t)n; }
+        if (fd == 1 || fd == 2) return tty_write((const char *)buf, (uint32_t)n);
         return -EBADF_;                         /* ...unless redirected onto a file */
     }
     if (f->kind == FD_PIPE_WR) return pipe_write(f->pipe, buf, (uint32_t)n, f->flags);
@@ -450,6 +450,19 @@ static int64_t sys_read(int fd, void *buf, uint64_t n) {
     f->off = off + (uint64_t)r;
     spin_unlock(&f->off_lock);
     return r;
+}
+
+/* ioctl(2): dispatch on the fd's backing object. The implicit console fds (0/1/2)
+   and /dev/tty carry the terminal discipline (termios/winsize/job control); a
+   pipe/socket/regular file is -ENOTTY (which is how isatty(3) tells them apart). */
+static int64_t sys_ioctl(int fd, unsigned cmd, uint64_t arg) {
+    file_t *f = fd_get(fd);
+    if (!f) {
+        if (fd == 0 || fd == 1 || fd == 2) return tty_ioctl(cmd, arg);
+        return -EBADF_;
+    }
+    if (f->kind == FD_DEV) return synth_ioctl(f, cmd, arg);
+    return -ENOTTY_;
 }
 
 __attribute__((noreturn))
@@ -1851,7 +1864,7 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 14:  return (uint64_t)sys_rt_sigprocmask((int)f->rdi, (const void *)f->rsi,
                                                   (void *)f->rdx, f->r10); /* rt_sigprocmask */
     case 15:  return signals_sigreturn(f);                     /* rt_sigreturn */
-    case 16:  return (uint64_t)(int64_t)-ENOTTY_;              /* ioctl: not a tty */
+    case 16:  return (uint64_t)sys_ioctl((int)f->rdi, (unsigned)f->rsi, f->rdx);  /* ioctl */
     case 20:  return (uint64_t)sys_writev((int)f->rdi, (const struct iovec *)f->rsi,
                                           (int)f->rdx);        /* writev */
     case 22:  return (uint64_t)sys_pipe((int *)f->rdi);        /* pipe */
@@ -1866,6 +1879,11 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 105:                                                  /* setuid */
     case 106: return f->rdi == 0 ? 0                           /* setgid: only root (0) is real */
                                  : (uint64_t)(int64_t)-EPERM_;
+    case 109: return (uint64_t)task_setpgid((int)f->rdi, (int)f->rsi);  /* setpgid */
+    case 121: return (uint64_t)task_getpgid((int)f->rdi);      /* getpgid */
+    case 111: return (uint64_t)task_getpgid(0);                /* getpgrp */
+    case 112: return (uint64_t)task_setsid();                  /* setsid */
+    case 124: return (uint64_t)task_getsid((int)f->rdi);       /* getsid */
     case 56:  return (uint64_t)sys_clone(f);                   /* clone */
     case 202: return (uint64_t)sys_futex(f->rdi, (int)f->rsi, (int)f->rdx);  /* futex */
     case 7:   return (uint64_t)sys_poll(f->rdi, (uint32_t)f->rsi, (int64_t)(int)f->rdx);  /* poll */

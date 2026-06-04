@@ -221,10 +221,15 @@ int synth_write(file_t *f, const void *buf, uint32_t n) {
         case DEV_RANDOM:
         case DEV_URANDOM: return (int)n;                     /* discard */
         case DEV_FULL:    return -28;                        /* -ENOSPC */
-        case DEV_TTY:     serial_write((const char *)buf, n); return (int)n;
+        case DEV_TTY:     return tty_write((const char *)buf, n);  /* OPOST/ONLCR */
         }
     }
     return -1;
+}
+
+int synth_ioctl(file_t *f, unsigned cmd, uint64_t arg) {
+    if (f->kind == FD_DEV && f->dev == DEV_TTY) return tty_ioctl(cmd, arg);
+    return -25;   /* -ENOTTY */
 }
 
 /* ---- directory enumeration ---- */

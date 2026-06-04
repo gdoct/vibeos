@@ -275,9 +275,21 @@ milestone is mostly about closing specific syscall/ABI gaps, not new subsystems.
   is read once at boot and anchored to the timer tick; `clock_gettime`
   (CLOCK_REALTIME + MONOTONIC) and `gettimeofday` now return real wall-clock
   time, and `stat` timestamps are wall-clock too. (`multest` prints the epoch.)
-- **Interactive I/O** — `ioctl` always returns `-ENOTTY`; no PTYs
-  (`/dev/ptmx`/pts); no sessions/job control (`setsid`/`setpgid`/`tcsetpgrp`).
-  Gateway to any interactive program.
+- ~~**Interactive I/O**~~ — *done (over the console; PTYs still open).* `ioctl`
+  (16) dispatches per-fd: the console fds (0/1/2) and `/dev/tty` carry a
+  **termios** line discipline ([tty.c](kernel/src/tty.c)) — raw/cooked, `ECHO`,
+  `ISIG` (INTR/QUIT/SUSP → SIGINT/SIGQUIT/SIGTSTP to the foreground group),
+  ERASE/KILL/WERASE/EOF, `ICRNL`/`INLCR`/`IGNCR` input mapping, `OPOST`/`ONLCR`
+  output — set/queried via `TCGETS`/`TCSETS{,W,F}`/`TCFLSH`; plus `TIOCGWINSZ`/
+  `TIOCSWINSZ`, `FIONREAD`, and the job-control ioctls `TIOCGPGRP`/`TIOCSPGRP`
+  (`tcgetpgrp`/`tcsetpgrp`), `TIOCGSID`, `TIOCSCTTY`/`TIOCNOTTY`. **Sessions +
+  process groups** live on `task_t` (`pgid`/`sid`, inherited across fork/clone)
+  with `setpgid`/`getpgid`/`getpgrp`/`setsid`/`getsid` (109/121/111/112/124);
+  `kill(-pgrp)`/`kill(0)` target groups; a background read raises `SIGTTIN`.
+  `isatty` works (a pipe/file is `-ENOTTY`). `/bin/ttytest` exercises the whole
+  surface (23 checks + a Ctrl-C→SIGINT round-trip) on QEMU. **Still missing:**
+  PTYs (`/dev/ptmx`/pts) — needed for a terminal multiplexer / OpenSSH, not for
+  bash over the serial console.
 - **More multiplexing** — *mostly done.* `select`/`pselect6` (23/270),
   `ppoll` (271), `eventfd`/`eventfd2` (284/290), `timerfd_create`/`settime`/
   `gettime` (283/286/287) are wired up, and `poll` was rebuilt over a unified
@@ -285,10 +297,12 @@ milestone is mostly about closing specific syscall/ABI gaps, not new subsystems.
   Still missing: `epoll`. (Readiness is coarse poll-with-sleep, 50 ms quantum —
   not event-driven; fine until something needs sub-tick latency.)
 
-1. **Run `bash`** *(closest — file-mutation + credentials + a little tty work).*
+1. **Run `bash`** *(closest — the prerequisites are now in place).*
    Scripted (non-interactive) bash needs little beyond what we have plus
-   `getuid`/`geteuid` and `unlink`. Interactive bash additionally needs termios
-   `ioctl` (line editing) and `setpgid`/`tcsetpgrp` (job control).
+   `getuid`/`geteuid` and `unlink` — *done*. Interactive bash additionally needs
+   termios `ioctl` (line editing) and `setpgid`/`tcsetpgrp` (job control) — also
+   *done* over the serial console (see "Interactive I/O" above). Next step is to
+   cross-build bash itself and shake out the remaining ABI gaps it hits.
 2. **Run a Rust program** *(near — reuse the `x86_64-unknown-linux-musl` target).*
    A statically-linked Rust binary already matches our ABI; `std` rides on musl +
    futex/threads, which we have. No custom Rust target needed. A hello-world is

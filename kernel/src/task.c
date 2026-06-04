@@ -239,6 +239,8 @@ task_t *task_fork(const char *name, struct vmspace *vm,
     }
     spin_unlock(&parent->files->lock);
     for (unsigned i = 0; i < sizeof t->cwd; i++) t->cwd[i] = parent->cwd[i];  /* inherit cwd */
+    t->pgid = task_pgid(parent);            /* inherit the process group + session */
+    t->sid  = task_sid(parent);
 
     /* Craft the child stack: context_switch -> fork_child_return, which finds a
        copy of the parent's syscall frame (rax forced to 0) and sysrets. The
@@ -276,6 +278,56 @@ task_t *task_fork(const char *name, struct vmspace *vm,
 
 int task_tgid(task_t *t) { return t->tgid ? t->tgid : t->id; }
 
+/* ---- job control (ROADMAP §"Interactive I/O") ---- */
+
+int task_pgid(task_t *t) { return t->pgid ? t->pgid : t->id; }
+int task_sid(task_t *t)  { return t->sid  ? t->sid  : t->id; }
+
+/* setpgid(pid, pgid): pid 0 == caller; pgid 0 == set to pid. We allow joining any
+   existing group or starting a new one named by the pid — no cross-session check
+   (single-user, single console). */
+int task_setpgid(int pid, int pgid) {
+    task_t *cur = task_current();
+    task_t *t = pid ? task_by_id(pid) : cur;
+    if (!t || !t->vm) return -3;            /* -ESRCH */
+    if (pgid < 0) return -22;               /* -EINVAL */
+    t->pgid = pgid ? pgid : t->id;
+    return 0;
+}
+
+int task_getpgid(int pid) {
+    task_t *t = pid ? task_by_id(pid) : task_current();
+    if (!t || !t->vm) return -3;            /* -ESRCH */
+    return task_pgid(t);
+}
+
+/* setsid(): the caller becomes a session + group leader (sid == pgid == pid) with
+   no controlling terminal. */
+int task_setsid(void) {
+    task_t *t = task_current();
+    t->sid  = t->id;
+    t->pgid = t->id;
+    return t->id;
+}
+
+int task_getsid(int pid) {
+    task_t *t = pid ? task_by_id(pid) : task_current();
+    if (!t || !t->vm) return -3;            /* -ESRCH */
+    return task_sid(t);
+}
+
+/* Deliver `sig` to every live user task in process group `pgrp`. Safe to call
+   without sched_lock held (signals_raise takes it as needed) — used from the tty
+   line discipline (IRQ context) and from kill(-pgrp). */
+void tasks_signal_pgrp(int pgrp, int sig) {
+    if (pgrp <= 0) return;
+    for (int i = 1; i < MAX_TASKS; i++) {
+        task_t *t = &g_tasks[i];
+        if ((t->state == TASK_NONE || t->state == TASK_DEAD) || !t->vm) continue;
+        if (task_pgid(t) == pgrp) signals_raise(t, sig);
+    }
+}
+
 task_t *task_clone(const char *name, struct vmspace *vm,
                    const struct syscall_frame *frame, uint64_t user_stack,
                    uint64_t tls, int share_files, int is_thread) {
@@ -306,6 +358,8 @@ task_t *task_clone(const char *name, struct vmspace *vm,
         spin_unlock(&parent->files->lock);
     }
     for (unsigned i = 0; i < sizeof t->cwd; i++) t->cwd[i] = parent->cwd[i];
+    t->pgid = task_pgid(parent);            /* inherit group/session (threads share) */
+    t->sid  = task_sid(parent);
 
     /* Same fork_child_return frame as fork, but the child resumes on its own
        stack (user_stack) with rax=0. */
