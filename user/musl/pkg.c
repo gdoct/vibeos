@@ -1,14 +1,18 @@
 /*
- * pkg — a minimal VibeOS package tool (ROADMAP §4).
+ * pkg — VibeOS package tool, v1 (docs/pkgman.md).
  *
- * A "package" is a plain POSIX ustar tar archive (so it can be produced by any
- * host `tar`); the metadata VibeFS understands — path, entry type, symlink
- * target, file size — is carried in the tar header and applied on extract.
+ * A package is a POSIX ustar archive with a `.pkg` extension carrying a
+ * `package_info.yml` manifest at its root plus a staged file tree. This tool
+ * lists, extracts, and creates such archives. It does NOT resolve dependencies,
+ * track installed packages, uninstall, build ports, or run maintainer scripts —
+ * those belong to the "future" layer described in docs/pkgman.md.
  *
- *   pkg x <archive.tar> [destdir]   extract into destdir (default "/")
- *   pkg t <archive.tar>             list contents
+ *   pkg list    <archive.pkg>
+ *   pkg extract <archive.pkg> <destdir>
+ *   pkg create  <pkgdir> [--output <archive.pkg>] [--include <path>]...
  *
- * Built against musl (uses libc: open/read/write/mkdir/symlink).
+ * Built as a static x86_64-linux-musl binary, so it runs unmodified both on the
+ * host (for image-time `pkg create`) and on VibeOS over the serial shell.
  */
 
 #include <stdio.h>
@@ -16,11 +20,16 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <dirent.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+
+extern char **environ;
 
 #define BLK 512
 
-/* ustar header field offsets. */
+/* POSIX ustar header (one 512-byte block). */
 struct tar_hdr {
     char name[100];
     char mode[8];
@@ -41,84 +50,559 @@ struct tar_hdr {
     char pad[12];
 };
 
+/* ---- small helpers ------------------------------------------------------ */
+
 static unsigned long oct(const char *s, int n) {
     unsigned long v = 0;
     for (int i = 0; i < n && s[i] >= '0' && s[i] <= '7'; i++) v = v * 8 + (s[i] - '0');
     return v;
 }
 
-/* Join destdir + "/" + name into out. */
+/* Write `val` as a NUL-terminated octal field of width `n` (right-justified,
+   zero-padded) — the classic ustar numeric encoding. */
+static void putoct(char *dst, int n, unsigned long val) {
+    dst[n - 1] = '\0';
+    for (int i = n - 2; i >= 0; i--) { dst[i] = '0' + (val & 7); val >>= 3; }
+}
+
+/* Read exactly `n` bytes (handling short reads); returns n, 0 at EOF, <0 err. */
+static ssize_t read_full(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, (char *)buf + got, n - got);
+        if (r < 0) return -1;
+        if (r == 0) break;
+        got += r;
+    }
+    return got;
+}
+
+static int write_full(int fd, const void *buf, size_t n) {
+    size_t put = 0;
+    while (put < n) {
+        ssize_t w = write(fd, (const char *)buf + put, n - put);
+        if (w <= 0) return -1;
+        put += w;
+    }
+    return 0;
+}
+
+/* Reject paths that could escape the destination: absolute paths and any ".."
+   component. Leading "./" and embedded "." components are harmless. Returns 1 if
+   safe, 0 otherwise. */
+static int path_is_safe(const char *p) {
+    if (p[0] == '/') return 0;
+    const char *s = p;
+    while (*s) {
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t len = (size_t)(e - s);
+        if (len == 2 && s[0] == '.' && s[1] == '.') return 0;
+        s = (*e == '/') ? e + 1 : e;
+    }
+    return 1;
+}
+
+/* mkdir -p for every parent directory of `path` (path itself is left alone). */
+static void mkparents(const char *path) {
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", path);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') { *p = 0; mkdir(buf, 0755); *p = '/'; }
+    }
+}
+
+/* Join dest + "/" + name, normalizing the slash. */
 static void joinp(char *out, size_t cap, const char *dest, const char *name) {
-    if (name[0] == '/') name++;
-    snprintf(out, cap, "%s/%s", dest, name);
+    while (name[0] == '/') name++;
+    if (!dest[0] || (dest[0] == '/' && !dest[1]))
+        snprintf(out, cap, "/%s", name);
+    else
+        snprintf(out, cap, "%s/%s", dest, name);
 }
 
-/* mkdir -p for the parent directories of `path`. */
-static void mkparents(char *path) {
-    for (char *p = path + 1; *p; p++) {
-        if (*p == '/') { *p = 0; mkdir(path, 0755); *p = '/'; }
-    }
+/* ---- list / extract ----------------------------------------------------- */
+
+/* Decode the archive name field (prefix + name) into `out`. */
+static void hdr_name(const struct tar_hdr *h, char *out, size_t cap) {
+    if (h->prefix[0]) snprintf(out, cap, "%.155s/%.100s", h->prefix, h->name);
+    else              snprintf(out, cap, "%.100s", h->name);
 }
 
-int main(int argc, char **argv) {
-    if (argc < 3 || (argv[1][0] != 'x' && argv[1][0] != 't')) {
-        fprintf(stderr, "usage: pkg x|t <archive.tar> [destdir]\n");
-        return 2;
-    }
-    int list = (argv[1][0] == 't');
-    const char *dest = (argc > 3) ? argv[3] : "";
-
-    int fd = open(argv[2], O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "pkg: cannot open %s\n", argv[2]); return 1; }
+static int cmd_list(const char *archive) {
+    int fd = open(archive, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "pkg: cannot open %s: %s\n", archive, strerror(errno)); return 1; }
 
     struct tar_hdr h;
-    int zeros = 0, count = 0;
+    int zeros = 0;
     for (;;) {
-        ssize_t r = read(fd, &h, BLK);
-        if (r <= 0) break;
-        if (r < BLK) { fprintf(stderr, "pkg: short read\n"); break; }
+        ssize_t r = read_full(fd, &h, BLK);
+        if (r == 0) break;
+        if (r != BLK) { fprintf(stderr, "pkg: truncated archive\n"); close(fd); return 1; }
         if (h.name[0] == '\0') { if (++zeros >= 2) break; continue; }
         zeros = 0;
 
-        unsigned long size = oct(h.size, 12);
-        char full[512];
-        char name[256];
-        if (h.prefix[0]) snprintf(name, sizeof name, "%.155s/%.100s", h.prefix, h.name);
-        else             snprintf(name, sizeof name, "%.100s", h.name);
-        joinp(full, sizeof full, dest, name);
+        char name[300];
+        hdr_name(&h, name, sizeof name);
+        printf("%s\n", name);
 
-        if (list) {
-            printf("%c %8lu  %s\n", h.typeflag ? h.typeflag : '0', size, name);
-        } else if (h.typeflag == '5') {                 /* directory */
+        /* Skip the data blocks (only regular files carry any). */
+        if (h.typeflag == '0' || h.typeflag == '\0') {
+            unsigned long size = oct(h.size, 12);
+            unsigned long blocks = (size + BLK - 1) / BLK;
+            char skip[BLK];
+            for (unsigned long b = 0; b < blocks; b++)
+                if (read_full(fd, skip, BLK) != BLK) { fprintf(stderr, "pkg: truncated archive\n"); close(fd); return 1; }
+        }
+    }
+    close(fd);
+    return 0;
+}
+
+/* Fail an extraction with a message naming the offending entry. */
+static int extract_fail(int fd, const char *name, const char *why) {
+    fprintf(stderr, "pkg: failed to extract %s: %s\n", name, why);
+    if (fd >= 0) close(fd);
+    return 1;
+}
+
+static int cmd_extract(const char *archive, const char *dest) {
+    int fd = open(archive, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "pkg: cannot open %s: %s\n", archive, strerror(errno)); return 1; }
+
+    char base[256];
+    const char *slash = strrchr(archive, '/');
+    snprintf(base, sizeof base, "%s", slash ? slash + 1 : archive);
+    printf("Extracting %s...\n", base);
+
+    struct tar_hdr h;
+    int zeros = 0;
+    for (;;) {
+        ssize_t r = read_full(fd, &h, BLK);
+        if (r == 0) break;
+        if (r != BLK) { fprintf(stderr, "pkg: truncated archive\n"); close(fd); return 1; }
+        if (h.name[0] == '\0') { if (++zeros >= 2) break; continue; }
+        zeros = 0;
+
+        char name[300];
+        hdr_name(&h, name, sizeof name);
+        if (!path_is_safe(name)) return extract_fail(fd, name, "unsafe path");
+
+        char full[1024];
+        joinp(full, sizeof full, dest, name);
+        unsigned long size = oct(h.size, 12);
+
+        struct stat st;
+        int exists = (lstat(full, &st) == 0);
+
+        if (h.typeflag == '5') {                         /* directory */
             mkparents(full);
-            mkdir(full, 0755);
-        } else if (h.typeflag == '2') {                 /* symlink */
+            if (exists && !S_ISDIR(st.st_mode)) return extract_fail(fd, name, "exists, not a directory");
+            if (!exists && mkdir(full, 0755) < 0 && errno != EEXIST)
+                return extract_fail(fd, name, strerror(errno));
+            printf("Created %s\n", full);
+        } else if (h.typeflag == '2') {                  /* symlink */
             char tgt[101]; snprintf(tgt, sizeof tgt, "%.100s", h.linkname);
             mkparents(full);
-            symlink(tgt, full);
-        } else {                                        /* regular file ('0'/0) */
+            if (exists) {
+                if (!S_ISLNK(st.st_mode)) return extract_fail(fd, name, "exists, not a symlink");
+                unlink(full);
+            }
+            if (symlink(tgt, full) < 0) return extract_fail(fd, name, strerror(errno));
+            printf("Created %s -> %s\n", full, tgt);
+        } else if (h.typeflag == '0' || h.typeflag == '\0') { /* regular file */
             mkparents(full);
+            if (exists && S_ISDIR(st.st_mode)) return extract_fail(fd, name, "exists as a directory");
             int out = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (out < 0) return extract_fail(fd, name, strerror(errno));
             unsigned long remaining = size;
             char buf[BLK];
             while (remaining > 0) {
-                if (read(fd, buf, BLK) != BLK) { remaining = 0; break; }
+                if (read_full(fd, buf, BLK) != BLK) { close(out); return extract_fail(fd, name, "truncated data"); }
                 unsigned long w = remaining < BLK ? remaining : BLK;
-                if (out >= 0) write(out, buf, w);
+                if (write_full(out, buf, w) < 0) { close(out); return extract_fail(fd, name, "write failed"); }
                 remaining -= w;
             }
-            if (out >= 0) close(out);
-            count++;
-            continue;                                   /* data already consumed */
+            close(out);
+            printf("Created %s\n", full);
+            continue;                                    /* data already consumed */
+        } else {
+            return extract_fail(fd, name, "unsupported entry type");
         }
 
-        /* Reached only for list mode or non-regular entries (extract of a
-           regular file consumes its data and `continue`s above). Skip the data
-           blocks so the next read lands on the following header. */
+        /* Skip any trailing data blocks for non-regular entries (normally 0). */
         unsigned long blocks = (size + BLK - 1) / BLK;
-        for (unsigned long b = 0; b < blocks; b++) { char skip[BLK]; if (read(fd, skip, BLK) != BLK) break; }
+        char skip[BLK];
+        for (unsigned long b = 0; b < blocks; b++)
+            if (read_full(fd, skip, BLK) != BLK) break;
     }
     close(fd);
-    if (!list) printf("pkg: extracted %d file(s)\n", count);
+    printf("Package extracted successfully.\n");
     return 0;
+}
+
+/* ---- manifest parsing --------------------------------------------------- */
+
+#define MAXLIST 64
+#define STRMAX  256
+
+struct manifest {
+    char name[STRMAX];
+    char version[STRMAX];
+    char build_cmd[512];
+    char build_workdir[STRMAX];
+    char stage_from[STRMAX];
+    char include[MAXLIST][STRMAX];
+    int  n_include;
+    char extras[MAXLIST][STRMAX];
+    int  n_extras;
+};
+
+static char *trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+    return s;
+}
+
+/* Parse the tiny YAML subset used by package_info.yml. Returns 0 on success. */
+static int parse_manifest(const char *path, struct manifest *m) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "pkg: cannot open manifest %s: %s\n", path, strerror(errno)); return -1; }
+
+    memset(m, 0, sizeof *m);
+    char line[1024];
+    /* section: "", "build", "stage"; sublist: 0 none, 1 include, 2 extras */
+    char section[32] = "";
+    int sublist = 0;
+
+    while (fgets(line, sizeof line, f)) {
+        /* strip comments */
+        char *hash = strchr(line, '#');
+        if (hash) *hash = 0;
+        int indent = 0;
+        while (line[indent] == ' ') indent++;
+        char *body = trim(line);
+        if (!*body) continue;
+
+        if (body[0] == '-') {                            /* list item */
+            char *item = trim(body + 1);
+            if (!*item) continue;
+            if (sublist == 1 && m->n_include < MAXLIST)
+                snprintf(m->include[m->n_include++], STRMAX, "%s", item);
+            else if (sublist == 2 && m->n_extras < MAXLIST)
+                snprintf(m->extras[m->n_extras++], STRMAX, "%s", item);
+            continue;
+        }
+
+        char *colon = strchr(body, ':');
+        if (!colon) continue;
+        *colon = 0;
+        char *key = trim(body);
+        char *val = trim(colon + 1);
+
+        if (indent == 0) {                               /* top-level key */
+            sublist = 0;
+            if (!strcmp(key, "name"))         snprintf(m->name, STRMAX, "%s", val);
+            else if (!strcmp(key, "version")) snprintf(m->version, STRMAX, "%s", val);
+            else if (!strcmp(key, "extras"))  { section[0] = 0; sublist = 2; }
+            else                              snprintf(section, sizeof section, "%s", key);
+        } else {                                         /* nested key */
+            if (!strcmp(section, "build")) {
+                if (!strcmp(key, "command"))      snprintf(m->build_cmd, sizeof m->build_cmd, "%s", val);
+                else if (!strcmp(key, "workdir")) snprintf(m->build_workdir, STRMAX, "%s", val);
+            } else if (!strcmp(section, "stage")) {
+                if (!strcmp(key, "from"))         snprintf(m->stage_from, STRMAX, "%s", val);
+                else if (!strcmp(key, "include")) sublist = 1;
+            }
+        }
+    }
+    fclose(f);
+
+    if (!m->name[0])    { fprintf(stderr, "pkg: manifest missing required key: name\n"); return -1; }
+    if (!m->version[0]) { fprintf(stderr, "pkg: manifest missing required key: version\n"); return -1; }
+    return 0;
+}
+
+/* ---- create ------------------------------------------------------------- */
+
+/* Run the manifest build command inside `cwd`. Tokenizes on whitespace and
+   execs directly (the VibeOS shell has no `-c`). A bare program name is looked
+   up in /bin. Returns 0 on success (or if no command), -1 on failure. */
+static int run_build(const char *cmd, const char *cwd) {
+    if (!cmd || !*cmd) return 0;
+
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", cmd);
+    char *argv[32];
+    int argc = 0;
+    char *p = buf;
+    while (*p && argc < 31) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        argv[argc++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = 0;
+    }
+    argv[argc] = 0;
+    if (argc == 0) return 0;
+
+    char prog[STRMAX];
+    if (strchr(argv[0], '/')) snprintf(prog, sizeof prog, "%s", argv[0]);
+    else                      snprintf(prog, sizeof prog, "/bin/%s", argv[0]);
+
+    pid_t pid = fork();
+    if (pid < 0) { fprintf(stderr, "pkg: fork failed: %s\n", strerror(errno)); return -1; }
+    if (pid == 0) {
+        if (cwd && *cwd && chdir(cwd) < 0) _exit(126);
+        execve(prog, argv, environ);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "pkg: build command failed (status %d)\n", WEXITSTATUS(status));
+        return -1;
+    }
+    return 0;
+}
+
+/* Emit one ustar header block. */
+static int write_header(int out, const char *arcname, char type,
+                        unsigned long size, const char *linkname) {
+    struct tar_hdr h;
+    memset(&h, 0, sizeof h);
+    snprintf(h.name, sizeof h.name, "%s", arcname);
+    putoct(h.mode, 8, type == '5' ? 0755 : 0644);
+    putoct(h.uid, 8, 0);
+    putoct(h.gid, 8, 0);
+    putoct(h.size, 12, type == '0' ? size : 0);
+    putoct(h.mtime, 12, 0);
+    h.typeflag = type;
+    if (linkname) snprintf(h.linkname, sizeof h.linkname, "%s", linkname);
+    memcpy(h.magic, "ustar", 5);
+    h.version[0] = '0'; h.version[1] = '0';
+    snprintf(h.uname, sizeof h.uname, "root");
+    snprintf(h.gname, sizeof h.gname, "root");
+
+    /* checksum: sum of all bytes with the checksum field taken as spaces */
+    memset(h.chksum, ' ', sizeof h.chksum);
+    unsigned long sum = 0;
+    const unsigned char *raw = (const unsigned char *)&h;
+    for (size_t i = 0; i < sizeof h; i++) sum += raw[i];
+    putoct(h.chksum, 7, sum);
+    h.chksum[7] = ' ';
+
+    return write_full(out, &h, BLK);
+}
+
+/* Append a regular file's data, zero-padded to a block boundary. */
+static int write_file_data(int out, const char *src, unsigned long size) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) { fprintf(stderr, "pkg: cannot read %s: %s\n", src, strerror(errno)); return -1; }
+    unsigned long remaining = size;
+    char buf[BLK];
+    int rc = 0;
+    while (remaining > 0) {
+        size_t want = remaining < BLK ? remaining : BLK;
+        ssize_t got = read_full(in, buf, want);
+        if (got != (ssize_t)want) { rc = -1; break; }
+        if (want < BLK) memset(buf + want, 0, BLK - want);
+        if (write_full(out, buf, BLK) < 0) { rc = -1; break; }
+        remaining -= want;
+    }
+    close(in);
+    return rc;
+}
+
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* A small set of archive paths, used to archive each path at most once.
+   Returns 1 if `p` was already present (caller should skip), 0 if newly added. */
+struct strset { char items[3 * MAXLIST + 1][STRMAX]; int n; };
+static int strset_add(struct strset *s, const char *p) {
+    for (int i = 0; i < s->n; i++)
+        if (!strcmp(s->items[i], p)) return 1;
+    if (s->n < (int)(sizeof s->items / sizeof s->items[0]))
+        snprintf(s->items[s->n++], STRMAX, "%s", p);
+    return 0;
+}
+
+/* Recursively archive `src` under archive-relative path `arcname`.
+   `staging` controls the per-file log verb ("Staging" vs "Adding"). */
+static int add_path(int out, const char *src, const char *arcname, int staging) {
+    if (!path_is_safe(arcname)) {
+        fprintf(stderr, "pkg: refusing unsafe archive path %s\n", arcname);
+        return -1;
+    }
+    struct stat st;
+    if (lstat(src, &st) < 0) {
+        fprintf(stderr, "pkg: %s: %s\n", src, strerror(errno));
+        return -1;
+    }
+
+    if (S_ISLNK(st.st_mode)) {
+        char tgt[256];
+        ssize_t n = readlink(src, tgt, sizeof tgt - 1);
+        if (n < 0) { fprintf(stderr, "pkg: readlink %s: %s\n", src, strerror(errno)); return -1; }
+        tgt[n] = 0;
+        printf("%s %s\n", staging ? "Staging" : "Adding", arcname);
+        return write_header(out, arcname, '2', 0, tgt);
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        char dirname[STRMAX + 2];
+        snprintf(dirname, sizeof dirname, "%s/", arcname);
+        if (write_header(out, dirname, '5', 0, NULL) < 0) return -1;
+
+        DIR *d = opendir(src);
+        if (!d) { fprintf(stderr, "pkg: opendir %s: %s\n", src, strerror(errno)); return -1; }
+        static char names[512][STRMAX];   /* file-scope-ish; create is single-threaded */
+        int n = 0;
+        struct dirent *de;
+        while ((de = readdir(d)) && n < (int)(sizeof names / sizeof names[0])) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            snprintf(names[n++], STRMAX, "%s", de->d_name);
+        }
+        closedir(d);
+        char *ptrs[512];
+        for (int i = 0; i < n; i++) ptrs[i] = names[i];
+        qsort(ptrs, n, sizeof ptrs[0], cmp_str);
+
+        for (int i = 0; i < n; i++) {
+            char csrc[1024], carc[1024];
+            snprintf(csrc, sizeof csrc, "%s/%s", src, ptrs[i]);
+            snprintf(carc, sizeof carc, "%s/%s", arcname, ptrs[i]);
+            if (add_path(out, csrc, carc, staging) < 0) return -1;
+        }
+        return 0;
+    }
+
+    if (S_ISREG(st.st_mode)) {
+        printf("%s %s\n", staging ? "Staging" : "Adding", arcname);
+        if (write_header(out, arcname, '0', (unsigned long)st.st_size, NULL) < 0) return -1;
+        return write_file_data(out, src, (unsigned long)st.st_size);
+    }
+
+    fprintf(stderr, "pkg: %s: unsupported file type\n", src);
+    return -1;
+}
+
+static int cmd_create(const char *pkgdir, const char *out_opt,
+                      char cli_inc[][STRMAX], int n_cli_inc) {
+    struct manifest m;
+    char manifest_path[1024];
+    snprintf(manifest_path, sizeof manifest_path, "%s/package_info.yml", pkgdir);
+    if (parse_manifest(manifest_path, &m) < 0) return 1;
+
+    char output[1024];
+    if (out_opt) snprintf(output, sizeof output, "%s", out_opt);
+    else         snprintf(output, sizeof output, "%s-%s.pkg", m.name, m.version);
+
+    printf("Building %s-%s...\n", m.name, m.version);
+
+    /* Run the build command inside <pkgdir>/<workdir> (default <pkgdir>). */
+    char workdir[1024];
+    if (m.build_workdir[0] && strcmp(m.build_workdir, "."))
+        snprintf(workdir, sizeof workdir, "%s/%s", pkgdir, m.build_workdir);
+    else
+        snprintf(workdir, sizeof workdir, "%s", pkgdir);
+    if (run_build(m.build_cmd, workdir) < 0) return 1;
+
+    int out = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) { fprintf(stderr, "pkg: cannot write %s: %s\n", output, strerror(errno)); return 1; }
+
+    /* Track archive paths already written so the same path requested via both
+       the manifest `extras` and a CLI `--include` is archived only once. */
+    static struct strset seen;
+    seen.n = 0;
+
+    /* package_info.yml is always archived first, at the root. */
+    strset_add(&seen, "package_info.yml");
+    if (add_path(out, manifest_path, "package_info.yml", 0) < 0) goto fail;
+
+    /* Staged build outputs, resolved against <pkgdir>/<stage.from>. */
+    for (int i = 0; i < m.n_include; i++) {
+        if (strset_add(&seen, m.include[i])) continue;
+        char src[1024];
+        if (m.stage_from[0]) snprintf(src, sizeof src, "%s/%s/%s", pkgdir, m.stage_from, m.include[i]);
+        else                 snprintf(src, sizeof src, "%s/%s", pkgdir, m.include[i]);
+        if (add_path(out, src, m.include[i], 1) < 0) goto fail;
+    }
+
+    /* Extra files: manifest `extras` plus CLI `--include`, taken straight from
+       the package source directory and kept at their given relative path. */
+    for (int i = 0; i < m.n_extras; i++) {
+        if (strset_add(&seen, m.extras[i])) continue;
+        char src[1024];
+        snprintf(src, sizeof src, "%s/%s", pkgdir, m.extras[i]);
+        if (add_path(out, src, m.extras[i], 0) < 0) goto fail;
+    }
+    for (int i = 0; i < n_cli_inc; i++) {
+        if (strset_add(&seen, cli_inc[i])) continue;
+        char src[1024];
+        snprintf(src, sizeof src, "%s/%s", pkgdir, cli_inc[i]);
+        if (add_path(out, src, cli_inc[i], 0) < 0) goto fail;
+    }
+
+    /* Two zero blocks terminate a ustar archive. */
+    {
+        char zero[BLK];
+        memset(zero, 0, sizeof zero);
+        if (write_full(out, zero, BLK) < 0 || write_full(out, zero, BLK) < 0) goto fail;
+    }
+    close(out);
+    printf("Wrote %s\n", output);
+    return 0;
+
+fail:
+    close(out);
+    unlink(output);
+    return 1;
+}
+
+/* ---- entry point -------------------------------------------------------- */
+
+static int usage(void) {
+    fprintf(stderr,
+        "usage:\n"
+        "  pkg list    <archive.pkg>\n"
+        "  pkg extract <archive.pkg> <destdir>\n"
+        "  pkg create  <pkgdir> [--output <archive.pkg>] [--include <path>]...\n");
+    return 2;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 3) return usage();
+    const char *cmd = argv[1];
+
+    if (!strcmp(cmd, "list")) {
+        if (argc != 3) return usage();
+        return cmd_list(argv[2]);
+    }
+    if (!strcmp(cmd, "extract")) {
+        if (argc != 4) return usage();
+        return cmd_extract(argv[2], argv[3]);
+    }
+    if (!strcmp(cmd, "create")) {
+        const char *pkgdir = argv[2];
+        const char *out_opt = NULL;
+        static char cli_inc[MAXLIST][STRMAX];
+        int n_cli_inc = 0;
+        for (int i = 3; i < argc; i++) {
+            if (!strcmp(argv[i], "--output") && i + 1 < argc) {
+                out_opt = argv[++i];
+            } else if (!strcmp(argv[i], "--include") && i + 1 < argc) {
+                if (n_cli_inc < MAXLIST) snprintf(cli_inc[n_cli_inc++], STRMAX, "%s", argv[++i]);
+            } else {
+                fprintf(stderr, "pkg: unknown argument: %s\n", argv[i]);
+                return usage();
+            }
+        }
+        return cmd_create(pkgdir, out_opt, cli_inc, n_cli_inc);
+    }
+
+    return usage();
 }

@@ -111,6 +111,44 @@ if [ -f user/build/dynhello.elf ] && [ -f "$MUSL_LD" ]; then
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/dynhello.elf /bin/dynhello
 fi
 
+# Prebuilt packages (docs/pkgman.md, v1): build each package source under
+# packages/ with the host-runnable `pkg create` (the static musl pkg.elf runs on
+# the host too) and stage the resulting .pkg archives into /dist/packages so they
+# can be listed/extracted on the running system with `pkg list`/`pkg extract`.
+PKG="$(pwd)/user/build/pkg.elf"
+if [ -x "$PKG" ] && [ -d packages ]; then
+  PKGOUT="$(pwd)/boot/build/packages"
+  rm -rf "$PKGOUT"; mkdir -p "$PKGOUT"
+  "$DISKUTIL" --diskfile "$VDISK" --mkdir /dist
+  "$DISKUTIL" --diskfile "$VDISK" --mkdir /dist/packages
+  for pkgdir in "$(pwd)"/packages/*/; do
+    [ -f "$pkgdir/package_info.yml" ] || continue
+    name=$(basename "$pkgdir")
+    # pkg create writes <name>-<version>.pkg into the current directory.
+    ( cd "$PKGOUT" && "$PKG" create "$pkgdir" ) >/dev/null || \
+      { echo "warning: pkg create failed for $name"; continue; }
+  done
+  for archive in "$PKGOUT"/*.pkg; do
+    [ -f "$archive" ] || continue
+    "$DISKUTIL" --diskfile "$VDISK" --import "$archive" "/dist/packages/$(basename "$archive")"
+  done
+  # Also ship the package *source* trees under /dist/src so `pkg create` can be
+  # exercised on the running system (the serial shell has no redirection to
+  # author a manifest at runtime). Mirror each tree: mkdir dirs, import files.
+  "$DISKUTIL" --diskfile "$VDISK" --mkdir /dist/src
+  for pkgdir in packages/*/; do
+    [ -f "$pkgdir/package_info.yml" ] || continue
+    name=$(basename "$pkgdir")
+    "$DISKUTIL" --diskfile "$VDISK" --mkdir "/dist/src/$name"
+    ( cd "$pkgdir" && find . -mindepth 1 -type d -printf '%P\n' ) | while read -r d; do
+      "$DISKUTIL" --diskfile "$VDISK" --mkdir "/dist/src/$name/$d"
+    done
+    ( cd "$pkgdir" && find . -type f -printf '%P\n' ) | while read -r f; do
+      "$DISKUTIL" --diskfile "$VDISK" --import "$pkgdir$f" "/dist/src/$name/$f"
+    done
+  done
+fi
+
 step "Volume contents"
 "$DISKUTIL" --diskfile "$VDISK" --ls /
 "$DISKUTIL" --diskfile "$VDISK" --ls /bin
