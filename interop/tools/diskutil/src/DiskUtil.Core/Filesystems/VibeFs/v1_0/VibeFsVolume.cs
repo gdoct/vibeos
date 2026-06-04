@@ -370,6 +370,57 @@ public sealed class VibeFsVolume : IDisposable
         FlushBitmaps();
     }
 
+    // Create a symbolic link at `linkPath` pointing at `target`. Mirrors the
+    // kernel's fs_symlink: a symlink is a small file of type Symlink (3) whose
+    // single data block holds the target path bytes (size = byte length, no NUL).
+    public void CreateSymlink(string linkPath, string target)
+    {
+        if (string.IsNullOrEmpty(target))
+        {
+            throw new ArgumentException("Symlink target must not be empty.", nameof(target));
+        }
+
+        EnsureWritable();
+
+        var targetBytes = System.Text.Encoding.UTF8.GetBytes(target);
+        if (targetBytes.Length >= FsBlockSize)
+        {
+            throw new ArgumentException(
+                $"Symlink target is too long ({targetBytes.Length} bytes; max {FsBlockSize - 1}).",
+                nameof(target));
+        }
+
+        var normalizedPath = NormalizeAbsolutePath(linkPath);
+        if (normalizedPath == "/")
+        {
+            throw new InvalidOperationException("Cannot create a symlink at the root path.");
+        }
+
+        if (TryResolvePath(normalizedPath) is not null)
+        {
+            throw new InvalidOperationException($"Path '{normalizedPath}' already exists.");
+        }
+
+        var parent = ResolveParentPath(normalizedPath);
+        if (FindDirectoryEntry(parent.ParentInode, parent.Name) is not null)
+        {
+            throw new InvalidOperationException($"Path '{normalizedPath}' already exists.");
+        }
+
+        var inodeNumber = AllocateInode();
+        var inode = Inode.Create((ushort)VibeFsNodeType.Symlink, 1);
+
+        var blockBuffer = new byte[FsBlockSize];
+        Buffer.BlockCopy(targetBytes, 0, blockBuffer, 0, targetBytes.Length);
+        var diskBlock = MapFileBlock(inode, 0, allocate: true);
+        WriteBlock(diskBlock, blockBuffer);
+
+        inode.Size = (ulong)targetBytes.Length;
+        WriteInode(inodeNumber, inode);
+        AddDirectoryEntry(parent.ParentInodeNumber, parent.ParentInode, parent.Name, inodeNumber, (byte)VibeFsNodeType.Symlink);
+        FlushBitmaps();
+    }
+
     public void Delete(string path)
     {
         EnsureWritable();
@@ -1213,6 +1264,7 @@ public sealed class VibeFsVolume : IDisposable
         {
             1 => VibeFsNodeType.File,
             2 => VibeFsNodeType.Directory,
+            3 => VibeFsNodeType.Symlink,
             _ => VibeFsNodeType.Unknown
         };
     }

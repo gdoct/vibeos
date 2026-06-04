@@ -50,7 +50,10 @@ if [ -f user/build/sinit.elf ]; then
 else
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/init.elf  /bin/init
 fi
-"$DISKUTIL" --diskfile "$VDISK" --import user/build/sh.elf    /bin/sh
+# /bin/vsh is the freestanding "vibe shell" (user/vsh.c), the gap-filler shell.
+# init execs /bin/sh; that name is wired to the real shell (mksh) further down,
+# after the package build — if the mksh package isn't built it falls back to vsh.
+"$DISKUTIL" --diskfile "$VDISK" --import user/build/vsh.elf   /bin/vsh
 "$DISKUTIL" --diskfile "$VDISK" --import user/build/hello.elf /bin/hello
 [ -f user/build/truntest.elf ] && \
   "$DISKUTIL" --diskfile "$VDISK" --import user/build/truntest.elf /bin/truntest
@@ -147,6 +150,31 @@ if [ -x "$PKG" ] && [ -d packages ]; then
       "$DISKUTIL" --diskfile "$VDISK" --import "$pkgdir$f" "/dist/src/$name/$f"
     done
   done
+fi
+
+# Default shell wiring (docs/pkgman.md, packages/mksh). init execs /bin/sh.
+# Prefer mksh when its package built: extract the binary from the .pkg (ustar)
+# and symlink /bin/sh -> /bin/mksh. Otherwise fall back to the gap-filler
+# /bin/vsh so the system still boots. (Mirrors the sinit/init fallback above.)
+step "Wire default shell (/bin/sh)"
+MKSH_PKG=""
+for cand in "${PKGOUT:-/nonexistent}"/mksh-*.pkg; do
+  [ -f "$cand" ] && MKSH_PKG="$cand"
+done
+if [ -n "$MKSH_PKG" ]; then
+  MKSH_TMP="$(mktemp -d)"
+  if tar -xf "$MKSH_PKG" -C "$MKSH_TMP" bin/mksh 2>/dev/null && [ -f "$MKSH_TMP/bin/mksh" ]; then
+    "$DISKUTIL" --diskfile "$VDISK" --import "$MKSH_TMP/bin/mksh" /bin/mksh
+    "$DISKUTIL" --diskfile "$VDISK" --symlink /bin/mksh /bin/sh
+    echo "default shell: /bin/sh -> /bin/mksh ($(basename "$MKSH_PKG"))"
+  else
+    echo "warning: $MKSH_PKG has no bin/mksh; falling back to /bin/vsh"
+    "$DISKUTIL" --diskfile "$VDISK" --import user/build/vsh.elf /bin/sh
+  fi
+  rm -rf "$MKSH_TMP"
+else
+  "$DISKUTIL" --diskfile "$VDISK" --import user/build/vsh.elf /bin/sh
+  echo "default shell: /bin/sh = /bin/vsh (mksh package not built)"
 fi
 
 step "Volume contents"

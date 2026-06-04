@@ -1,0 +1,12 @@
+# doom — scaffold for a future DoomGeneric port.
+# seealso: https://github.com/ozkl/doomgeneric
+# This starts as a documentation-only package so the package directory exists
+# and `pkg create packages/doom` succeeds immediately. Replace the staged doc
+# payload with a real build once the DoomGeneric source and VibeOS patches are
+# added under this package tree.
+name: doom
+version: 0.0.0
+stage:
+  from: stage
+  include:
+    - share/doc/doom/README

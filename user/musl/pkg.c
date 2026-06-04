@@ -103,6 +103,42 @@ static int path_is_safe(const char *p) {
     return 1;
 }
 
+static int path_is_current_dir(const char *p) {
+    return !strcmp(p, ".") || !strcmp(p, "./");
+}
+
+static int path_join_checked(char *out, size_t cap, const char *base, const char *rel) {
+    if (!rel[0] || path_is_current_dir(rel)) {
+        size_t blen = strlen(base);
+        if (blen + 1 > cap) {
+            fprintf(stderr, "pkg: path too long\n");
+            return -1;
+        }
+        memcpy(out, base, blen + 1);
+        return 0;
+    }
+    if (!path_is_safe(rel)) {
+        fprintf(stderr, "pkg: refusing unsafe relative path %s\n", rel);
+        return -1;
+    }
+    size_t blen = strlen(base);
+    size_t rlen = strlen(rel);
+    if (blen + 1 + rlen + 1 > cap) {
+        fprintf(stderr, "pkg: path too long\n");
+        return -1;
+    }
+    memcpy(out, base, blen);
+    out[blen] = '/';
+    memcpy(out + blen + 1, rel, rlen + 1);
+    return 0;
+}
+
+static int path_join3_checked(char *out, size_t cap, const char *a, const char *b, const char *c) {
+    char tmp[1024];
+    if (path_join_checked(tmp, sizeof tmp, a, b) < 0) return -1;
+    return path_join_checked(out, cap, tmp, c);
+}
+
 /* mkdir -p for every parent directory of `path` (path itself is left alone). */
 static void mkparents(const char *path) {
     char buf[1024];
@@ -119,6 +155,115 @@ static void joinp(char *out, size_t cap, const char *dest, const char *name) {
         snprintf(out, cap, "/%s", name);
     else
         snprintf(out, cap, "%s/%s", dest, name);
+}
+
+static int ensure_parent_dirs(const char *path, char *why, size_t why_cap) {
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", path);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        struct stat st;
+        if (lstat(buf, &st) == 0) {
+            if (!S_ISDIR(st.st_mode)) {
+                snprintf(why, why_cap, "parent is not a directory");
+                return -1;
+            }
+        } else if (errno == ENOENT) {
+            if (mkdir(buf, 0755) < 0) {
+                snprintf(why, why_cap, "%s", strerror(errno));
+                return -1;
+            }
+        } else {
+            snprintf(why, why_cap, "%s", strerror(errno));
+            return -1;
+        }
+        *p = '/';
+    }
+    return 0;
+}
+
+static int make_tempdir(char *out, size_t cap) {
+    const char *base = ".pkgwork";
+    for (int i = 0; i < 1000; i++) {
+        snprintf(out, cap, "%s-%ld-%d", base, (long)getpid(), i);
+        if (mkdir(out, 0700) == 0) return 0;
+        if (errno != EEXIST) break;
+    }
+    fprintf(stderr, "pkg: cannot create temporary directory: %s\n", strerror(errno));
+    return -1;
+}
+
+static int copy_file(const char *src, const char *dst, mode_t mode) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) return -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode & 0777 ? mode & 0777 : 0644);
+    if (out < 0) { close(in); return -1; }
+    char buf[4096];
+    int rc = 0;
+    for (;;) {
+        ssize_t got = read(in, buf, sizeof buf);
+        if (got < 0) { rc = -1; break; }
+        if (got == 0) break;
+        if (write_full(out, buf, (size_t)got) < 0) { rc = -1; break; }
+    }
+    close(in);
+    close(out);
+    return rc;
+}
+
+static int copy_tree(const char *src, const char *dst) {
+    struct stat st;
+    if (lstat(src, &st) < 0) return -1;
+
+    if (S_ISLNK(st.st_mode)) {
+        char tgt[512];
+        ssize_t n = readlink(src, tgt, sizeof tgt - 1);
+        if (n < 0) return -1;
+        tgt[n] = 0;
+        return symlink(tgt, dst);
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if (mkdir(dst, st.st_mode & 0777 ? st.st_mode & 0777 : 0755) < 0 && errno != EEXIST)
+            return -1;
+        DIR *d = opendir(src);
+        if (!d) return -1;
+        int rc = 0;
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char csrc[1024], cdst[1024];
+            snprintf(csrc, sizeof csrc, "%s/%s", src, de->d_name);
+            snprintf(cdst, sizeof cdst, "%s/%s", dst, de->d_name);
+            if (copy_tree(csrc, cdst) < 0) { rc = -1; break; }
+        }
+        closedir(d);
+        return rc;
+    }
+    if (S_ISREG(st.st_mode)) return copy_file(src, dst, st.st_mode);
+    errno = EINVAL;
+    return -1;
+}
+
+static int remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) < 0) return -1;
+    if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (!d) return -1;
+        int rc = 0;
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char child[1024];
+            snprintf(child, sizeof child, "%s/%s", path, de->d_name);
+            if (remove_tree(child) < 0) rc = -1;
+        }
+        closedir(d);
+        if (rmdir(path) < 0) rc = -1;
+        return rc;
+    }
+    return unlink(path);
 }
 
 /* ---- list / extract ----------------------------------------------------- */
@@ -191,19 +336,20 @@ static int cmd_extract(const char *archive, const char *dest) {
         char full[1024];
         joinp(full, sizeof full, dest, name);
         unsigned long size = oct(h.size, 12);
+        char why[256];
+        if (ensure_parent_dirs(full, why, sizeof why) < 0)
+            return extract_fail(fd, name, why);
 
         struct stat st;
         int exists = (lstat(full, &st) == 0);
 
         if (h.typeflag == '5') {                         /* directory */
-            mkparents(full);
             if (exists && !S_ISDIR(st.st_mode)) return extract_fail(fd, name, "exists, not a directory");
             if (!exists && mkdir(full, 0755) < 0 && errno != EEXIST)
                 return extract_fail(fd, name, strerror(errno));
             printf("Created %s\n", full);
         } else if (h.typeflag == '2') {                  /* symlink */
             char tgt[101]; snprintf(tgt, sizeof tgt, "%.100s", h.linkname);
-            mkparents(full);
             if (exists) {
                 if (!S_ISLNK(st.st_mode)) return extract_fail(fd, name, "exists, not a symlink");
                 unlink(full);
@@ -211,8 +357,8 @@ static int cmd_extract(const char *archive, const char *dest) {
             if (symlink(tgt, full) < 0) return extract_fail(fd, name, strerror(errno));
             printf("Created %s -> %s\n", full, tgt);
         } else if (h.typeflag == '0' || h.typeflag == '\0') { /* regular file */
-            mkparents(full);
             if (exists && S_ISDIR(st.st_mode)) return extract_fail(fd, name, "exists as a directory");
+            if (exists && S_ISLNK(st.st_mode)) return extract_fail(fd, name, "exists as a symlink");
             int out = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (out < 0) return extract_fail(fd, name, strerror(errno));
             unsigned long remaining = size;
@@ -367,12 +513,41 @@ static int run_build(const char *cmd, const char *cwd) {
     return 0;
 }
 
+static int split_tar_name(const char *arcname, char *prefix, size_t prefix_cap,
+                          char *name, size_t name_cap) {
+    size_t len = strlen(arcname);
+    if (len < name_cap) {
+        snprintf(name, name_cap, "%s", arcname);
+        prefix[0] = 0;
+        return 0;
+    }
+
+    const char *slash = arcname + len;
+    while (slash > arcname) {
+        while (slash > arcname && slash[-1] != '/') slash--;
+        if (slash == arcname) break;
+        size_t plen = (size_t)((slash - 1) - arcname);
+        size_t nlen = len - (size_t)(slash - arcname);
+        if (plen < prefix_cap && nlen < name_cap) {
+            memcpy(prefix, arcname, plen);
+            prefix[plen] = 0;
+            snprintf(name, name_cap, "%s", slash);
+            return 0;
+        }
+        slash--;
+    }
+
+    fprintf(stderr, "pkg: archive path too long for ustar: %s\n", arcname);
+    return -1;
+}
+
 /* Emit one ustar header block. */
 static int write_header(int out, const char *arcname, char type,
                         unsigned long size, const char *linkname) {
     struct tar_hdr h;
     memset(&h, 0, sizeof h);
-    snprintf(h.name, sizeof h.name, "%s", arcname);
+    if (split_tar_name(arcname, h.prefix, sizeof h.prefix, h.name, sizeof h.name) < 0)
+        return -1;
     putoct(h.mode, 8, type == '5' ? 0755 : 0644);
     putoct(h.uid, 8, 0);
     putoct(h.gid, 8, 0);
@@ -497,22 +672,75 @@ static int cmd_create(const char *pkgdir, const char *out_opt,
     snprintf(manifest_path, sizeof manifest_path, "%s/package_info.yml", pkgdir);
     if (parse_manifest(manifest_path, &m) < 0) return 1;
 
+    if (m.build_workdir[0] && !path_is_current_dir(m.build_workdir) && !path_is_safe(m.build_workdir)) {
+        fprintf(stderr, "pkg: manifest build.workdir is unsafe\n");
+        return 1;
+    }
+    if (m.stage_from[0] && !path_is_safe(m.stage_from)) {
+        fprintf(stderr, "pkg: manifest stage.from is unsafe\n");
+        return 1;
+    }
+    for (int i = 0; i < m.n_include; i++) {
+        if (!path_is_safe(m.include[i])) {
+            fprintf(stderr, "pkg: manifest stage.include path is unsafe: %s\n", m.include[i]);
+            return 1;
+        }
+    }
+    for (int i = 0; i < m.n_extras; i++) {
+        if (!path_is_safe(m.extras[i])) {
+            fprintf(stderr, "pkg: manifest extras path is unsafe: %s\n", m.extras[i]);
+            return 1;
+        }
+    }
+    for (int i = 0; i < n_cli_inc; i++) {
+        if (!path_is_safe(cli_inc[i])) {
+            fprintf(stderr, "pkg: include path is unsafe: %s\n", cli_inc[i]);
+            return 1;
+        }
+    }
+
     char output[1024];
     if (out_opt) snprintf(output, sizeof output, "%s", out_opt);
     else         snprintf(output, sizeof output, "%s-%s.pkg", m.name, m.version);
 
     printf("Building %s-%s...\n", m.name, m.version);
 
-    /* Run the build command inside <pkgdir>/<workdir> (default <pkgdir>). */
+    char tempdir[1024];
+    char workroot[1024];
+    if (make_tempdir(tempdir, sizeof tempdir) < 0) return 1;
+    if (path_join_checked(workroot, sizeof workroot, tempdir, "src") < 0) {
+        remove_tree(tempdir);
+        return 1;
+    }
+    if (copy_tree(pkgdir, workroot) < 0) {
+        fprintf(stderr, "pkg: failed to copy package source tree: %s\n", strerror(errno));
+        remove_tree(tempdir);
+        return 1;
+    }
+
+    if (path_join_checked(manifest_path, sizeof manifest_path, workroot, "package_info.yml") < 0) {
+        remove_tree(tempdir);
+        return 1;
+    }
+
+    /* Run the build command inside the copied work tree. */
     char workdir[1024];
-    if (m.build_workdir[0] && strcmp(m.build_workdir, "."))
-        snprintf(workdir, sizeof workdir, "%s/%s", pkgdir, m.build_workdir);
-    else
-        snprintf(workdir, sizeof workdir, "%s", pkgdir);
-    if (run_build(m.build_cmd, workdir) < 0) return 1;
+    if (path_join_checked(workdir, sizeof workdir, workroot,
+                          (m.build_workdir[0] && !path_is_current_dir(m.build_workdir)) ? m.build_workdir : "") < 0) {
+        remove_tree(tempdir);
+        return 1;
+    }
+    if (run_build(m.build_cmd, workdir) < 0) {
+        remove_tree(tempdir);
+        return 1;
+    }
 
     int out = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out < 0) { fprintf(stderr, "pkg: cannot write %s: %s\n", output, strerror(errno)); return 1; }
+    if (out < 0) {
+        fprintf(stderr, "pkg: cannot write %s: %s\n", output, strerror(errno));
+        remove_tree(tempdir);
+        return 1;
+    }
 
     /* Track archive paths already written so the same path requested via both
        the manifest `extras` and a CLI `--include` is archived only once. */
@@ -527,8 +755,11 @@ static int cmd_create(const char *pkgdir, const char *out_opt,
     for (int i = 0; i < m.n_include; i++) {
         if (strset_add(&seen, m.include[i])) continue;
         char src[1024];
-        if (m.stage_from[0]) snprintf(src, sizeof src, "%s/%s/%s", pkgdir, m.stage_from, m.include[i]);
-        else                 snprintf(src, sizeof src, "%s/%s", pkgdir, m.include[i]);
+        if (m.stage_from[0]) {
+            if (path_join3_checked(src, sizeof src, workroot, m.stage_from, m.include[i]) < 0) goto fail;
+        } else {
+            if (path_join_checked(src, sizeof src, workroot, m.include[i]) < 0) goto fail;
+        }
         if (add_path(out, src, m.include[i], 1) < 0) goto fail;
     }
 
@@ -537,13 +768,13 @@ static int cmd_create(const char *pkgdir, const char *out_opt,
     for (int i = 0; i < m.n_extras; i++) {
         if (strset_add(&seen, m.extras[i])) continue;
         char src[1024];
-        snprintf(src, sizeof src, "%s/%s", pkgdir, m.extras[i]);
+        if (path_join_checked(src, sizeof src, workroot, m.extras[i]) < 0) goto fail;
         if (add_path(out, src, m.extras[i], 0) < 0) goto fail;
     }
     for (int i = 0; i < n_cli_inc; i++) {
         if (strset_add(&seen, cli_inc[i])) continue;
         char src[1024];
-        snprintf(src, sizeof src, "%s/%s", pkgdir, cli_inc[i]);
+        if (path_join_checked(src, sizeof src, workroot, cli_inc[i]) < 0) goto fail;
         if (add_path(out, src, cli_inc[i], 0) < 0) goto fail;
     }
 
@@ -554,12 +785,14 @@ static int cmd_create(const char *pkgdir, const char *out_opt,
         if (write_full(out, zero, BLK) < 0 || write_full(out, zero, BLK) < 0) goto fail;
     }
     close(out);
+    remove_tree(tempdir);
     printf("Wrote %s\n", output);
     return 0;
 
 fail:
     close(out);
     unlink(output);
+    remove_tree(tempdir);
     return 1;
 }
 

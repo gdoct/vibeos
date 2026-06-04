@@ -1,0 +1,25 @@
+# mksh — the MirBSD Korn Shell, ported as the default VibeOS shell.
+#
+# This is a `pkg create` build manifest (docs/pkgman.md, v1). `pkg create
+# packages/mksh` copies this directory into a work area, runs the build command
+# in `build.workdir`, then archives `package_info.yml` plus the staged outputs
+# listed under `stage.include` (resolved against `stage.from`) into
+# mksh-<version>.pkg.
+#
+# The build is driven by src/Makefile (the build command is `make`, run in src/):
+# it extracts the vendored mksh source tarball, cross-compiles it static with the
+# x86_64-linux-musl toolchain (musl-gcc), strips it, and installs the binary to
+# src/build/out/bin/mksh — which stage.include then archives as bin/mksh.
+#
+# build.sh extracts that binary, installs it as /bin/mksh, and symlinks
+# /bin/sh -> /bin/mksh, making mksh the default shell (init execs /bin/sh). The
+# previous freestanding shell remains available at /bin/vsh as a fallback.
+name: mksh
+version: R59c
+build:
+  command: make
+  workdir: src
+stage:
+  from: src/build/out
+  include:
+    - bin/mksh

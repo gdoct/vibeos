@@ -14,7 +14,7 @@ static int Run(string[] args)
     {
         if (!TryGetCommandArgs(args, out var command, out var commandArgs))
         {
-            throw new ArgumentException("Specify exactly one command: --import|-i, --export|-e, --ls, --format, --mkdir, or --create-volume.");
+            throw new ArgumentException("Specify exactly one command: --import|-i, --export|-e, --ls, --format, --mkdir, --symlink, or --create-volume.");
         }
 
         if (command == "create-volume")
@@ -87,6 +87,15 @@ static int Run(string[] args)
                 CreateDirectory(diskFile, commandArgs[0]);
                 return 0;
 
+            case "symlink":
+                if (commandArgs.Count != 2)
+                {
+                    throw new ArgumentException("Symlink expects: --symlink <target> <vibefs-linkpath>");
+                }
+
+                CreateSymlink(diskFile, commandArgs[0], commandArgs[1]);
+                return 0;
+
             default:
                 throw new ArgumentException($"Unsupported command '{command}'.");
         }
@@ -114,6 +123,7 @@ static bool TryGetCommandArgs(string[] args, out string command, out List<string
     AddIfPresent(args, commandFlags, "format", "--format");
     AddIfPresent(args, commandFlags, "mkdir", "--mkdir");
     AddIfPresent(args, commandFlags, "mkdir", "-m");
+    AddIfPresent(args, commandFlags, "symlink", "--symlink");
     AddIfPresent(args, commandFlags, "create-volume", "--create-volume");
 
     if (commandFlags.Count == 0)
@@ -217,7 +227,12 @@ static void ListPath(string diskFile, string vibeFsPath)
 
     foreach (var entry in entries)
     {
-        var type = entry.Type == VibeFsNodeType.Directory ? "dir " : "file";
+        var type = entry.Type switch
+        {
+            VibeFsNodeType.Directory => "dir ",
+            VibeFsNodeType.Symlink => "link",
+            _ => "file"
+        };
         Console.WriteLine($"{type}  {entry.Size,10}  {entry.FullPath}");
     }
 }
@@ -234,6 +249,13 @@ static void CreateDirectory(string diskFile, string vibeFsPath)
     using var volume = VibeFsVolume.OpenReadWrite(diskFile);
     volume.CreateDirectory(vibeFsPath);
     Console.WriteLine($"Created directory '{vibeFsPath}'.");
+}
+
+static void CreateSymlink(string diskFile, string target, string linkPath)
+{
+    using var volume = VibeFsVolume.OpenReadWrite(diskFile);
+    volume.CreateSymlink(linkPath, target);
+    Console.WriteLine($"Created symlink '{linkPath}' -> '{target}'.");
 }
 
 static void CreateVolume(string sizeArg, string outputFile)
@@ -300,6 +322,7 @@ static void PrintUsage()
     Console.WriteLine("  disktool-cli --diskfile <diskfile> --ls [vibefs-path]");
     Console.WriteLine("  disktool-cli --diskfile <diskfile> --format <total-blocks>");
     Console.WriteLine("  disktool-cli --diskfile <diskfile> --mkdir|-m <vibefs-path>");
+    Console.WriteLine("  disktool-cli --diskfile <diskfile> --symlink <target> <vibefs-linkpath>");
     Console.WriteLine();
     Console.WriteLine("Size examples for --create-volume: 65536, 64K, 128M, 1G");
 }

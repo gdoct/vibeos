@@ -1,0 +1,18 @@
+doom package scaffold
+
+This package directory is reserved for a VibeOS port of ozkl/doomgeneric.
+
+Current state:
+- no source tree is bundled yet
+- no build command is defined yet
+- this placeholder package exists so `pkg create packages/doom` works now
+
+Planned output:
+- a packaged DoomGeneric binary adapted to VibeOS
+- any support assets needed by the port, if they are distributable
+
+To continue the port:
+1. add the upstream source under `packages/doom/src`
+2. add VibeOS-specific changes under `packages/doom/patches`
+3. update `packages/doom/package_info.yml` with a `build` section
+4. stage the built binary under `build/out` or another chosen staging path

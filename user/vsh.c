@@ -1,5 +1,9 @@
 /*
- * /bin/sh — a tiny interactive shell for VibeOS (ROADMAP §3 B.4).
+ * /bin/vsh — the "vibe shell", a tiny interactive shell for VibeOS (ROADMAP §3 B.4).
+ *
+ * This is the gap-filler shell: it stands in as the default until a real shell
+ * (mksh, see packages/mksh) is ported, after which /bin/sh is symlinked to
+ * /bin/mksh and vsh remains available at /bin/vsh as a freestanding fallback.
  *
  * Reads a line from the serial console (read(0), backed by the kernel TTY),
  * splits it into words, and runs the command by fork + execve + wait4. A bare

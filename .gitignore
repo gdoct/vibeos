@@ -39,7 +39,8 @@
 *.layout
 *.cbp
 *.workspace
-
+*.tgz
+*.pkg
 build/
 bin/
 dist/

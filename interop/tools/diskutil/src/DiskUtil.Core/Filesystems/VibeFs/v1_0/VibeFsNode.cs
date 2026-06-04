@@ -4,7 +4,8 @@ public enum VibeFsNodeType
 {
     Unknown = 0,
     File = 1,
-    Directory = 2
+    Directory = 2,
+    Symlink = 3
 }
 
 public sealed record VibeFsNode(
