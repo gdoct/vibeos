@@ -231,7 +231,7 @@ static int deliver(task_t *t, mctx_t *m) {
         switch (default_disp(sig)) {              /* SIG_DFL */
         case DFL_IGN:  continue;
         case DFL_CONT: continue;
-        case DFL_STOP: task_stop_current(); continue;   /* resumes on SIGCONT */
+        case DFL_STOP: task_stop_current(sig); continue;   /* resumes on SIGCONT */
         case DFL_TERM:
         case DFL_CORE: task_exit_signal(sig);     /* does not return */
         }

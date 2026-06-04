@@ -132,7 +132,19 @@ extern "C" void sched_unlock(void) {
     pop_off();
 }
 
-task_t *task_current(void) { return g_cpu_cur[smp_cpu_index()]; }
+/* The running task on the calling CPU. The (read cpu index → index g_cpu_cur)
+   pair must be preemption-safe: a syscall runs with interrupts on, so a timer
+   tick can preempt and *work-steal* the task onto another CPU between the two
+   steps — leaving us indexing the old CPU's now-idle (NULL) slot and faulting on
+   the next deref. push_off/pop_off disable interrupts across the pair (and nest
+   correctly when sched_lock is already held, or in IRQ context). The returned
+   task struct is stable across later migration, so callers can hold it freely. */
+task_t *task_current(void) {
+    push_off();
+    task_t *t = g_cpu_cur[smp_cpu_index()];
+    pop_off();
+    return t;
+}
 int     sched_active(void) { return g_started; }
 
 void sched_init(void) {
@@ -598,26 +610,48 @@ void task_signal_wake(task_t *t) {
     sched_unlock();
 }
 
-/* Job-control stop: park the current task until task_cont. */
-void task_stop_current(void) {
+/* Notify a stopped/continued task's parent so a waitpid(WUNTRACED|WCONTINUED)
+   wakes and a SIGCHLD handler runs. Called without sched_lock held (signals_raise
+   + wait_queue_wake_all take it themselves). */
+static void notify_parent_jobctl(task_t *t) {
+    task_t *p = t->parent;
+    if (!p) return;
+    signals_raise(p, SIGCHLD);           /* default-ignored is fine; a handler runs */
+    wait_queue_wake_all(&p->child_wq);   /* wake a waitpid'er regardless of SIGCHLD */
+}
+
+/* Job-control stop: record the event for the parent's waitpid, notify the parent,
+   then park the current task until task_cont. */
+void task_stop_current(int sig) {
+    task_t *t = task_current();
+    t->stop_sig    = sig;
+    t->stop_change = 1;                  /* a stop awaiting report */
+    notify_parent_jobctl(t);             /* before we block, so it can't be missed */
+
     sched_lock();
-    task_t *t = g_cpu_cur[smp_cpu_index()];
     t->stopped = 1;
     t->state = TASK_BLOCKED;
-    sched();                          /* resumes here once continued */
+    sched();                             /* resumes here once continued */
     sched_unlock();
 }
 
 void task_cont(task_t *t) {
     sched_lock();
+    int was_stopped = t->stopped;
     if (t->stopped) {
         t->stopped = 0;
         if (t->state == TASK_BLOCKED) enqueue_ready(t);
     }
     sched_unlock();
+    if (was_stopped) {
+        t->stop_change = 2;              /* a continue awaiting report (WCONTINUED) */
+        notify_parent_jobctl(t);
+    }
 }
 
-int task_wait(int *status, int nohang, int wpid) {
+/* options: WNOHANG(1) | WUNTRACED(2) | WCONTINUED(8). */
+int task_wait(int *status, int options, int wpid) {
+    int nohang = options & 1;
     sched_lock();
     task_t *p = g_cpu_cur[smp_cpu_index()];
     for (;;) {
@@ -638,6 +672,21 @@ int task_wait(int *status, int nohang, int wpid) {
                 if (vm) vmspace_destroy(vm);   /* zombie won't run again */
                 if (status) *status = wstatus;
                 return pid;
+            }
+            /* Job-control state changes (reported once each). WIFSTOPPED status is
+               (sig<<8)|0x7f; WIFCONTINUED is 0xffff. */
+            if (c->stop_change == 1 && (options & 2)) {     /* WUNTRACED */
+                c->stop_change = 0;
+                int wstatus = ((c->stop_sig & 0xff) << 8) | 0x7f;
+                sched_unlock();
+                if (status) *status = wstatus;
+                return c->id;
+            }
+            if (c->stop_change == 2 && (options & 8)) {     /* WCONTINUED */
+                c->stop_change = 0;
+                sched_unlock();
+                if (status) *status = 0xffff;
+                return c->id;
             }
             if (c->state != TASK_DEAD && c->state != TASK_NONE) have_child = 1;
         }

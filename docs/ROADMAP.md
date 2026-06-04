@@ -285,11 +285,16 @@ milestone is mostly about closing specific syscall/ABI gaps, not new subsystems.
   (`tcgetpgrp`/`tcsetpgrp`), `TIOCGSID`, `TIOCSCTTY`/`TIOCNOTTY`. **Sessions +
   process groups** live on `task_t` (`pgid`/`sid`, inherited across fork/clone)
   with `setpgid`/`getpgid`/`getpgrp`/`setsid`/`getsid` (109/121/111/112/124);
-  `kill(-pgrp)`/`kill(0)` target groups; a background read raises `SIGTTIN`.
-  `isatty` works (a pipe/file is `-ENOTTY`). `/bin/ttytest` exercises the whole
-  surface (23 checks + a Ctrl-C→SIGINT round-trip) on QEMU. **Still missing:**
-  PTYs (`/dev/ptmx`/pts) — needed for a terminal multiplexer / OpenSSH, not for
-  bash over the serial console.
+  `kill(-pgrp)`/`kill(0)` target groups; a background read raises `SIGTTIN` and a
+  background terminal mutation (`tcsetpgrp`/`tcsetattr`/winsize) raises `SIGTTOU`.
+  The **^Z/stop/cont cycle** a shell needs is wired end-to-end: a stop notifies
+  the parent (SIGCHLD + `child_wq` wake) and `wait4` reports `WIFSTOPPED` under
+  `WUNTRACED` / `WIFCONTINUED` under `WCONTINUED`; SIGCONT resumes. `isatty`
+  works (a pipe/file is `-ENOTTY`). `/bin/ttytest` exercises the whole surface on
+  QEMU — 23 termios/job-control checks, a Ctrl-C→SIGINT round-trip, the
+  stop/cont cycle, and a background-SIGTTOU case. **Still missing:** PTYs
+  (`/dev/ptmx`/pts) — needed for a terminal multiplexer / OpenSSH, not for bash
+  over the serial console.
 - **More multiplexing** — *mostly done.* `select`/`pselect6` (23/270),
   `ppoll` (271), `eventfd`/`eventfd2` (284/290), `timerfd_create`/`settime`/
   `gettime` (283/286/287) are wired up, and `poll` was rebuilt over a unified
