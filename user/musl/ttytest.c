@@ -24,7 +24,44 @@ static void check(const char *what, int ok) {
     if (ok) passes++; else fails++;
 }
 
-int main(void) {
+/* Saved at start so the SIGINT handler can hand the terminal back before exit. */
+static pid_t g_orig_fg;
+
+static void on_sigint(int sig) {
+    (void)sig;
+    write(1, "GOT_SIGINT\n", 11);          /* async-signal-safe */
+    if (g_orig_fg > 0) tcsetpgrp(0, g_orig_fg);
+    _exit(0);
+}
+
+/* `ttytest sigint`: become the foreground group, then block reading the tty. A
+   ^C (VINTR) typed at the console must be turned into SIGINT and delivered to us
+   (the foreground process group) by the line discipline — exercising signal
+   delivery from IRQ context to a process group. The driver feeds a 0x03 byte. */
+static int run_sigint(void) {
+    g_orig_fg = tcgetpgrp(0);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigint;             /* no SA_RESTART: read() will see EINTR */
+    sigaction(SIGINT, &sa, NULL);
+
+    setpgid(0, 0);                         /* own process group */
+    tcsetpgrp(0, getpid());                /* claim the terminal foreground */
+
+    write(1, "WAIT_SIGINT\n", 12);
+    for (;;) {                             /* ^C fires on_sigint -> _exit */
+        char c;
+        ssize_t r = read(0, &c, 1);
+        if (r < 0) continue;               /* EINTR: loop (handler exits on ^C) */
+        if (r == 0) break;                 /* EOF */
+    }
+    if (g_orig_fg > 0) tcsetpgrp(0, g_orig_fg);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "sigint") == 0) return run_sigint();
+
     printf("ttytest: interactive-I/O ABI\n");
 
     /* --- isatty: console fds are terminals, a pipe is not --- */
