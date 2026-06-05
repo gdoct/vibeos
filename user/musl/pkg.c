@@ -336,6 +336,7 @@ static int cmd_extract(const char *archive, const char *dest) {
         char full[1024];
         joinp(full, sizeof full, dest, name);
         unsigned long size = oct(h.size, 12);
+        unsigned long mode = oct(h.mode, 8) & 0777;
         char why[256];
         if (ensure_parent_dirs(full, why, sizeof why) < 0)
             return extract_fail(fd, name, why);
@@ -345,8 +346,9 @@ static int cmd_extract(const char *archive, const char *dest) {
 
         if (h.typeflag == '5') {                         /* directory */
             if (exists && !S_ISDIR(st.st_mode)) return extract_fail(fd, name, "exists, not a directory");
-            if (!exists && mkdir(full, 0755) < 0 && errno != EEXIST)
+            if (!exists && mkdir(full, mode ? (mode_t)mode : 0755) < 0 && errno != EEXIST)
                 return extract_fail(fd, name, strerror(errno));
+            if (mode) chmod(full, (mode_t)mode);
             printf("Created %s\n", full);
         } else if (h.typeflag == '2') {                  /* symlink */
             char tgt[101]; snprintf(tgt, sizeof tgt, "%.100s", h.linkname);
@@ -359,7 +361,7 @@ static int cmd_extract(const char *archive, const char *dest) {
         } else if (h.typeflag == '0' || h.typeflag == '\0') { /* regular file */
             if (exists && S_ISDIR(st.st_mode)) return extract_fail(fd, name, "exists as a directory");
             if (exists && S_ISLNK(st.st_mode)) return extract_fail(fd, name, "exists as a symlink");
-            int out = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int out = open(full, O_WRONLY | O_CREAT | O_TRUNC, mode ? (mode_t)mode : 0644);
             if (out < 0) return extract_fail(fd, name, strerror(errno));
             unsigned long remaining = size;
             char buf[BLK];
@@ -370,6 +372,7 @@ static int cmd_extract(const char *archive, const char *dest) {
                 remaining -= w;
             }
             close(out);
+            if (mode) chmod(full, (mode_t)mode);
             printf("Created %s\n", full);
             continue;                                    /* data already consumed */
         } else {
@@ -543,12 +546,12 @@ static int split_tar_name(const char *arcname, char *prefix, size_t prefix_cap,
 
 /* Emit one ustar header block. */
 static int write_header(int out, const char *arcname, char type,
-                        unsigned long size, const char *linkname) {
+                        unsigned long mode, unsigned long size, const char *linkname) {
     struct tar_hdr h;
     memset(&h, 0, sizeof h);
     if (split_tar_name(arcname, h.prefix, sizeof h.prefix, h.name, sizeof h.name) < 0)
         return -1;
-    putoct(h.mode, 8, type == '5' ? 0755 : 0644);
+    putoct(h.mode, 8, mode & 07777);
     putoct(h.uid, 8, 0);
     putoct(h.gid, 8, 0);
     putoct(h.size, 12, type == '0' ? size : 0);
@@ -624,13 +627,13 @@ static int add_path(int out, const char *src, const char *arcname, int staging) 
         if (n < 0) { fprintf(stderr, "pkg: readlink %s: %s\n", src, strerror(errno)); return -1; }
         tgt[n] = 0;
         printf("%s %s\n", staging ? "Staging" : "Adding", arcname);
-        return write_header(out, arcname, '2', 0, tgt);
+        return write_header(out, arcname, '2', (unsigned long)(st.st_mode & 0777), 0, tgt);
     }
 
     if (S_ISDIR(st.st_mode)) {
         char dirname[STRMAX + 2];
         snprintf(dirname, sizeof dirname, "%s/", arcname);
-        if (write_header(out, dirname, '5', 0, NULL) < 0) return -1;
+        if (write_header(out, dirname, '5', (unsigned long)(st.st_mode & 0777), 0, NULL) < 0) return -1;
 
         DIR *d = opendir(src);
         if (!d) { fprintf(stderr, "pkg: opendir %s: %s\n", src, strerror(errno)); return -1; }
@@ -657,7 +660,7 @@ static int add_path(int out, const char *src, const char *arcname, int staging) 
 
     if (S_ISREG(st.st_mode)) {
         printf("%s %s\n", staging ? "Staging" : "Adding", arcname);
-        if (write_header(out, arcname, '0', (unsigned long)st.st_size, NULL) < 0) return -1;
+        if (write_header(out, arcname, '0', (unsigned long)(st.st_mode & 0777), (unsigned long)st.st_size, NULL) < 0) return -1;
         return write_file_data(out, src, (unsigned long)st.st_size);
     }
 

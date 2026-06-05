@@ -223,6 +223,7 @@ void task_set_vmspace(struct vmspace *vm) {
     task_t *t = task_current();
     t->vm = vm;
     uint64_t cr3 = vm ? vm->pml4_phys : paging_kernel_pml4();
+    paging_note_active(cr3);
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
 }
 
@@ -400,6 +401,7 @@ task_t *task_clone(const char *name, struct vmspace *vm,
 
 static void apply_task_mm(task_t *t) {
     uint64_t cr3 = t->vm ? t->vm->pml4_phys : paging_kernel_pml4();
+    paging_note_active(cr3);
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
     /* Always latch this CPU's kernel stack (syscall entry %gs:kernel_rsp + the
        TSS rsp0 a ring-3 trap lands on). Done for every task, not just ones with
@@ -448,6 +450,15 @@ void scheduler(void) {
             apply_task_mm(t);
             context_switch(&g_sched_rsp[c], t->saved_rsp);  /* run t (lock held) */
             g_cpu_cur[c] = nullptr;       /* t returned via sched() */
+        }
+        if (!t) {
+            /* Going idle: drop to the kernel master tables so this CPU doesn't
+               sit in hlt holding a user vmspace as CR3. A task can be preempted
+               off this CPU, run and exit elsewhere, and have its address space
+               reaped — leaving an idle CPU pointing CR3 at freed page tables,
+               whose next access (an IRQ entry) triple-faults. Done under the lock
+               so the active-PML4 record updates before any reaper can free it. */
+            vmspace_switch(nullptr);
         }
         sched_unlock();
         if (!t) __asm__ volatile("hlt");  /* nothing runnable; wait for an IRQ */
@@ -511,12 +522,24 @@ static void task_exit_common(int code, int sig) {
        shared table (threads), the files stay open until the last reference. */
     fdtable_unref(t->files);
     t->files = nullptr;
+    /* Switch CR3 to the kernel master tables before becoming a zombie. Otherwise
+       this CPU keeps running (the scheduler idle loop, etc.) on t->vm's page
+       tables, which the parent's wait4 frees as soon as it sees the zombie — a
+       use-after-free of the PML4 that makes the kernel's own mapping vanish and
+       triple-faults. (task_exit_thread does the same for the shared-AS case.) */
+    vmspace_switch(nullptr);
     sched_lock();
     t->exit_code   = code;
     t->term_signal = sig;
     task_t *p = t->parent;
     if (p && p->state != TASK_NONE && p->state != TASK_DEAD) {
         t->state = TASK_ZOMBIE;       /* parent's wait4 reaps */
+        /* Raise SIGCHLD so a parent waiting via sigsuspend()/rt_sigsuspend (an
+           interactive shell reaping a job) wakes — the child_wq wake below only
+           covers a parent blocked in wait4(). Set the pending bit directly (we
+           hold sched_lock; signals_raise would re-enter it). Delivery/handler
+           run when the parent next returns to userspace. */
+        __atomic_or_fetch(&p->sig.pending, SIGBIT(SIGCHLD), __ATOMIC_ACQ_REL);
         wq_wake_all_locked(&p->child_wq);
     } else {
         t->state = TASK_DEAD;

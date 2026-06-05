@@ -75,6 +75,7 @@ typedef struct vmspace {
 } vmspace_t;
 
 uint64_t   paging_kernel_pml4(void);                 /* master PML4 (phys) */
+void       paging_note_active(uint64_t pml4_phys);   /* record this CPU's CR3 PML4 */
 vmspace_t *vmspace_create(void);                     /* kernel half shared; ref=1 */
 void       vmspace_ref(vmspace_t *vm);               /* +1 (a thread shares it) */
 void       vmspace_switch(vmspace_t *vm);            /* load CR3 (NULL = master) */

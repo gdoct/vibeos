@@ -3,6 +3,22 @@
 #include "irq.h"
 #include "paging.h"
 #include "kmalloc.h"
+#include "smp.h"
+
+/* Per-CPU record of the PML4 currently loaded in CR3, updated at every CR3 load
+   for a task/vmspace. vmspace_destroy() consults it to refuse freeing a page-
+   table tree that a CPU is still running on (a use-after-free that makes the
+   kernel's own mapping vanish and triple-faults). */
+static volatile uint64_t g_active_pml4[SMP_MAX_CPUS];
+void paging_note_active(uint64_t pml4_phys) {
+    int c = smp_cpu_index();
+    if (c >= 0 && c < SMP_MAX_CPUS) g_active_pml4[c] = pml4_phys;
+}
+static int pml4_active_cpu(uint64_t pml4_phys) {
+    for (int c = 0; c < SMP_MAX_CPUS; c++)
+        if (g_active_pml4[c] == pml4_phys) return c;
+    return -1;
+}
 
 /*
  * 4-level (PML4) paging — higher-half kernel (ROADMAP §3, Phase 0).
@@ -432,6 +448,7 @@ void vmspace_ref(vmspace_t *vm) { if (vm) __atomic_add_fetch(&vm->ref, 1, __ATOM
 
 void vmspace_switch(vmspace_t *vm) {
     uint64_t cr3 = vm ? vm->pml4_phys : g_pml4_phys;
+    paging_note_active(cr3);
     __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
 }
 
@@ -508,6 +525,16 @@ void vmspace_destroy(vmspace_t *vm) {
     if (!vm) return;
     if (__atomic_sub_fetch(&vm->ref, 1, __ATOMIC_ACQ_REL) > 0)
         return;                         /* still shared by another thread */
+    int busy = pml4_active_cpu(vm->pml4_phys);
+    if (busy >= 0) {
+        /* A CPU still has this PML4 in CR3 — freeing it now would pull the page
+           tables out from under a running CPU and triple-fault. Leak it instead
+           and shout, so the offending path is visible rather than fatal. */
+        kprintf("[paging] BUG: vmspace pml4=%lx freed while active on CPU %d "
+                "(cur cpu %d) -> leaking to avoid use-after-free\n",
+                (unsigned long)vm->pml4_phys, busy, smp_cpu_index());
+        return;
+    }
     uint64_t *pml4 = table(vm->pml4_phys);
     for (uint64_t i = 0; i < 256; i++) {
         if (!(pml4[i] & PTE_P)) continue;

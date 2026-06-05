@@ -96,6 +96,7 @@ static const app_t g_apps[] = {
     { "TERMINAL",   "/bin/gterm"    },
     { "MANDELBROT", "/bin/gmandel"  },
     { "CLOCK",      "/bin/gclock"   },
+    { "DOOM",       "/bin/doom"     },
     { "HELLO",      "/bin/guihello" },
 };
 #define N_APPS ((int)(sizeof g_apps / sizeof g_apps[0]))

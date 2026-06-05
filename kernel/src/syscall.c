@@ -596,6 +596,22 @@ static int64_t sys_writev(int fd, const struct iovec *iov, int cnt) {
     return total;
 }
 
+static int64_t sys_readv(int fd, const struct iovec *iov, int cnt) {
+    if (cnt < 0) return -EINVAL_;
+    if (cnt && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)iov,
+                               (uint64_t)cnt * sizeof(struct iovec), 0))
+        return -EFAULT_;
+    int64_t total = 0;
+    for (int i = 0; i < cnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        int64_t r = sys_read(fd, (void *)iov[i].iov_base, iov[i].iov_len);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if ((uint64_t)r < iov[i].iov_len) break;
+    }
+    return total;
+}
+
 /* mmap: anonymous arena + file-backed MAP_PRIVATE (ROADMAP §4, for ld-musl).
    File backing copies the file's bytes into freshly allocated private pages (no
    shared page cache yet); the tail past EOF stays zero (BSS). */
@@ -1224,16 +1240,39 @@ static int64_t sys_getdents64(int fd, void *ubuf, uint64_t count) {
     if (count && !paging_user_ok(cur_vm(), (uint64_t)(uintptr_t)ubuf, count, 1))
         return -EFAULT_;
 
+    /* The synthetic top-level mounts /dev and /proc aren't real dirents, so emit
+       them after the real entries when listing the root — otherwise `ls /` would
+       hide them. f->off >= SYNTH_OFF marks the synthetic phase (past any real
+       directory byte offset). */
+    const uint64_t SYNTH_OFF = 1ULL << 62;
+    static const char *const ROOT_SYNTH[] = { "dev", "proc" };
+    int is_root = ((uint32_t)f->ino == (uint32_t)fs_resolve("/"));
+
     uint8_t *out = (uint8_t *)ubuf;
     uint64_t used = 0;
     for (;;) {
-        fs_dirent_t de;
+        const char *name; uint8_t dtype; uint64_t ino_no, next_off;
         uint64_t saved = f->off;
-        int r = fs_dirent_at(f->ino, &f->off, &de);
-        if (r < 0) return fs_to_errno(r);
-        if (r == 0) break;                      /* end of directory */
+        int synth = 0;
 
-        unsigned namelen = (unsigned)kstrlen(de.name);
+        if (f->off >= SYNTH_OFF) {              /* synthetic phase (root only) */
+            uint64_t si = f->off - SYNTH_OFF;
+            if (!is_root || si >= 2) break;
+            name = ROOT_SYNTH[si]; dtype = DT_DIR; ino_no = SYNTH_OFF + si;
+            next_off = f->off + 1; synth = 1;
+        } else {
+            fs_dirent_t de;
+            int r = fs_dirent_at(f->ino, &f->off, &de);  /* advances f->off */
+            if (r < 0) return fs_to_errno(r);
+            if (r == 0) {                       /* end of real entries */
+                if (is_root) { f->off = SYNTH_OFF; continue; }
+                break;
+            }
+            name = de.name; ino_no = de.inode; next_off = f->off;
+            dtype = (de.type == FT_DIR) ? DT_DIR : DT_REG;
+        }
+
+        unsigned namelen = (unsigned)kstrlen(name);
         unsigned reclen = (sizeof(struct linux_dirent64) + namelen + 1 + 7) & ~7u;
         if (used + reclen > count) {            /* doesn't fit: rewind, stop */
             f->off = saved;
@@ -1241,12 +1280,13 @@ static int64_t sys_getdents64(int fd, void *ubuf, uint64_t count) {
             break;
         }
         struct linux_dirent64 *d = (struct linux_dirent64 *)(out + used);
-        d->d_ino = de.inode;
-        d->d_off = (int64_t)f->off;
+        d->d_ino = ino_no;
+        d->d_off = (int64_t)next_off;
         d->d_reclen = (uint16_t)reclen;
-        d->d_type = (de.type == FT_DIR) ? DT_DIR : DT_REG;
-        kmemcpy(d->d_name, de.name, namelen + 1);
+        d->d_type = dtype;
+        kmemcpy(d->d_name, name, namelen + 1);
         used += reclen;
+        if (synth) f->off = next_off;          /* real entries: fs_dirent_at already advanced */
     }
     return (int64_t)used;
 }
@@ -1648,6 +1688,18 @@ static int64_t sys_umask(int mask) {
     return old;
 }
 
+/* getrusage(who, usage): no per-process accounting yet — return a zeroed struct
+   so callers (e.g. mksh's job timing) succeed instead of erroring. */
+static int64_t sys_getrusage(int who, uint64_t ubuf) {
+    (void)who;
+    if (ubuf) {
+        char zero[144];                          /* sizeof(struct rusage) on x86-64 */
+        kmemset(zero, 0, sizeof zero);
+        if (copy_to_user(cur_vm(), ubuf, zero, sizeof zero) < 0) return -EFAULT_;
+    }
+    return 0;
+}
+
 static int64_t sys_poll(uint64_t ufds, uint32_t nfds, int64_t timeout_ms) {
     struct pollfd { int fd; int16_t events; int16_t revents; };
     if (nfds == 0) { if (timeout_ms > 0) ksleep_ms((uint64_t)timeout_ms); return 0; }
@@ -1932,6 +1984,8 @@ static uint64_t do_syscall(syscall_frame_t *f) {
                                                   (void *)f->rdx, f->r10); /* rt_sigprocmask */
     case 15:  return signals_sigreturn(f);                     /* rt_sigreturn */
     case 16:  return (uint64_t)sys_ioctl((int)f->rdi, (unsigned)f->rsi, f->rdx);  /* ioctl */
+    case 19:  return (uint64_t)sys_readv((int)f->rdi, (const struct iovec *)f->rsi,
+                                         (int)f->rdx);         /* readv */
     case 20:  return (uint64_t)sys_writev((int)f->rdi, (const struct iovec *)f->rsi,
                                           (int)f->rdx);        /* writev */
     case 22:  return (uint64_t)sys_pipe((int *)f->rdi);        /* pipe */
@@ -1985,6 +2039,7 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 127: return (uint64_t)sys_rt_sigpending((void *)f->rdi, f->rsi);  /* rt_sigpending */
     case 73:  return (uint64_t)sys_flock((int)f->rdi, (int)f->rsi);             /* flock */
     case 95:  return (uint64_t)sys_umask((int)f->rdi);                          /* umask */
+    case 98:  return (uint64_t)sys_getrusage((int)f->rdi, f->rsi);              /* getrusage */
     case 110: return (uint64_t)sys_getppid();                                   /* getppid */
     case 130: return (uint64_t)sys_rt_sigsuspend((const void *)f->rdi, f->rsi); /* rt_sigsuspend */
     case 131: return (uint64_t)sys_sigaltstack((const void *)f->rdi, (void *)f->rsi); /* sigaltstack */

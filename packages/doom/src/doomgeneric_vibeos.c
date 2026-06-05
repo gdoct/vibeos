@@ -19,6 +19,30 @@ static unsigned int s_KeyRead;
 static unsigned int s_KeyWrite;
 static int s_ShouldQuit;
 
+static const char *default_iwads[] = {
+    "/dist/src/doom/local/freedoom1.wad",
+    "/dist/src/doom/local/doom1.wad",
+    "/dist/src/doom/local/freedoom2.wad",
+};
+
+static int has_iwad_arg(int argc, char **argv)
+{
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-iwad")) return 1;
+    }
+    return 0;
+}
+
+static const char *find_default_iwad(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof default_iwads / sizeof default_iwads[0]; i++) {
+        if (access(default_iwads[i], R_OK) == 0) return default_iwads[i];
+    }
+    return NULL;
+}
+
 static unsigned char convert_to_doom_key(uint32_t key, uint32_t mods)
 {
     unsigned char ascii = (unsigned char)tolower((int)(key & 0xff));
@@ -162,7 +186,29 @@ void DG_SetWindowTitle(const char *title)
 
 int main(int argc, char **argv)
 {
-    doomgeneric_Create(argc, argv);
+    const char *iwad = NULL;
+    char **launch_argv = argv;
+    int launch_argc = argc;
+
+    if (!has_iwad_arg(argc, argv) && (iwad = find_default_iwad()) != NULL) {
+        char **augmented = calloc((size_t)argc + 3, sizeof(char *));
+        int i;
+
+        if (!augmented) {
+            fprintf(stderr, "doom: argument allocation failed\n");
+            return 1;
+        }
+
+        for (i = 0; i < argc; i++) augmented[i] = argv[i];
+        augmented[argc] = "-iwad";
+        augmented[argc + 1] = (char *)iwad;
+        augmented[argc + 2] = NULL;
+        launch_argv = augmented;
+        launch_argc = argc + 2;
+        printf("doom: using default IWAD %s\n", iwad);
+    }
+
+    doomgeneric_Create(launch_argc, launch_argv);
 
     while (!s_ShouldQuit) {
         doomgeneric_Tick();
@@ -170,5 +216,6 @@ int main(int argc, char **argv)
 
     gfx_free(&s_Surface);
     gc_close(s_Conn);
+    if (launch_argv != argv) free(launch_argv);
     return 0;
 }
