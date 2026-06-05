@@ -24,7 +24,7 @@ int main(void) {
         int r, resized = 0, quit = 0;
         /* Drain all pending events (coalesce a resize burst to the final size). */
         while ((r = gc_poll(c, &ev)) > 0) {
-            if (ev.ev == GE_KEY && ev.key == 'q') quit = 1;
+            if (ev.ev == GE_KEY && (ev.buttons & GIN_PRESSED) && ev.key == 'q') quit = 1;
             else if (ev.ev == GE_RESIZE) resized = 1;   /* c->w/c->h updated in gc_poll */
         }
         if (r < 0 || quit) break;

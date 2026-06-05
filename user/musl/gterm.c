@@ -314,7 +314,7 @@ int main(void) {
         gevt_input_t ev;
         int r;
         while ((r = gc_poll(c, &ev)) > 0) {
-            if (ev.ev == GE_KEY) {
+            if (ev.ev == GE_KEY && (ev.buttons & GIN_PRESSED)) {  /* key-down only */
                 unsigned k = ev.key;
                 int handled = 0;
                 if (ev.buttons & GIN_MOD_CTRL) {         /* font size shortcuts */

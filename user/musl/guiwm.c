@@ -581,8 +581,10 @@ static void on_mouse(int x, int y, int buttons) {
     }
 }
 
-static void on_key(int code, int mods) {
-    if (g_focus >= 0) send_input(&g_win[g_focus], GE_KEY, 0, 0, mods, code);
+static void on_key(int code, int mods, int pressed) {
+    if (g_focus >= 0)
+        send_input(&g_win[g_focus], GE_KEY, 0, 0,
+                   mods | (pressed ? GIN_PRESSED : 0), code);
 }
 
 int main(void) {
@@ -684,7 +686,7 @@ int main(void) {
         int n = read(in, ev, sizeof ev);
         for (int k = 0; k < n/(int)sizeof(gin_event_t); k++) {
             if (ev[k].type == GIN_MOUSE) on_mouse(ev[k].x, ev[k].y, ev[k].buttons);
-            else if (ev[k].type == GIN_KEY) on_key(ev[k].code, ev[k].buttons);
+            else if (ev[k].type == GIN_KEY) on_key(ev[k].code, ev[k].buttons, ev[k].pressed);
         }
         /* present scene if it changed */
         if (g_dirty) {

@@ -64,7 +64,7 @@ int main(void) {
            gc_poll keeps c->w/c->h at the latest size, so we render just once. */
         while ((r = gc_poll(c, &ev)) > 0) {
             if (ev.ev == GE_RESIZE) resized = 1;     /* c->w/c->h already updated */
-            else if (ev.ev == GE_KEY) {
+            else if (ev.ev == GE_KEY && (ev.buttons & GIN_PRESSED)) {  /* key-down only */
                 switch (ev.key) {
                 case 'q': gc_close(c); gfx_free(&s); return 0;
                 case '=': case '+': scale *= 0.7; rerender = 1; break;

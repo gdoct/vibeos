@@ -32,7 +32,7 @@ typedef struct input_event {
 } input_event_t;            /* 8 bytes */
 
 void input_push_mouse(int x, int y, int buttons);
-void input_push_key(char c, int mods);
+void input_push_key(char c, int mods, int pressed);
 
 /* Drain up to n bytes of whole events into buf (non-blocking). Returns bytes. */
 int  input_read(void *buf, uint32_t n);

@@ -23,6 +23,7 @@ typedef struct gfb_info {
 #define GIN_MOUSE 1
 #define GIN_KEY   2
 #define GIN_MOD_CTRL 0x01   /* key event: Ctrl held (carried in `buttons`) */
+#define GIN_PRESSED  0x80   /* key event: set = key-down, clear = key-up (in `buttons`) */
 typedef struct gin_event {
     uint8_t  type;          /* GIN_MOUSE | GIN_KEY */
     uint8_t  buttons;       /* mouse: bit0=L,1=R,2=M; key: GIN_MOD_* mask */

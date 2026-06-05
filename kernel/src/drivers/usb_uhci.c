@@ -212,6 +212,23 @@ static const char kmap[2][0x40] = {
 static void kbd_report(hid_dev_t *h, const uint8_t *r) {
     int shift = (r[0] & 0x22) != 0;            /* L/R shift modifiers */
     int ctrl  = (r[0] & 0x11) != 0;            /* L/R ctrl modifiers   */
+    int mods  = ctrl ? INPUT_MOD_CTRL : 0;
+    /* Key releases: keys present in the previous report but gone from this one.
+       Only the userspace GUI ring tracks key-up — the console TTY and in-kernel
+       WM consume "a key was typed" and would garble on releases, so we skip them
+       there. Without this, a held movement key in DOOM never clears and the
+       player walks forever in one direction. */
+    if (input_grabbed()) {
+        for (int i = 2; i < 8; i++) {
+            uint8_t k = h->prev[i];
+            if (k == 0) continue;
+            int still = 0;
+            for (int j = 2; j < 8; j++) if (r[j] == k) { still = 1; break; }
+            if (still) continue;               /* still held: not a release */
+            if (k < 0x40 && kmap[shift][k]) input_push_key(kmap[shift][k], mods, 0);
+        }
+    }
+    /* Key presses: keys in this report that weren't in the previous one. */
     for (int i = 2; i < 8; i++) {
         uint8_t k = r[i];
         if (k == 0) continue;
@@ -220,8 +237,7 @@ static void kbd_report(hid_dev_t *h, const uint8_t *r) {
         if (was) continue;                     /* still held: not a fresh press */
         if (k < 0x40 && kmap[shift][k]) {
             char c = kmap[shift][k];
-            int mods = ctrl ? INPUT_MOD_CTRL : 0;
-            if (input_grabbed())      input_push_key(c, mods); /* userspace GUI server */
+            if (input_grabbed())      input_push_key(c, mods, 1); /* userspace GUI server */
             else if (gui_wants_keyboard()) gui_input_key(c);  /* in-kernel WM textbox */
             else                      tty_input(c);      /* otherwise the console */
         }

@@ -35,8 +35,9 @@ void input_push_mouse(int x, int y, int buttons) {
     push(&e);
 }
 
-void input_push_key(char c, int mods) {
-    input_event_t e = { INPUT_EV_KEY, (uint8_t)mods, (uint8_t)c, 1, 0, 0 };
+void input_push_key(char c, int mods, int pressed) {
+    input_event_t e = { INPUT_EV_KEY, (uint8_t)mods, (uint8_t)c,
+                        (uint8_t)(pressed ? 1 : 0), 0, 0 };
     push(&e);
 }
 

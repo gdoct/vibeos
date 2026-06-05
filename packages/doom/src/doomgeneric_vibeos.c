@@ -110,7 +110,7 @@ static void pump_events(void)
     while ((r = gc_poll(s_Conn, &ev)) > 0) {
         switch (ev.ev) {
         case GE_KEY:
-            queue_key(1, ev.key, ev.buttons);
+            queue_key((ev.buttons & GIN_PRESSED) ? 1 : 0, ev.key, ev.buttons);
             break;
         case GE_RESIZE:
             reset_surface(s_Conn->w, s_Conn->h);
