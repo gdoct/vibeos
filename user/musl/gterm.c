@@ -265,8 +265,17 @@ int main(void) {
         dup2(out[1], 2);
         close(in[0]); close(in[1]);
         close(out[0]); close(out[1]);
-        char *av[] = { "/bin/sh", 0 };
-        execve("/bin/sh", av, environ);
+        /* -i forces an interactive shell (prompt + /etc/mkshrc greeting) even
+         * though stdio is a pipe, not a tty; +m disables job-control/monitor
+         * mode, which would otherwise warn about the missing controlling tty.
+         * Pass an explicit environment so the rc + PATH are set regardless of
+         * how gterm itself was launched. */
+        char *av[] = { (char *)"/bin/sh", (char *)"-i", (char *)"+m", (char *)0 };
+        char *env[] = {
+            (char *)"PATH=/bin", (char *)"HOME=/", (char *)"TERM=vibeos",
+            (char *)"ENV=/etc/mkshrc", (char *)0
+        };
+        execve("/bin/sh", av, env);
         _exit(127);
     }
 

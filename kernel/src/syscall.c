@@ -1625,6 +1625,29 @@ static int64_t sys_rt_sigsuspend(const void *umask, uint64_t sigsetsize) {
     return -EINTR_;
 }
 
+/* getppid: parent's pid, or 1 (init) for an orphan. */
+static int64_t sys_getppid(void) {
+    task_t *t = task_current();
+    return (t && t->parent) ? task_tgid(t->parent) : 1;
+}
+
+/* flock(fd, op): advisory whole-file locking. VibeOS is single-user with no
+   contending lockers, so accept it as a no-op (shells lock their history file
+   with it). Just validate the fd. */
+static int64_t sys_flock(int fd, int op) {
+    (void)op;
+    return fd_get(fd) ? 0 : -EBADF_;
+}
+
+/* umask(mask): set the process file-creation mask, return the previous value.
+   Stored process-wide (a simplification; not yet applied at file creation). */
+static int g_umask = 022;
+static int64_t sys_umask(int mask) {
+    int old = g_umask;
+    g_umask = mask & 0777;
+    return old;
+}
+
 static int64_t sys_poll(uint64_t ufds, uint32_t nfds, int64_t timeout_ms) {
     struct pollfd { int fd; int16_t events; int16_t revents; };
     if (nfds == 0) { if (timeout_ms > 0) ksleep_ms((uint64_t)timeout_ms); return 0; }
@@ -1960,6 +1983,9 @@ static uint64_t do_syscall(syscall_frame_t *f) {
     case 200: return (uint64_t)sys_kill((int)f->rdi, (int)f->rsi);   /* tkill(tid,sig) */
     case 234: return (uint64_t)sys_tgkill((int)f->rdi, (int)f->rsi, (int)f->rdx); /* tgkill */
     case 127: return (uint64_t)sys_rt_sigpending((void *)f->rdi, f->rsi);  /* rt_sigpending */
+    case 73:  return (uint64_t)sys_flock((int)f->rdi, (int)f->rsi);             /* flock */
+    case 95:  return (uint64_t)sys_umask((int)f->rdi);                          /* umask */
+    case 110: return (uint64_t)sys_getppid();                                   /* getppid */
     case 130: return (uint64_t)sys_rt_sigsuspend((const void *)f->rdi, f->rsi); /* rt_sigsuspend */
     case 131: return (uint64_t)sys_sigaltstack((const void *)f->rdi, (void *)f->rsi); /* sigaltstack */
     case 72:  return (uint64_t)sys_fcntl((int)f->rdi, (int)f->rsi, f->rdx);  /* fcntl */
