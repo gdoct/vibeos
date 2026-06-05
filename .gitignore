@@ -57,3 +57,8 @@ toolchain/vibeos.specs
 # host build-time font tool (binary)
 gui/client/tools/genfont
 vendor/
+
+# Local Doom/Freedoom test data for the package port. Keep a committed README in
+# the directory, but ignore downloaded archives and IWADs.
+packages/doom/local/*.zip
+packages/doom/local/*.wad

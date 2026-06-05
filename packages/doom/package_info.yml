@@ -1,12 +1,22 @@
-# doom — scaffold for a future DoomGeneric port.
-# seealso: https://github.com/ozkl/doomgeneric
-# This starts as a documentation-only package so the package directory exists
-# and `pkg create packages/doom` succeeds immediately. Replace the staged doc
-# payload with a real build once the DoomGeneric source and VibeOS patches are
-# added under this package tree.
+# doom — a package-local DoomGeneric port for the VibeOS userspace window manager.
+#
+# `pkg create packages/doom` copies this directory into an isolated work area,
+# runs `make` in src/, then archives the staged binary + docs from
+# src/build/out. The package fetches a pinned DoomGeneric snapshot on demand and
+# keeps only the VibeOS-specific backend plus minimal GUI client support in-repo,
+# so the upstream source itself is not committed here.
+#
+# The resulting /bin/doom is a static musl GUI client that talks to /bin/guiwm
+# over loopback TCP and expects the user to supply an IWAD (for example
+# doom1.wad) at runtime via `-iwad`.
 name: doom
-version: 0.0.0
+version: 1.0.0
+build:
+  command: make
+  workdir: src
 stage:
-  from: stage
+  from: src/build/out
   include:
+    - bin/doom
+    - share/doc/doom/LICENSE
     - share/doc/doom/README
