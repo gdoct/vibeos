@@ -18,6 +18,9 @@ day one, so cross-compiled musl runs with no translation layer.
 ```bash
 make              # build bootloader + kernel + userspace binaries
 ./build.sh [size] # clean build + fresh VibeFS data disk (default 2G), /bin populated
+./update-kernel.sh # rebuild kernel.elf and replace it in the existing ESP image
+./update-system.sh # rebuild kernel + userspace and refresh the existing images (no packages)
+./merge-package.sh <pkg> # build one package and merge it into the existing VibeFS image
 make run          # boot in QEMU q35 + OVMF, -smp 4; serial = QEMU stdio
 make clean        # NB: does not cover user/build — build.sh removes it explicitly
 ```
@@ -28,6 +31,11 @@ make clean        # NB: does not cover user/build — build.sh removes it explic
   end-to-end on QEMU and be confirmed via the serial log, not just compile.
 - Artifacts: `boot/build/vibeos.img` (FAT ESP), `boot/build/vdisk.img`
   (virtio-blk VibeFS volume).
+- Incremental image workflows reuse the existing images: `update-kernel.sh`
+  touches only `boot/build/vibeos.img`, `update-system.sh` refreshes the kernel
+  plus core userspace in `boot/build/{vibeos,vdisk}.img`, and
+  `merge-package.sh <pkg>` imports one package archive into
+  `boot/build/vdisk.img`.
 - *Known issue:* unclean-`fsck` can drop `/bin/init` on diskutil volumes —
   workaround is a clean image per build (`./build.sh`). See [ROADMAP.md](docs/ROADMAP.md).
 

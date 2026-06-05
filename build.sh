@@ -14,206 +14,27 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VDISK="boot/build/vdisk.img"
 VDISK_SIZE="${1:-2G}"
-DISKUTIL_PROJ="interop/tools/diskutil/src/DiskTool.CLI"
-DISKUTIL="$DISKUTIL_PROJ/bin/Debug/net8.0/disktool-cli"
 
-step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+source "$PWD/build-lib.sh"
 
 step "Clean build: kernel + bootloader + userspace + boot image"
 make clean
 rm -rf user/build            # make clean doesn't cover the userspace tree
 make image                   # kernel.elf (+ user/build/{init,hello}.elf), BOOTX64.EFI, vibeos.img
 
-step "Build diskutil-cli host tool"
-dotnet build "$DISKUTIL_PROJ" -c Debug --nologo -v minimal
-[ -x "$DISKUTIL" ] || { echo "error: $DISKUTIL not found after build"; exit 1; }
+ensure_diskutil
 
 step "Bootstrap $VDISK ($VDISK_SIZE) with /bin"
 rm -f "$VDISK"
 "$DISKUTIL" --create-volume "$VDISK_SIZE" "$VDISK"
-"$DISKUTIL" --diskfile "$VDISK" --mkdir /bin
-"$DISKUTIL" --diskfile "$VDISK" --mkdir /etc
-"$DISKUTIL" --diskfile "$VDISK" --mkdir /config
-"$DISKUTIL" --diskfile "$VDISK" --mkdir /config/services
-"$DISKUTIL" --diskfile "$VDISK" --mkdir /config/logs
-"$DISKUTIL" --diskfile "$VDISK" --import config/system.conf /config/system.conf
-# Default interactive shell environment: mksh sources /etc/mkshrc via $ENV
-# (PATH/HOME/ENV are exported by init/sinit). Sets PATH, prompt, and aliases.
-"$DISKUTIL" --diskfile "$VDISK" --import config/mkshrc /etc/mkshrc
-# Service definitions (ROADMAP: service-managed init) — one discoverable YAML per
-# service, read by the init at boot.
-for svc in config/services/*.yaml; do
-  [ -f "$svc" ] && "$DISKUTIL" --diskfile "$VDISK" --import "$svc" "/config/services/$(basename "$svc")"
-done
-# /bin/init is the service-managed init (sinit) when built; else the freestanding
-# fallback (user/init.c).
-if [ -f user/build/sinit.elf ]; then
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/sinit.elf /bin/init
-else
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/init.elf  /bin/init
-fi
-# /bin/vsh is the freestanding "vibe shell" (user/vsh.c), the gap-filler shell.
-# init execs /bin/sh; that name is wired to the real shell (mksh) further down,
-# after the package build — if the mksh package isn't built it falls back to vsh.
-"$DISKUTIL" --diskfile "$VDISK" --import user/build/vsh.elf   /bin/vsh
-"$DISKUTIL" --diskfile "$VDISK" --import user/build/hello.elf /bin/hello
-[ -f user/build/truntest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/truntest.elf /bin/truntest
-[ -f user/build/multest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/multest.elf /bin/multest
-[ -f user/build/mhello.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/mhello.elf /bin/mhello
-[ -f user/build/ftest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/ftest.elf /bin/ftest
-[ -f user/build/pipetest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/pipetest.elf /bin/pipetest
-[ -f user/build/faulttest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/faulttest.elf /bin/faulttest
-[ -f user/build/cputest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/cputest.elf /bin/cputest
-[ -f user/build/sigtest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/sigtest.elf /bin/sigtest
-[ -f user/build/ttytest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/ttytest.elf /bin/ttytest
-[ -f user/build/nettest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/nettest.elf /bin/nettest
-[ -f user/build/wget.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/wget.elf /bin/wget
-[ -f user/build/pkg.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/pkg.elf /bin/pkg
-[ -f user/build/vibehello.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/vibehello.elf /bin/vibehello
-[ -f user/build/abitest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/abitest.elf /bin/abitest
-[ -f user/build/threadtest.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/threadtest.elf /bin/threadtest
-[ -f user/build/sysconf.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/sysconf.elf /bin/sysconf
-[ -f user/build/heartbeat.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/heartbeat.elf /bin/heartbeat
-# GUI phase 2 (gui/client): the userspace window manager + demo clients.
-[ -f user/build/guiwm.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/guiwm.elf /bin/guiwm
-[ -f user/build/gmandel.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/gmandel.elf /bin/gmandel
-[ -f user/build/gclock.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/gclock.elf /bin/gclock
-[ -f user/build/gterm.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/gterm.elf /bin/gterm
-[ -f user/build/guihello.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/guihello.elf /bin/guihello
-[ -f user/build/guiprobe.elf ] && \
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/guiprobe.elf /bin/guiprobe
-
-# Dynamic linking (ROADMAP §4): ship the musl dynamic linker as
-# /lib/ld-musl-x86_64.so.1 (the host's musl libc.so doubles as the loader) and a
-# dynamically-linked test program. The kernel reads /bin/dynhello's PT_INTERP,
-# maps the linker, and lets it relocate + run the program.
-MUSL_LD="/usr/lib/x86_64-linux-musl/libc.so"
-if [ -f user/build/dynhello.elf ] && [ -f "$MUSL_LD" ]; then
-  "$DISKUTIL" --diskfile "$VDISK" --mkdir /lib
-  "$DISKUTIL" --diskfile "$VDISK" --import "$MUSL_LD" /lib/ld-musl-x86_64.so.1
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/dynhello.elf /bin/dynhello
-fi
-
-# Prebuilt packages (docs/pkgman.md, v1): build each package source under
-# packages/ with the host-runnable `pkg create` (the static musl pkg.elf runs on
-# the host too) and stage the resulting .pkg archives into /dist/packages so they
-# can be listed/extracted on the running system with `pkg list`/`pkg extract`.
-PKG="$(pwd)/user/build/pkg.elf"
-if [ -x "$PKG" ] && [ -d packages ]; then
-  PKGOUT="$(pwd)/boot/build/packages"
-  rm -rf "$PKGOUT"; mkdir -p "$PKGOUT"
-  "$DISKUTIL" --diskfile "$VDISK" --mkdir /dist
-  "$DISKUTIL" --diskfile "$VDISK" --mkdir /dist/packages
-  for pkgdir in "$(pwd)"/packages/*/; do
-    [ -f "$pkgdir/package_info.yml" ] || continue
-    name=$(basename "$pkgdir")
-    # pkg create writes <name>-<version>.pkg into the current directory. Each
-    # package's build (mksh/toybox compile, etc.) is third-party and noisy, so
-    # capture its stdout+stderr to a per-package log and keep this output clean;
-    # on failure point at the log.
-    ( cd "$PKGOUT" && "$PKG" create "$pkgdir" ) >"$PKGOUT/$name-build.log" 2>&1 || \
-      { echo "warning: pkg create failed for $name (see boot/build/packages/$name-build.log)"; continue; }
-  done
-  for archive in "$PKGOUT"/*.pkg; do
-    [ -f "$archive" ] || continue
-    "$DISKUTIL" --diskfile "$VDISK" --import "$archive" "/dist/packages/$(basename "$archive")"
-  done
-  # Also ship the package *source* trees under /dist/src so `pkg create` can be
-  # exercised on the running system (the serial shell has no redirection to
-  # author a manifest at runtime). Mirror each tree: mkdir dirs, import files.
-  "$DISKUTIL" --diskfile "$VDISK" --mkdir /dist/src
-  for pkgdir in packages/*/; do
-    [ -f "$pkgdir/package_info.yml" ] || continue
-    name=$(basename "$pkgdir")
-    "$DISKUTIL" --diskfile "$VDISK" --mkdir "/dist/src/$name"
-    ( cd "$pkgdir" && find . -mindepth 1 -type d -printf '%P\n' ) | while read -r d; do
-      "$DISKUTIL" --diskfile "$VDISK" --mkdir "/dist/src/$name/$d"
-    done
-    ( cd "$pkgdir" && find . -type f -printf '%P\n' ) | while read -r f; do
-      "$DISKUTIL" --diskfile "$VDISK" --import "$pkgdir$f" "/dist/src/$name/$f"
-    done
-  done
-fi
-
-# Default shell wiring (docs/pkgman.md, packages/mksh). init execs /bin/sh.
-# Prefer mksh when its package built: extract the binary from the .pkg (ustar)
-# and symlink /bin/sh -> /bin/mksh. Otherwise fall back to the gap-filler
-# /bin/vsh so the system still boots. (Mirrors the sinit/init fallback above.)
-step "Wire default shell (/bin/sh)"
-MKSH_PKG=""
-for cand in "${PKGOUT:-/nonexistent}"/mksh-*.pkg; do
-  [ -f "$cand" ] && MKSH_PKG="$cand"
-done
-if [ -n "$MKSH_PKG" ]; then
-  MKSH_TMP="$(mktemp -d)"
-  if tar -xf "$MKSH_PKG" -C "$MKSH_TMP" bin/mksh 2>/dev/null && [ -f "$MKSH_TMP/bin/mksh" ]; then
-    chmod +x "$MKSH_TMP/bin/mksh"     # import records the host mode; ensure +x so the shell is executable
-    "$DISKUTIL" --diskfile "$VDISK" --import "$MKSH_TMP/bin/mksh" /bin/mksh
-    "$DISKUTIL" --diskfile "$VDISK" --symlink /bin/mksh /bin/sh
-    echo "default shell: /bin/sh -> /bin/mksh ($(basename "$MKSH_PKG"))"
-  else
-    echo "warning: $MKSH_PKG has no bin/mksh; falling back to /bin/vsh"
-    "$DISKUTIL" --diskfile "$VDISK" --import user/build/vsh.elf /bin/sh
-  fi
-  rm -rf "$MKSH_TMP"
-else
-  "$DISKUTIL" --diskfile "$VDISK" --import user/build/vsh.elf /bin/sh
-  echo "default shell: /bin/sh = /bin/vsh (mksh package not built)"
-fi
-
-# Toybox userland (packages/toybox). toybox is a multicall binary: install it at
-# /bin/toybox, then create a symlink farm (/bin/ls -> /bin/toybox, …) for every
-# applet. The applet list comes from running the freshly built (static, host-
-# runnable) binary; --symlinks skips any name already in /bin, so it never
-# clobbers init, the shell, or the test binaries.
-step "Install toybox userland (/bin coreutils)"
-TOYBOX_PKG=""
-for cand in "${PKGOUT:-/nonexistent}"/toybox-*.pkg; do
-  [ -f "$cand" ] && TOYBOX_PKG="$cand"
-done
-if [ -n "$TOYBOX_PKG" ]; then
-  TB_TMP="$(mktemp -d)"
-  if tar -xf "$TOYBOX_PKG" -C "$TB_TMP" bin/toybox 2>/dev/null && [ -f "$TB_TMP/bin/toybox" ]; then
-    chmod +x "$TB_TMP/bin/toybox"
-    "$DISKUTIL" --diskfile "$VDISK" --import "$TB_TMP/bin/toybox" /bin/toybox
-    # `toybox` with no args prints the space-separated applet list.
-    "$TB_TMP/bin/toybox" | tr ' ' '\n' | grep -v '^$' \
-      | "$DISKUTIL" --diskfile "$VDISK" --symlinks /bin/toybox /bin
-  else
-    echo "warning: $TOYBOX_PKG has no bin/toybox; no coreutils installed"
-  fi
-  rm -rf "$TB_TMP"
-else
-  echo "toybox package not built; /bin has no coreutils (only the shell builtins)"
-fi
-
-step "Volume contents"
-"$DISKUTIL" --diskfile "$VDISK" --ls /
-"$DISKUTIL" --diskfile "$VDISK" --ls /bin
+sync_core_userspace
+build_all_package_archives
+mirror_all_package_sources
+wire_default_shell
+install_toybox_userland
+install_doom_test_app
+show_volume_contents
 
 cat <<EOF
 

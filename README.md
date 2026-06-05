@@ -127,6 +127,14 @@ You can pass a custom volume size if you want a different VibeFS disk:
 ./build.sh 4G
 ```
 
+To update the existing images in place instead of rebuilding them from scratch:
+
+```bash
+./update-kernel.sh          # rebuild kernel.elf and replace it in boot/build/vibeos.img
+./update-system.sh          # rebuild kernel + userspace and refresh boot/build/{vibeos,vdisk}.img
+./merge-package.sh doom     # build one package archive and merge it into boot/build/vdisk.img
+```
+
 ## Running
 
 Boot the image in QEMU with OVMF, the attached VibeFS data disk, and a
