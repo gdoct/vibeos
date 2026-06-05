@@ -295,9 +295,21 @@ milestone is mostly about closing specific syscall/ABI gaps, not new subsystems.
   `WUNTRACED` / `WIFCONTINUED` under `WCONTINUED`; SIGCONT resumes. `isatty`
   works (a pipe/file is `-ENOTTY`). `/bin/ttytest` exercises the whole surface on
   QEMU — 23 termios/job-control checks, a Ctrl-C→SIGINT round-trip, the
-  stop/cont cycle, and a background-SIGTTOU case. **Still missing:** PTYs
-  (`/dev/ptmx`/pts) — needed for a terminal multiplexer / OpenSSH, not for bash
-  over the serial console.
+  stop/cont cycle, and a background-SIGTTOU case. **Still missing:** PTYs — see
+  the dedicated item below.
+- **PTYs (pseudo-terminals)** — *not started; the next interactive-I/O gap.*
+  A `/dev/ptmx` master plus a `/dev/pts/N` slave namespace, opened as a
+  master/slave fd pair. The slave reuses the existing termios line discipline
+  ([tty.c](kernel/src/tty.c)) so a program on it sees a real terminal — raw/cooked
+  input, `ECHO`, `ISIG`, the job-control ioctls — while the master is the byte
+  stream the terminal program reads/writes. Needs the
+  `posix_openpt`/`grantpt`/`unlockpt`/`ptsname` plumbing (`TIOCGPTN`,
+  `TIOCSPTLCK`) and winsize→`SIGWINCH` propagation across the pair.
+  *Motivation:* the userspace GUI terminal ([gterm](user/musl/gterm.c)) — and a
+  future tmux / OpenSSH — currently wire the shell over **plain pipes**, so mksh
+  can't run its line editor in the window: no Tab completion, history search, or
+  job control (these work on the serial console, which is a real tty). Giving
+  gterm a PTY makes it a real terminal and retires its `-i +m` pipe workaround.
 - **More multiplexing** — *mostly done.* `select`/`pselect6` (23/270),
   `ppoll` (271), `eventfd`/`eventfd2` (284/290), `timerfd_create`/`settime`/
   `gettime` (283/286/287) are wired up, and `poll` was rebuilt over a unified

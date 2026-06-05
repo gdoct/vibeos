@@ -81,6 +81,7 @@ static gfx_surface_t g_back;             /* scene back buffer (no cursor) */
 static int        g_mx, g_my;            /* cursor position */
 static int        g_buttons;             /* last button bitmask */
 static int        g_dirty = 1;           /* scene needs a recompose */
+static time_t     g_last_clock;          /* last second shown in the taskbar clock */
 
 /* drag / resize state (window index, or -1) */
 static int        g_drag = -1, g_drag_dx, g_drag_dy;
@@ -100,12 +101,65 @@ static const app_t g_apps[] = {
     { "HELLO",      "/bin/guihello" },
 };
 #define N_APPS ((int)(sizeof g_apps / sizeof g_apps[0]))
-static int g_app_x[N_APPS], g_app_w[N_APPS];   /* taskbar hit rects */
-static int g_taskbar_winx;                      /* where the window list starts */
 static int g_launch_fd = -1;                    /* write end of the helper pipe */
 
-#define C_LAUNCH    GFX_RGB(0x2c,0x6e,0x4a)     /* launcher button (green) */
+#define C_LAUNCH    GFX_RGB(0x2c,0x6e,0x4a)     /* Start button (green) */
 #define C_LAUNCH_FG GFX_RGB(0xe0,0xff,0xe8)
+
+/* ---- Start menu ---- */
+/* A Windows-style Start button on the left of the taskbar opens a menu whose
+   "Programs" entry expands a submenu of the launchable apps (g_apps). The menu
+   is a transient overlay drawn on top of the taskbar; geometry is computed by
+   the *_rect helpers so compose() (draw) and on_mouse() (hit-test) agree. */
+typedef struct { const char *label; int submenu; } startitem_t;
+static const startitem_t g_startitems[] = {
+    { "Programs", 1 },          /* submenu == the g_apps list */
+};
+#define N_START ((int)(sizeof g_startitems / sizeof g_startitems[0]))
+
+static int g_start_open    = 0;   /* Start menu visible */
+static int g_programs_open = 0;   /* Programs submenu visible */
+
+#define MENU_W      150           /* menu width */
+#define MENUITEM_H  22            /* per-item height */
+#define MENU_TEXT_Y 6             /* text top offset within an item */
+
+#define C_MENU      GFX_RGB(0x24,0x36,0x48)     /* menu background */
+#define C_MENU_HI   GFX_RGB(0x2a,0x52,0x86)     /* hovered/active item */
+#define C_MENU_FG   GFX_RGB(0xe0,0xe8,0xf0)
+#define C_MENU_EDGE GFX_RGB(0x60,0x70,0x80)
+#define C_MENU_SHAD GFX_RGB(0x08,0x10,0x18)
+
+static int taskbar_top(void) { return g_screen.h - TASKBAR_H; }
+
+static void start_btn_rect(int *x, int *y, int *w, int *h) {
+    *x = 6; *y = taskbar_top() + 3;
+    *w = gfx_text_w("START") + 20; *h = TASKBAR_H - 6;
+}
+static void startmenu_rect(int *x, int *y, int *w, int *h) {
+    int bx, by, bw, bh; start_btn_rect(&bx, &by, &bw, &bh);
+    *w = MENU_W; *h = N_START * MENUITEM_H + 4;
+    *x = bx;     *y = taskbar_top() - *h;
+}
+static void progmenu_rect(int *x, int *y, int *w, int *h) {
+    int sx, sy, sw, sh; startmenu_rect(&sx, &sy, &sw, &sh);
+    *w = MENU_W; *h = N_APPS * MENUITEM_H + 4;
+    *x = sx + sw; *y = taskbar_top() - *h;     /* bottom-aligned, to the right */
+}
+/* item index under (px,py) in a menu, or -1 */
+static int menu_item_at(int px, int py, int mx, int my, int mw, int mh, int n) {
+    if (px < mx || px >= mx+mw || py < my || py >= my+mh) return -1;
+    int i = (py - (my + 2)) / MENUITEM_H;
+    return (i >= 0 && i < n) ? i : -1;
+}
+static int startmenu_item_at(int x, int y) {
+    int mx, my, mw, mh; startmenu_rect(&mx, &my, &mw, &mh);
+    return menu_item_at(x, y, mx, my, mw, mh, N_START);
+}
+static int progmenu_item_at(int x, int y) {
+    int mx, my, mw, mh; progmenu_rect(&mx, &my, &mw, &mh);
+    return menu_item_at(x, y, mx, my, mw, mh, N_APPS);
+}
 
 /* The helper loop: never maps the framebuffer, so its fork/exec is clean. Reads
    newline-terminated binary paths from `rfd` and spawns each. */
@@ -266,6 +320,38 @@ static void draw_window(win_t *w, int focused) {
             gfx_pixel(&g_back, gx - 2, gy - d + t, GFX_RGB(0xc0,0xc8,0xd0));
 }
 
+static void draw_menu_frame(int x, int y, int w, int h) {
+    gfx_fill_rect(&g_back, x+3, y+3, w, h, C_MENU_SHAD);   /* drop shadow */
+    gfx_fill_rect(&g_back, x, y, w, h, C_MENU);
+    gfx_rect(&g_back, x, y, w, h, C_MENU_EDGE);
+}
+
+/* Draw the Start menu (and the Programs submenu when expanded). Item highlight
+   follows the cursor; the Programs row also stays lit while its submenu is up. */
+static void draw_startmenu(void) {
+    int mx, my, mw, mh; startmenu_rect(&mx, &my, &mw, &mh);
+    draw_menu_frame(mx, my, mw, mh);
+    int hov = startmenu_item_at(g_mx, g_my);
+    for (int i = 0; i < N_START; i++) {
+        int iy = my + 2 + i*MENUITEM_H;
+        int active = (i == hov) || (g_startitems[i].submenu && g_programs_open);
+        if (active) gfx_fill_rect(&g_back, mx+2, iy, mw-4, MENUITEM_H, C_MENU_HI);
+        gfx_text(&g_back, mx+10, iy + MENU_TEXT_Y, g_startitems[i].label, C_MENU_FG);
+        if (g_startitems[i].submenu)
+            gfx_text(&g_back, mx + mw - 14, iy + MENU_TEXT_Y, ">", C_MENU_FG);
+    }
+    if (g_programs_open) {
+        int px, py, pw, ph; progmenu_rect(&px, &py, &pw, &ph);
+        draw_menu_frame(px, py, pw, ph);
+        int phov = progmenu_item_at(g_mx, g_my);
+        for (int i = 0; i < N_APPS; i++) {
+            int iy = py + 2 + i*MENUITEM_H;
+            if (i == phov) gfx_fill_rect(&g_back, px+2, iy, pw-4, MENUITEM_H, C_MENU_HI);
+            gfx_text(&g_back, px+10, iy + MENU_TEXT_Y, g_apps[i].label, C_MENU_FG);
+        }
+    }
+}
+
 static void compose(void) {
     gfx_clear(&g_back, C_DESKTOP);
     /* logo + label, upper third */
@@ -278,27 +364,34 @@ static void compose(void) {
     /* taskbar */
     int ty = g_back.h - TASKBAR_H;
     gfx_fill_rect(&g_back, 0, ty, g_back.w, TASKBAR_H, C_TASKBAR);
-    int tx = 8;
-    /* launcher buttons (start apps) */
-    for (int i = 0; i < N_APPS; i++) {
-        int bw = gfx_text_w(g_apps[i].label) + 16;
-        gfx_fill_rect(&g_back, tx, ty + 3, bw, TASKBAR_H - 6, C_LAUNCH);
-        gfx_rect(&g_back, tx, ty + 3, bw, TASKBAR_H - 6, C_LAUNCH_FG);
-        gfx_text(&g_back, tx + 8, ty + 8, g_apps[i].label, C_LAUNCH_FG);
-        g_app_x[i] = tx; g_app_w[i] = bw;
-        tx += bw + 6;
-    }
+    /* Start button on the left */
+    int bx, by, bw, bh; start_btn_rect(&bx, &by, &bw, &bh);
+    gfx_fill_rect(&g_back, bx, by, bw, bh, g_start_open ? C_TITLE : C_LAUNCH);
+    gfx_rect(&g_back, bx, by, bw, bh, C_LAUNCH_FG);
+    gfx_text(&g_back, bx + 10, ty + 8, "START", C_LAUNCH_FG);
     /* separator, then the open-window list */
-    tx += 6; gfx_vline(&g_back, tx - 8, ty + 3, TASKBAR_H - 6, GFX_RGB(0x40,0x50,0x60));
-    g_taskbar_winx = tx;
+    int tx = bx + bw + 8;
+    gfx_vline(&g_back, tx - 4, ty + 3, TASKBAR_H - 6, GFX_RGB(0x40,0x50,0x60));
     for (int i = 0; i < g_nz; i++) {
         win_t *w = &g_win[g_z[i]];
-        int bw = gfx_text_w(w->title) + 16;
-        gfx_fill_rect(&g_back, tx, ty + 3, bw, TASKBAR_H - 6,
+        int tw = gfx_text_w(w->title) + 16;
+        gfx_fill_rect(&g_back, tx, ty + 3, tw, TASKBAR_H - 6,
                       g_z[i] == g_focus ? C_TITLE : C_TITLE_BLUR);
         gfx_text(&g_back, tx + 8, ty + 8, w->title, C_TASK_FG);
-        tx += bw + 8;
+        tx += tw + 8;
     }
+    /* clock, bottom-right, in a sunken panel */
+    time_t now = time(0);
+    struct tm tmv; localtime_r(&now, &tmv);
+    char ts[16];
+    snprintf(ts, sizeof ts, "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    int cw = gfx_text_w(ts) + 16;
+    int cx = g_back.w - cw - 6;
+    gfx_fill_rect(&g_back, cx, ty + 3, cw, TASKBAR_H - 6, C_BORDER);
+    gfx_rect(&g_back, cx, ty + 3, cw, TASKBAR_H - 6, GFX_RGB(0x40,0x50,0x60));
+    gfx_text(&g_back, cx + 8, ty + 8, ts, C_TASK_FG);
+    /* Start menu overlays everything */
+    if (g_start_open) draw_startmenu();
 }
 
 /* copy a back-buffer rect to the framebuffer (clipped) */
@@ -425,15 +518,28 @@ static void on_mouse(int x, int y, int buttons) {
             g_dirty = 1;
         }
     } else if (pressed & 1) {
-        /* taskbar launcher: a click on an app button starts it */
-        int ty = g_screen.h - TASKBAR_H;
-        if (y >= ty) {
-            for (int i = 0; i < N_APPS; i++)
-                if (x >= g_app_x[i] && x < g_app_x[i] + g_app_w[i]) {
-                    printf("[guiwm] launch %s\n", g_apps[i].path);
-                    launch(g_apps[i].path);
-                    return;
+        /* Start button toggles the menu */
+        int bx, by, bw, bh; start_btn_rect(&bx, &by, &bw, &bh);
+        if (x >= bx && x < bx+bw && y >= by && y < by+bh) {
+            g_start_open = !g_start_open; g_programs_open = 0;
+            g_dirty = 1; return;
+        }
+        if (g_start_open) {
+            int mi = startmenu_item_at(x, y);
+            if (mi >= 0) {                       /* clicked a Start menu item */
+                if (g_startitems[mi].submenu) g_programs_open = !g_programs_open;
+                g_dirty = 1; return;
+            }
+            if (g_programs_open) {
+                int ai = progmenu_item_at(x, y); /* clicked an app in Programs */
+                if (ai >= 0) {
+                    printf("[guiwm] launch %s\n", g_apps[ai].path);
+                    launch(g_apps[ai].path);
+                    g_start_open = g_programs_open = 0; g_dirty = 1; return;
                 }
+            }
+            g_start_open = g_programs_open = 0;  /* clicked elsewhere: dismiss */
+            g_dirty = 1;                          /* and let the click fall through */
         }
         int idx = win_at(x, y);
         if (idx >= 0) {
@@ -460,6 +566,7 @@ static void on_mouse(int x, int y, int buttons) {
             send_input(w, GE_MOUSE_UP, x - w->x, y - w->y, buttons, 0);
         }
     } else {                                  /* motion */
+        if (g_start_open) g_dirty = 1;        /* refresh menu hover highlight */
         if (g_focus >= 0) {
             win_t *w = &g_win[g_focus];
             if (x >= w->x && x < w->x+w->w && y >= w->y && y < w->y+w->h)
@@ -530,6 +637,10 @@ int main(void) {
             pfd[np].fd = g_win[i].fd; pfd[np].events = POLLIN; map[np] = i; np++;
         }
         poll(pfd, np, 15);                     /* 15ms: ~60Hz input cadence */
+
+        /* tick the taskbar clock once per second */
+        time_t now = time(0);
+        if (now != g_last_clock) { g_last_clock = now; g_dirty = 1; }
 
         /* new connections */
         if (pfd[0].revents & POLLIN) {
