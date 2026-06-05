@@ -18,7 +18,7 @@ built with `g++` and GNU `ld` (the bootloader is a UEFI PE32+ application).
 
 All features were vibe coded, and the project is licensed under MIT.
 
-<img width="1277" height="1023" alt="image" src="https://github.com/user-attachments/assets/f3e462ce-f0a7-4d82-bfed-bc4252b58ea9" />
+<img width="1281" height="1024" alt="image" src="https://github.com/user-attachments/assets/a4bf7a0c-d8d8-46fd-b108-c77e1d883f0c" />
 
 ## What is implemented
 
