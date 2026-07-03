@@ -246,24 +246,24 @@ static int copy_tree(const char *src, const char *dst) {
 }
 
 static int remove_tree(const char *path) {
-    struct stat st;
-    if (lstat(path, &st) < 0) return -1;
-    if (S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
-        DIR *d = opendir(path);
-        if (!d) return -1;
-        int rc = 0;
-        struct dirent *de;
-        while ((de = readdir(d))) {
-            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-            char child[1024];
-            snprintf(child, sizeof child, "%s/%s", path, de->d_name);
-            if (remove_tree(child) < 0) rc = -1;
-        }
-        closedir(d);
-        if (rmdir(path) < 0) rc = -1;
-        return rc;
+    /* Attempt-then-recover rather than lstat-then-act (TOCTOU): unlink
+       handles files and symlinks; directories make it fail, so fall back to
+       emptying the directory and rmdir'ing it. */
+    if (unlink(path) == 0) return 0;
+    if (errno == ENOENT) return -1;
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char child[1024];
+        snprintf(child, sizeof child, "%s/%s", path, de->d_name);
+        if (remove_tree(child) < 0) rc = -1;
     }
-    return unlink(path);
+    closedir(d);
+    if (rmdir(path) < 0) rc = -1;
+    return rc;
 }
 
 /* ---- list / extract ----------------------------------------------------- */
@@ -352,11 +352,13 @@ static int cmd_extract(const char *archive, const char *dest) {
             printf("Created %s\n", full);
         } else if (h.typeflag == '2') {                  /* symlink */
             char tgt[101]; snprintf(tgt, sizeof tgt, "%.100s", h.linkname);
-            if (exists) {
-                if (!S_ISLNK(st.st_mode)) return extract_fail(fd, name, "exists, not a symlink");
-                unlink(full);
+            /* Attempt-then-recover (TOCTOU): on EEXIST unlink the old entry
+               and retry; directories make unlink fail, so they stay protected. */
+            if (symlink(tgt, full) < 0) {
+                if (errno != EEXIST) return extract_fail(fd, name, strerror(errno));
+                if (unlink(full) < 0) return extract_fail(fd, name, "exists and cannot be replaced");
+                if (symlink(tgt, full) < 0) return extract_fail(fd, name, strerror(errno));
             }
-            if (symlink(tgt, full) < 0) return extract_fail(fd, name, strerror(errno));
             printf("Created %s -> %s\n", full, tgt);
         } else if (h.typeflag == '0' || h.typeflag == '\0') { /* regular file */
             if (exists && S_ISDIR(st.st_mode)) return extract_fail(fd, name, "exists as a directory");
@@ -371,8 +373,8 @@ static int cmd_extract(const char *archive, const char *dest) {
                 if (write_full(out, buf, w) < 0) { close(out); return extract_fail(fd, name, "write failed"); }
                 remaining -= w;
             }
+            if (mode) fchmod(out, (mode_t)mode);
             close(out);
-            if (mode) chmod(full, (mode_t)mode);
             printf("Created %s\n", full);
             continue;                                    /* data already consumed */
         } else {
