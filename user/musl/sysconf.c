@@ -33,33 +33,45 @@ static int set_key(const char *key, const char *val) {
     in[n] = '\0';
 
     size_t klen = strlen(key);
-    int o = 0, replaced = 0;
+    size_t o = 0;
+    int replaced = 0;
     char *line = in;
     while (*line || line < in + n) {
         char *nl = strchr(line, '\n');
-        int linelen = nl ? (int)(nl - line) : (int)strlen(line);
+        size_t linelen = nl ? (size_t)(nl - line) : strlen(line);
         /* does this line define `key`? (optional leading spaces, then key, then ':') */
         const char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         int match = (strncmp(p, key, klen) == 0);
         if (match) { const char *q = p + klen; while (*q == ' ' || *q == '\t') q++; match = (*q == ':'); }
         if (match && !replaced) {
-            o += snprintf(out + o, sizeof out - o, "%s: %s\n", key, val);
+            int w = snprintf(out + o, sizeof out - o, "%s: %s\n", key, val);
+            if (w < 0 || (size_t)w >= sizeof out - o) goto toobig;
+            o += (size_t)w;
             replaced = 1;
         } else if (linelen > 0 || nl) {
+            if (linelen + 1 > sizeof out - o) goto toobig;
             memcpy(out + o, line, linelen); o += linelen;
             out[o++] = '\n';
         }
         if (!nl) break;
         line = nl + 1;
     }
-    if (!replaced) o += snprintf(out + o, sizeof out - o, "%s: %s\n", key, val);
+    if (!replaced) {
+        int w = snprintf(out + o, sizeof out - o, "%s: %s\n", key, val);
+        if (w < 0 || (size_t)w >= sizeof out - o) goto toobig;
+        o += (size_t)w;
+    }
 
     fd = open(CONFIG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { fprintf(stderr, "sysconf: cannot write %s\n", CONFIG_PATH); return 1; }
     write(fd, out, o);
     close(fd);
     return 0;
+
+toobig:
+    fprintf(stderr, "sysconf: rewritten %s would exceed %zu bytes\n", CONFIG_PATH, sizeof out);
+    return 1;
 }
 
 int main(int argc, char **argv) {
